@@ -1099,10 +1099,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	auto* pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	if (pipeline == nullptr) {
+		// Pipeline compilation is pending on the background worker; skip
+		// this draw on this frame instead of stalling the present thread.
+		return;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1119,7 +1124,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1128,7 +1133,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		vk_buffer.pushConstants(pipeline->pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
@@ -1147,7 +1152,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

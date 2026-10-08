@@ -334,8 +334,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
+	auto* pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	if (pipeline == nullptr) {
+		// Async pipeline creation is pending; drop this dispatch on this
+		// frame rather than suspending the render thread.
+		return;
+	}
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -352,7 +357,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
@@ -429,7 +434,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -455,7 +460,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	if (pipeline == nullptr) {
+		// Same as above: async creation pending; skip this dispatch.
+		return;
+	}
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -471,7 +480,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -491,7 +500,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

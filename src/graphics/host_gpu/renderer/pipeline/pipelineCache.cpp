@@ -481,6 +481,11 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	m_shutdown.store(true, std::memory_order_relaxed);
+	m_compile_cv.notify_all();
+	if (m_compile_thread.has_value() && m_compile_thread->joinable()) {
+		m_compile_thread->join();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -758,7 +763,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -927,60 +932,121 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
-	}
-
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(vs_input_info);
-		if (ps_active) {
-			ShaderDbgDumpInputInfo(*ps_input_info);
+	{
+		std::unique_lock lock(m_compile_mutex);
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			return iter->second.get();
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
-		     static_cast<void*>(pixel_program.module));
+		const uint64_t job_key =
+		    static_cast<uint64_t>(vs_id) * 0x9e3779b185ebca87ULL ^
+		    static_cast<uint64_t>(ps_id) * 0x100000001b3ULL ^
+		    static_cast<uint64_t>(static_params.topology) ^
+		    static_cast<uint64_t>(static_params.samples);
+		if (m_pending_jobs.find(job_key) != m_pending_jobs.end()) {
+			return nullptr;
+		}
+
+		if (graphics_debug_dump_enabled()) {
+			ShaderDbgDumpInputInfo(vs_input_info);
+			if (ps_active) {
+				ShaderDbgDumpInputInfo(*ps_input_info);
+			}
+			LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
+			     vs_id, static_cast<void*>(vertex_program.module), ps_id,
+			     static_cast<void*>(pixel_program.module));
+		}
+
+		CompileJob job {};
+		job.key             = job_key;
+		job.graphics          = true;
+		job.programs        = programs;
+		job.graphics_key    = key;
+		job.vertex_info.assign(vertex_info.begin(), vertex_info.end());
+		job.pixel_info      = ps_active ? std::optional<ShaderPixelInputInfo>(*ps_input_info)
+		                                : std::optional<ShaderPixelInputInfo>();
+		m_pending_jobs.insert(job_key);
+		m_compile_queue.push(std::move(job));
+		m_compile_cv.notify_one();
 	}
-
-	auto cached = std::make_unique<Pipeline>();
-	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
-	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-	EXIT_IF(!inserted);
-
-	return *iter->second;
+	EnsureWorker();
+	return nullptr;
 }
 
-PipelineCache::Pipeline&
+PipelineCache::Pipeline*
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
 
-	if (auto iter = m_compute_pipelines.find(compute_program.id);
-	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
+	{
+		std::unique_lock lock(m_compile_mutex);
+		if (auto iter = m_compute_pipelines.find(compute_program.id);
+		    iter != m_compute_pipelines.end()) {
+			return iter->second.get();
+		}
+		const uint64_t key = compute_program.id;
+		if (m_pending_jobs.find(key) != m_pending_jobs.end()) {
+			return nullptr;
+		}
+		if (graphics_debug_dump_enabled()) {
+			ShaderDbgDumpInputInfo(input_info);
+		}
+		CompileJob job {};
+		job.key               = key;
+		job.graphics          = false;
+		job.compute_program   = compute_program;
+		job.compute_input_info = input_info;
+		m_pending_jobs.insert(key);
+		m_compile_queue.push(std::move(job));
+		m_compile_cv.notify_one();
 	}
-
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(input_info);
-	}
-
-	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
-	EXIT_IF(!inserted);
-
-	return *iter->second;
+	EnsureWorker();
+	return nullptr;
 }
+
+void PipelineCache::EnsureWorker() {
+	std::unique_lock lock(m_compile_mutex);
+	if (!m_compile_thread.has_value()) {
+		m_compile_thread.emplace([this]() { WorkerLoop(); });
+	}
+}
+
+void PipelineCache::WorkerLoop() {
+	while (true) {
+		CompileJob job;
+		{
+			std::unique_lock lock(m_compile_mutex);
+			m_compile_cv.wait(lock, [this] {
+				return m_shutdown.load(std::memory_order_relaxed) || !m_compile_queue.empty();
+			});
+			if (m_shutdown && m_compile_queue.empty()) {
+				return;
+			}
+			job = std::move(m_compile_queue.front());
+			m_compile_queue.pop();
+		}
+		if (job.graphics) {
+			auto cached = std::make_unique<Pipeline>();
+			LogPipelineTrace("CreatePipelineInternal begin", 0, 0);
+			CreatePipelineInternal(m_graphics, *cached, job.graphics_key.rendering,
+			                       job.graphics_key.vertex_input, job.vertex_info,
+			                       job.pixel_info.has_value() ? &job.pixel_info.value() : nullptr,
+			                       job.programs, job.graphics_key.static_params, m_driver_cache);
+			LogPipelineTrace("CreatePipelineInternal done", 0, 0);
+			std::unique_lock lock(m_compile_mutex);
+			m_pending_jobs.erase(job.key);
+			auto [iter, inserted] = m_graphics_pipelines.emplace(job.graphics_key, std::move(cached));
+		} else {
+			auto cached = std::make_unique<Pipeline>();
+			CreatePipelineInternal(m_graphics, *cached, job.compute_input_info,
+			                       job.compute_program.module, m_driver_cache);
+			std::unique_lock lock(m_compile_mutex);
+			m_pending_jobs.erase(job.key);
+			auto [iter, inserted] =
+			    m_compute_pipelines.emplace(job.compute_program.id, std::move(cached));
+		}
+	}
+}
+
 } // namespace Libs::Graphics

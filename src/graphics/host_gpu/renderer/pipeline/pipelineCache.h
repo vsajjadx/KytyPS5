@@ -9,12 +9,20 @@
 #include "graphics/shader/shader.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
 #include <span>
+#include <thread>
+#include <atomic>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -133,13 +141,13 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
+	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
 private:
@@ -180,8 +188,36 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
+	// Async shader compilation. New programs/pipelines are built by a
+	// background worker; the render thread receives a not-ready sentinel
+	// and skips the affected draw/dispatch for that frame instead of
+	// stalling on a full recompile + pipeline create.
+	struct CompileJob {
+		uint64_t        key = 0; // dedup key (program id or graphics-pipeline key)
+		bool            graphics = false;
+		// Compute:
+		ShaderProgram           compute_program;
+		ShaderComputeInputInfo  compute_input_info;
+		// Graphics:
+		GraphicsPrograms        programs;
+		GraphicsPipelineKey   graphics_key;
+		std::vector<ShaderVertexInputInfo> vertex_info;
+		std::optional<ShaderPixelInputInfo> pixel_info;
+	};
+
+	std::mutex                 m_compile_mutex;
+	std::condition_variable    m_compile_cv;
+	std::queue<CompileJob>     m_compile_queue;
+	std::unordered_set<uint64_t> m_pending_jobs; // compute program ids
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_graphics;
+	bool                       m_async_enabled = false; // KYTY_ASYNC_PIPELINES=1
+	std::optional<std::thread> m_compile_thread;
+	std::atomic<bool>          m_shutdown {false};
+
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void EnsureWorker();
+	void WorkerLoop();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

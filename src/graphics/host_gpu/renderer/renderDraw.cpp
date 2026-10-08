@@ -1169,10 +1169,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	auto* pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	if (pipeline == nullptr) {
+		// Pipeline compilation is pending on the background worker; skip
+		// this draw on this frame instead of stalling the present thread.
+		return;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1189,7 +1194,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1210,7 +1215,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+		vk_buffer.pushConstants(pipeline->pipeline_layout, draw_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 
@@ -1225,7 +1230,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

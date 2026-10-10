@@ -211,7 +211,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::BufferDownloadSync);
+		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::g_download_site);
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
@@ -277,7 +277,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	                                  [this, vaddr, size] {
+		                                  Libs::Graphics::DownloadSiteScope ds(Libs::Graphics::WaitSite::DlInvalidate);
+		                                  ReadMemory(vaddr, size, true);
+	                                  });
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {

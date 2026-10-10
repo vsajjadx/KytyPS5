@@ -63,20 +63,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	// A write fault retires every cached GPU resource aliasing the page it lands in, so
-	// invalidate the whole guest page (a fixed 16 KiB) rather than the single byte that
-	// faulted. The cache walk costs the same either way, but the page-wide range stops the next
-	// byte written to that same page from faulting again -- the PERF log shows tens of thousands
-	// of these faults per second, each one followed by a CPU<->GPU synchronisation.
-	constexpr uint64_t guest_page_size = 0x4000;
-	const auto         page_begin      = fault_vaddr & ~(guest_page_size - 1u);
-	const bool         whole_page_mapped = IsMapped(page_begin, guest_page_size);
-	const auto         fault_begin     = std::chrono::steady_clock::now();
+	const auto fault_begin = std::chrono::steady_clock::now();
 	if (access == PageFaultAccess::Write) {
-		const auto invalidate_addr = whole_page_mapped ? page_begin : fault_vaddr;
-		const auto invalidate_size = whole_page_mapped ? guest_page_size : fault_size;
-		m_buffer_cache.InvalidateMemory(invalidate_addr, invalidate_size);
-		m_texture_cache.InvalidateMemory(invalidate_addr, invalidate_size);
+		// Invalidate exactly the reported address. Widening this to the whole 16 KiB guest
+		// page was tried and reverted: it removed most of the faults but retired 16 KiB of
+		// cached resources per byte written, which correlates with a GPU device lost
+		// (invalid GPU memory access) and a large rise in buffer_download_sync stalls.
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		g_frame_stats.write_faults.fetch_add(1, std::memory_order_relaxed);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

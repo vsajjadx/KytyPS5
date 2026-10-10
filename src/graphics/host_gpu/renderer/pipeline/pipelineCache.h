@@ -105,15 +105,8 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	// final_save=true (shutdown) also destroys the driver cache afterwards.
-	void Save(bool final_save = true);
+	void Save();
 
-	// Writes the driver pipeline cache every so many newly created pipelines, without
-	// destroying it. Shader compilation is the single most expensive thing the emulator does
-	// (the log shows hundreds of VS/PS/CS compiles at up to 73 ms each); persisting them
-	// as they happen means a crash or a kill no longer throws that work away, so a repeat
-	// run of the same title starts with everything already compiled.
-	void SaveDriverCacheSnapshot();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -181,7 +174,6 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
-	uint32_t                      m_pipelines_since_driver_save = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

@@ -58,19 +58,6 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 
 std::atomic<uint64_t> g_vram_spill_log_count {0};
 
-// VK_EXT_memory_budget reports what the driver is actually prepared to hand out. Once that is
-// nearly consumed, a device-local request can only fail, so ask for a host-visible (system RAM)
-// heap up front instead of burning the allocation attempt. Returns false whenever the budget is
-// not reportable (no extension, or usage unknown), which leaves behaviour exactly as it was.
-[[nodiscard]] bool DeviceMemoryTight(const GraphicContext& graphics) {
-	const auto budget = graphics.GetTotalMemoryBudget();
-	if (budget == 0) {
-		return false;
-	}
-	const auto usage = graphics.GetDeviceMemoryUsage();
-	return usage != 0 && usage + usage / 20 >= budget;
-}
-
 void LogVramSpill(uint64_t size, vk::Result device_result) {
 	const auto count = g_vram_spill_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (count > 16 && count % 64 != 0) {
@@ -98,6 +85,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// A vertex/index/indirect buffer is walked by the GPU for every draw; if its contents end up
+	// on the PCIe bus instead of in VRAM the frame rate collapses. Those stay device-local and a
+	// failure there is reported rather than spent on a slow allocation.
+	const bool spill_allowed =
+	    usage == MemoryUsage::DeviceLocal &&
+	    !bool(flags & (vk::BufferUsageFlagBits::eVertexBuffer |
+	                   vk::BufferUsageFlagBits::eIndexBuffer |
+	                   vk::BufferUsageFlagBits::eIndirectBuffer));
+
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
@@ -108,28 +104,22 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-	// Budget-driven spill: when the device heap is already nearly full, request system RAM from
-	// the start. Dropping WITHIN_BUDGET_BIT is required here -- the whole point is to place the
-	// buffer outside the device budget the driver enforces.
-	if (usage == MemoryUsage::DeviceLocal && DeviceMemoryTight(graphics)) {
-		allocation_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
-		                        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO;
-		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	}
-
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
 
-	if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal) {
-		// Device-local memory is exhausted. Instead of treating that as fatal, retry the same
-		// buffer in system RAM: every desktop GPU exposes a host-visible heap that does not
-		// count against VRAM, so the buffer gets created and the emulator keeps running. This
-		// used to reach EXIT_NOT_IMPLEMENTED and kill the process.
+	if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal && spill_allowed) {
+		// Device-local memory is genuinely exhausted. Retry the same buffer in system RAM: every
+		// desktop GPU exposes a host-visible heap that does not count against VRAM, so the buffer
+		// gets created and the emulator keeps running. This used to reach EXIT_NOT_IMPLEMENTED
+		// and kill the process.
+		//
+		// spill_allowed is false for buffers whose contents are read every frame (per-draw
+		// state, vertex/index data, render targets): those live on the PCIe bus once spilled and
+		// that is what took the frame rate down to 1. Only buffers whose access is rare enough
+		// that a slow read is preferable to a crash may spill.
 		const auto device_result = result;
 		graphics.LogMemoryBudget();
 

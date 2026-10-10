@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
+#include "loader/guestFaultRecovery.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
@@ -150,7 +151,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
 		    "unresolved_import_thunk");
-		EXIT_NOT_IMPLEMENTED(page == 0);
+		if (page == 0) {
+			LOGF("Relocate: unresolved-import thunk page allocation failed\\n");
+			return GuestFaultRecovery::INVALID_MEMORY_SENTINEL;
+		}
 		g_unresolved_stub_thunk_pages.push_back(page);
 		g_unresolved_stub_thunk_offset = 0;
 	}
@@ -194,6 +198,16 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	g_stubbed_imports.push_back(record);
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
+	if (thunk == 0) {
+		// No executable thunk is available. Point the relocation at the invalid-memory
+		// sentinel instead of aborting the process: the failure stays diagnosable and the
+		// guest fault it produces is recoverable by the exception handler.
+		g_stubbed_imports.pop_back();
+		LOGF("Relocate: unresolved-import thunk allocation failed for %s, using invalid-memory "
+		     "sentinel\\n",
+		     ri.name.c_str());
+		return GuestFaultRecovery::INVALID_MEMORY_SENTINEL;
+	}
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
 	return thunk;
 }
@@ -233,6 +247,18 @@ static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
+	// A null/unresolved-import fault inside the guest unwinds back to this frame instead of
+	// killing the process; this thread then returns through its normal exit path. The setjmp()
+	// deliberately lives in this function's own frame.
+	Loader::GuestFaultRecovery::RecoveryPoint recovery_point {};
+	auto* const previous_recovery_point = Loader::GuestFaultRecovery::g_active;
+	Loader::GuestFaultRecovery::g_active = &recovery_point;
+	if (std::setjmp(recovery_point.env) != 0) {
+		Loader::GuestFaultRecovery::g_active = previous_recovery_point;
+		std::printf("Guest entry thread unwound after an unresolvable fault; emulator continues\n");
+		std::fflush(stdout);
+		return;
+	}
 #if defined(__x86_64__) || defined(_M_X64)
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -676,6 +702,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
+		}
+		// A guest thread that dereferences a null or unresolved-import pointer cannot be
+		// resumed, but it must not take the whole emulator down with it either. Unwind only
+		// that guest thread back to the recovery point its entry wrapper armed and leave every
+		// other thread running; the old behaviour terminated the process here.
+		if (info->access_violation_type != CoreAccess::Execute &&
+		    Loader::GuestFaultRecovery::CanRecover(info->access_violation_vaddr)) {
+			char recovered_thread[64] = "(host thread)";
+			if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+				if (Libs::LibKernel::PthreadGetname(self, recovered_thread) != 0) {
+					std::snprintf(recovered_thread, sizeof(recovered_thread),
+					              "(unnamed guest thread)");
+				}
+			}
+			std::printf("Guest fault recovered: thread %s faulted at pc=0x%016" PRIx64
+			            " accessing 0x%016" PRIx64
+			            "; unwound that guest thread, emulator continues\n",
+			            recovered_thread, info->exception_address,
+			            info->access_violation_vaddr);
+			std::fflush(stdout);
+			Loader::GuestFaultRecovery::Unwind();
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread

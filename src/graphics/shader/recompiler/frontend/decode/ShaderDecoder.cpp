@@ -186,7 +186,9 @@ bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
 		// Conditional shader debugging is disabled.
 		case Opcode::S_CBRANCH_CDBGSYS:
-		case Opcode::S_CBRANCH_CDBGSYS_OR_USER: return false;
+		case Opcode::S_CBRANCH_CDBGUSER:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:
@@ -389,6 +391,7 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	while (front_words < front.size()) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
+		result.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		front_words += inst.word_count;
 		if (inst.opcode == Opcode::S_SETPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
@@ -406,6 +409,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
+	program.has_swap_pc = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -413,6 +417,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		DecodeInstruction(code, word_index, program.instructions.back());
 
 		const auto& inst = program.instructions.back();
+		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -507,6 +512,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SEXT_I32_I16:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BREV_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
 		case Opcode::S_BCNT1_I32_B32:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
@@ -568,7 +577,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
 		case Opcode::S_CBRANCH_CDBGSYS:
+		case Opcode::S_CBRANCH_CDBGUSER:
 		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
@@ -627,6 +638,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_USHORT:
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:
 		case Opcode::BUFFER_LOAD_DWORDX2:
 		case Opcode::BUFFER_LOAD_DWORDX3:

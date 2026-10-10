@@ -20,6 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -43,6 +44,23 @@
 namespace Libs::Graphics {
 
 static RenderContext* g_renderer = nullptr;
+
+namespace Gen5Driver {
+
+static constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
+static constexpr uint32_t DriverDmemSize = 0x200000;
+static constexpr uint32_t AgcDmemOffset  = 0x40000;
+
+struct DriverDmem {
+	std::mutex mutex;
+	int64_t    physical_offset = -1;
+};
+
+static DriverDmem g_driver_dmem;
+static int InitializeDmem();
+static void ReleaseDmem();
+
+} // namespace Gen5Driver
 
 template <typename... Args>
 static void AgcTrace(const char* format, const Args&... args) {
@@ -70,6 +88,7 @@ void Initialize() {
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->ShutdownGpu();
+	Gen5Driver::ReleaseDmem();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();
 	g_renderer = nullptr;
@@ -337,6 +356,38 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	}
 
 	printf("version = %u\n", ver);
+	std::scoped_lock lock {Gen5Driver::g_driver_dmem.mutex};
+	if (Gen5Driver::g_driver_dmem.physical_offset >= 0) {
+		return OK;
+	}
+	if (const auto result = Gen5Driver::InitializeDmem(); result != OK) {
+		return result;
+	}
+	struct FunctionShaderBindings {
+		uint64_t code;
+		uint32_t user_data[2];
+	};
+	static_assert(sizeof(FunctionShaderBindings) == 16);
+	// Ordered-count queue validator, including its return to the caller.
+	static constexpr std::array<uint32_t, 16> validator {
+	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
+	    0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
+	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
+	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
+	};
+	const auto base = Gen5Driver::DriverDmemBase + Gen5Driver::AgcDmemOffset;
+	const auto function_table = base + 0x60;
+	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
+	std::array<FunctionShaderBindings, 8> functions {};
+	functions[2].code = code_address;
+	const std::array<uint32_t, 4> descriptor {
+	    static_cast<uint32_t>(function_table),
+	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
+	    static_cast<uint32_t>(functions.size()), 0x5204u,
+	};
+	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
+	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
+	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 
 	return OK;
 }
@@ -830,6 +881,8 @@ enum class RegIndirectPacket : uint32_t {
 	Uc,
 };
 
+static constexpr uint32_t RegIndirectPacketSizeDw = 5;
+
 static uint32_t reg_indirect_native_op(RegIndirectPacket type) {
 	switch (type) {
 		case RegIndirectPacket::Cx: return Pm4::IT_SET_CONTEXT_REG_INDIRECT;
@@ -853,7 +906,7 @@ static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
 
 static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t num_regs,
                                       RegIndirectPacket type) {
-	cmd[0] = KYTY_PM4(5, reg_indirect_native_op(type), reg_indirect_pm4_r(type));
+	cmd[0] = KYTY_PM4(RegIndirectPacketSizeDw, reg_indirect_native_op(type), reg_indirect_pm4_r(type));
 	cmd[1] = static_cast<uint32_t>(vaddr) & 0xfffffffcu;
 	cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
 	cmd[3] = 0x80000000u;
@@ -1728,7 +1781,7 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 }
 
 uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
-	if (buf == nullptr || size_in_dwords < 2) {
+	if (buf == nullptr || size_in_dwords == 0) {
 		return nullptr;
 	}
 
@@ -1739,9 +1792,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
 	}
 
 	cmd[0] = KYTY_PM4(size_in_dwords, Pm4::IT_NOP, Pm4::R_ZERO);
-	if (size_in_dwords > 1) {
-		memset(cmd + 1, 0, static_cast<size_t>(size_in_dwords - 1) * 4);
-	}
 
 	return cmd;
 }
@@ -1789,6 +1839,33 @@ uint32_t KYTY_SYSV_ABI AgcCbDispatchGetSize() {
 	return 20;
 }
 
+static constexpr uint32_t BranchPacketSizeDw = 14;
+
+static void write_branch_target(uint32_t* words, uint64_t address, uint8_t cache_policy,
+                                 uint32_t size_in_dwords) {
+	words[0] = (words[0] & 0x3u) | (static_cast<uint32_t>(address) & ~0x3u);
+	words[1] = static_cast<uint32_t>(address >> 32u);
+	words[2] = (words[2] & 0xcff00000u) | (size_in_dwords & 0xfffffu) |
+	           ((static_cast<uint32_t>(cache_policy) & 0x3u) << 28u);
+}
+
+uint64_t KYTY_SYSV_ABI AgcCbBranchGetSize() {
+	PRINT_NAME();
+	return BranchPacketSizeDw * sizeof(uint32_t);
+}
+
+int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
+                                               const volatile uint32_t* target,
+                                               uint32_t size_in_dwords) {
+	PRINT_NAME();
+	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	write_branch_target(cmd + 8, reinterpret_cast<uint64_t>(target), cache_policy, size_in_dwords);
+	return OK;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t compare_function,
                                     const volatile uint64_t* compare_addr, uint64_t mask,
                                     uint64_t reference, uint8_t cache_policy1,
@@ -1814,7 +1891,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	auto* cmd = buf->AllocateDW(14);
+	auto* cmd = buf->AllocateDW(BranchPacketSizeDw);
 
 	if (cmd == nullptr) {
 		LOGF_COLOR(Log::Color::Red, "\t failed to allocate branch packet\n");
@@ -1825,7 +1902,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
 	const auto then_vaddr    = reinterpret_cast<uint64_t>(buffer1);
 	const auto else_vaddr    = reinterpret_cast<uint64_t>(buffer2);
 
-	cmd[0]  = KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0u);
+	cmd[0]  = KYTY_PM4(BranchPacketSizeDw, Pm4::IT_INDIRECT_BUFFER, 0u);
 	cmd[1]  = (mode & 0x3u) | ((static_cast<uint32_t>(compare_function) & 0x7u) << 8u);
 	cmd[2]  = static_cast<uint32_t>(compare_vaddr & 0xfffffff8u);
 	cmd[3]  = static_cast<uint32_t>((compare_vaddr >> 32u) & 0xffffffffu);
@@ -1833,12 +1910,9 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
 	cmd[5]  = static_cast<uint32_t>((mask >> 32u) & 0xffffffffu);
 	cmd[6]  = static_cast<uint32_t>(reference & 0xffffffffu);
 	cmd[7]  = static_cast<uint32_t>((reference >> 32u) & 0xffffffffu);
-	cmd[8]  = static_cast<uint32_t>(then_vaddr & 0xfffffffcu);
-	cmd[9]  = static_cast<uint32_t>((then_vaddr >> 32u) & 0xffffffffu);
-	cmd[10] = (size_in_dwords1 & 0xfffffu) | ((static_cast<uint32_t>(cache_policy1) & 0x3u) << 28u);
-	cmd[11] = static_cast<uint32_t>(else_vaddr & 0xfffffffcu);
-	cmd[12] = static_cast<uint32_t>((else_vaddr >> 32u) & 0xffffffffu);
-	cmd[13] = (size_in_dwords2 & 0xfffffu) | ((static_cast<uint32_t>(cache_policy2) & 0x3u) << 28u);
+	std::fill(cmd + 8, cmd + BranchPacketSizeDw, 0u);
+	write_branch_target(cmd + 8, then_vaddr, cache_policy1, size_in_dwords1);
+	write_branch_target(cmd + 11, else_vaddr, cache_policy2, size_in_dwords2);
 
 	return cmd;
 }
@@ -2353,7 +2427,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*             
 
 	buf->DbgDump();
 
-	auto* cmd = buf->AllocateDW(5);
+	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -2362,6 +2436,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*             
 	reg_indirect_write_packet(cmd, vaddr, num_regs, RegIndirectPacket::Cx);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirectGetSize() {
+	PRINT_NAME();
+	return RegIndirectPacketSizeDw * sizeof(uint32_t);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
@@ -2377,7 +2456,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 
 	buf->DbgDump();
 
-	auto* cmd = buf->AllocateDW(5);
+	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -2391,7 +2470,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 uint64_t KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize() {
 	PRINT_NAME();
 
-	return 5u * sizeof(uint32_t);
+	return RegIndirectPacketSizeDw * sizeof(uint32_t);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
@@ -2407,7 +2486,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*             
 
 	buf->DbgDump();
 
-	auto* cmd = buf->AllocateDW(5);
+	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -3647,12 +3726,7 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
 }
 
 uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
-	const auto cmd_id = packet[0];
-	if ((cmd_id & 0x3fffff00u) == 0x3fff1000u) {
-		return 1;
-	}
-
-	return KYTY_PM4_LEN(cmd_id);
+	return Pm4::PacketSizeDw(packet[0]);
 }
 
 int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
@@ -3694,12 +3768,7 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 		const auto cmd_id = packet[0];
 		packet[0]         = (cmd_id & ~1u) | predication_bit;
 
-		auto size = KYTY_PM4_LEN(cmd_id);
-		if ((cmd_id & 0x3fffff00u) == 0x3fff1000u) {
-			size = 1;
-		}
-
-		packet_va += size * sizeof(uint32_t);
+		packet_va += Pm4::PacketSizeDw(cmd_id) * sizeof(uint32_t);
 		packet = reinterpret_cast<uint32_t*>(packet_va);
 	}
 
@@ -4205,6 +4274,36 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 namespace Gen5Driver {
 
 LIB_NAME("Graphics5Driver", "Graphics5Driver");
+
+static int InitializeDmem() {
+	int64_t physical_offset = -1;
+	auto result = LibKernel::Memory::KernelAllocateDirectMemory(
+	    0, LibKernel::Memory::KernelGetDirectMemorySize(), DriverDmemSize, DriverDmemSize,
+	    12, &physical_offset);
+	if (result != OK) {
+		return result;
+	}
+	void* address = reinterpret_cast<void*>(DriverDmemBase);
+	result = LibKernel::Memory::KernelMapNamedDirectMemory(
+	    &address, DriverDmemSize, 0x33, 0, physical_offset, DriverDmemSize, "SceAgcDriver");
+	if (result != OK) {
+		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
+		return result;
+	}
+	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	std::memset(address, 0, DriverDmemSize);
+	g_driver_dmem.physical_offset = physical_offset;
+	return OK;
+}
+
+static void ReleaseDmem() {
+	std::scoped_lock lock {g_driver_dmem.mutex};
+	if (g_driver_dmem.physical_offset >= 0) {
+		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+		            g_driver_dmem.physical_offset, DriverDmemSize) != OK);
+		g_driver_dmem.physical_offset = -1;
+	}
+}
 
 struct TessellationDriverState {
 	uint64_t tf_ring_base      = 0;

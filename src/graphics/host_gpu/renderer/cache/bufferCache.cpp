@@ -143,6 +143,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+struct DbgWriter {
+	uint64_t addr, size, vs, ps, cs;
+};
+static std::vector<DbgWriter> g_dbg_writers; // GPU thread only; diagnostics
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -557,11 +562,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return handle;
 }
-
-struct DbgWriter {
-	uint64_t addr, size, vs, ps, cs;
-};
-static std::vector<DbgWriter> g_dbg_writers; // GPU thread only; diagnostics
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,

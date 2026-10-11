@@ -15,6 +15,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <unordered_map>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -292,6 +295,34 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
+		}
+		{
+			// Diagnostics: which guest pages keep faulting? Printed every 2 s.
+			static std::unordered_map<uint64_t, uint32_t> hot[2];
+			static auto last = std::chrono::steady_clock::now();
+			hot[is_write ? 1 : 0][vaddr >> 12]++;
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last > std::chrono::seconds(2)) {
+				last = now;
+				for (int k = 0; k < 2; k++) {
+					std::vector<std::pair<uint32_t, uint64_t>> top;
+					uint64_t total = 0;
+					for (const auto& [page, n]: hot[k]) {
+						top.emplace_back(n, page);
+						total += n;
+					}
+					std::sort(top.rbegin(), top.rend());
+					std::printf("FAULTS %s: %llu total, %zu pages; top:", k ? "write" : "read",
+					            static_cast<unsigned long long>(total), hot[k].size());
+					for (size_t i = 0; i < top.size() && i < 6; i++) {
+						std::printf(" 0x%llx x%u", static_cast<unsigned long long>(top[i].second << 12),
+						            top[i].first);
+					}
+					std::printf("\n");
+					hot[k].clear();
+				}
+				std::fflush(stdout);
+			}
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 

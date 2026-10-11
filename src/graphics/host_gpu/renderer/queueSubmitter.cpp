@@ -57,14 +57,14 @@ uint64_t QueueSubmitter::Enqueue(MasterSemaphore& master, SubmitInfo info, vk::C
 		const double    elapsed      = std::chrono::duration<double>(now - window_start).count();
 		if (elapsed >= 2.0) {
 			static const char* const names[] = {"DrawIndex", "DrawAuto", "PrepareDraw", "ExecuteDraw",
-			                                    "Dispatch"};
-			char                     line[512];
+			                                    "Dispatch", "Programs", "ResolveColor", "ResolveDepth", "Bindings", "GfxBindings", "VertexIdx", "Pipeline", "RenderTargets", "CommitBind", "DrawLock"};
+			char                     line[1024];
 			int                      n = std::snprintf(line, sizeof(line), "PERF3 %.1fs: submits=%llu",
 			                                           elapsed,
 			                                           static_cast<unsigned long long>(
 			                                               g_frame_stats.submits.load() - last_submits));
 			last_submits = g_frame_stats.submits.load();
-			for (uint32_t i = 0; i < static_cast<uint32_t>(StatSlotId::Count) && n > 0 && n < 450; i++) {
+			for (uint32_t i = 0; i < static_cast<uint32_t>(StatSlotId::Count) && n > 0 && n < 900; i++) {
 				const auto calls = g_stat_slots[i].calls.load();
 				const auto us    = g_stat_slots[i].us.load();
 				n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu/%.0fms", names[i],

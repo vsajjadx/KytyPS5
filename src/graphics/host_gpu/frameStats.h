@@ -88,7 +88,7 @@ inline FrameStats g_frame_stats;
 
 // Wall-clock time spent inside the main host-GPU entry points, so a log shows which one eats the
 // frame (printed as PERF3 and replayed when the device is lost).
-enum class StatSlotId : uint32_t { DrawIndex, DrawAuto, PrepareDraw, ExecuteDraw, Dispatch, Count };
+enum class StatSlotId : uint32_t { DrawIndex, DrawAuto, PrepareDraw, ExecuteDraw, Dispatch, Programs, ResolveColor, ResolveDepth, Bindings, GfxBindings, VertexIdx, Pipeline, RenderTargets, CommitBind, DrawLock, Count };
 
 struct StatSlot {
 	std::atomic<uint64_t> calls {0};

@@ -368,7 +368,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint64_t dl_addr = vaddr;
 		uint64_t dl_size = size;
 		{
-			constexpr uint64_t Window = 2 * MiB;
+			constexpr uint64_t Window = 4096; // diagnostics showed 2 MiB windows only inflated copies (575 MB / 2 s)
 			const uint64_t lo = std::max<uint64_t>(vaddr & ~(Window - 1), buffer.CpuAddress());
 			const uint64_t hi = std::min<uint64_t>((vaddr & ~(Window - 1)) + Window,
 			                                       buffer.CpuAddress() + buffer.Size());

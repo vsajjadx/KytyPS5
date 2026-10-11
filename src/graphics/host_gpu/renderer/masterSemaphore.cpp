@@ -107,6 +107,12 @@ void NoteBoundShader(uint32_t stage_slot, uint64_t hash) {
 	}
 }
 
+void GetBoundShaders(uint64_t& vs, uint64_t& ps, uint64_t& cs) {
+	vs = g_bound_vs.load(std::memory_order_relaxed);
+	ps = g_bound_ps.load(std::memory_order_relaxed);
+	cs = g_bound_cs.load(std::memory_order_relaxed);
+}
+
 bool CurrentDrawShadersSkipped() {
 	static const std::vector<uint64_t> skipped = [] {
 		std::vector<uint64_t> list;

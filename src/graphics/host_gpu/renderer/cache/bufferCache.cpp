@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -162,6 +163,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
+	{
+		static uint64_t dl_bytes = 0, dl_count = 0;
+		static auto dl_last = std::chrono::steady_clock::now();
+		dl_bytes += total_size;
+		dl_count++;
+		const auto dl_now = std::chrono::steady_clock::now();
+		if (dl_now - dl_last > std::chrono::seconds(2)) {
+			std::printf("DOWNLOADS: %llu in 2s, %.1f MB total, last=%llu KB\n", static_cast<unsigned long long>(dl_count),
+			            static_cast<double>(dl_bytes) / 1048576.0, static_cast<unsigned long long>(total_size / 1024));
+			dl_bytes = dl_count = 0;
+			dl_last = dl_now;
+		}
+	}
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -319,6 +333,23 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 						            top[i].first);
 					}
 					std::printf("\n");
+					for (size_t i = 0; k == 0 && i < top.size() && i < 3; i++) {
+						const uint64_t pa = top[i].second << 12;
+						uint32_t shown = 0;
+						for (auto it = g_dbg_writers.rbegin(); it != g_dbg_writers.rend() && shown < 2; ++it) {
+							if (pa >= it->addr && pa < it->addr + it->size) {
+								std::printf("  writer of 0x%llx: range=0x%llx+0x%llx vs=%016llx ps=%016llx cs=%016llx\n",
+								            static_cast<unsigned long long>(pa),
+								            static_cast<unsigned long long>(it->addr),
+								            static_cast<unsigned long long>(it->size),
+								            static_cast<unsigned long long>(it->vs),
+								            static_cast<unsigned long long>(it->ps),
+								            static_cast<unsigned long long>(it->cs));
+								shown++;
+							}
+						}
+					}
+					g_dbg_writers.clear();
 					hot[k].clear();
 				}
 				std::fflush(stdout);
@@ -527,6 +558,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+struct DbgWriter {
+	uint64_t addr, size, vs, ps, cs;
+};
+static std::vector<DbgWriter> g_dbg_writers; // GPU thread only; diagnostics
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -556,6 +592,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		DbgWriter w {vaddr, size, 0, 0, 0};
+		GetBoundShaders(w.vs, w.ps, w.cs);
+		if (g_dbg_writers.size() < 20000) {
+			g_dbg_writers.push_back(w);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

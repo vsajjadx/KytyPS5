@@ -295,8 +295,23 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// A CPU access fault only reports one byte. Games usually read a GPU-written buffer
+		// sequentially (or writes it back), so fetching just that page costs one full GPU wait per page. Download
+		// the surrounding 2 MiB window (clipped to the buffer) in a single wait instead.
+		uint64_t dl_addr = vaddr;
+		uint64_t dl_size = size;
+		{
+			constexpr uint64_t Window = 2 * MiB;
+			const uint64_t lo = std::max<uint64_t>(vaddr & ~(Window - 1), buffer.CpuAddress());
+			const uint64_t hi = std::min<uint64_t>((vaddr & ~(Window - 1)) + Window,
+			                                       buffer.CpuAddress() + buffer.Size());
+			if (lo <= vaddr && hi >= vaddr + size) {
+				dl_addr = lo;
+				dl_size = hi - lo;
+			}
+		}
+		if (DownloadBufferMemory<false>(buffer, dl_addr, dl_size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(dl_addr, dl_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

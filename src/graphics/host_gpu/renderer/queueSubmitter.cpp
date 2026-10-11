@@ -78,9 +78,17 @@ uint64_t QueueSubmitter::Enqueue(MasterSemaphore& master, SubmitInfo info, vk::C
 				wait_us += w.us.load(std::memory_order_relaxed);
 			}
 			const auto submit_us = g_frame_stats.submit_us.load();
-			std::snprintf(line + n, sizeof(line) - n, " hostWait=%.0fms queueSubmit=%.0fms",
-			              static_cast<double>(wait_us - last_wait_us) / 1000.0,
-			              static_cast<double>(submit_us - last_submit_us) / 1000.0);
+			n += std::snprintf(line + n, sizeof(line) - n, " hostWait=%.0fms queueSubmit=%.0fms",
+			                   static_cast<double>(wait_us - last_wait_us) / 1000.0,
+			                   static_cast<double>(submit_us - last_submit_us) / 1000.0);
+			if (n > 0 && n < 950) {
+				std::snprintf(line + n, sizeof(line) - n,
+				              " VRAM=%.0f/%.0fMB(cap %.0f) oom=%u",
+				              static_cast<double>(m_graphics.GetDeviceMemoryUsage()) / 1048576.0,
+				              static_cast<double>(m_graphics.GetTotalMemoryBudget()) / 1048576.0,
+				              static_cast<double>(m_graphics.GetMemoryCap()) / 1048576.0,
+				              m_graphics.device_oom_events.load());
+			}
 			last_wait_us   = wait_us;
 			last_submit_us = submit_us;
 			std::printf("%s\n", line);

@@ -26,7 +26,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
@@ -76,10 +83,6 @@ private:
 	// Derives the GC thresholds from a VRAM budget; called at start-up and whenever an allocation
 	// failure teaches the graphics context a lower ceiling.
 	void UpdateGcThresholds(uint64_t budget);
-
-	enum class TransferDirection { Upload, Download };
-	struct TextureTransfer;
-	struct ImageDownload;
 
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
@@ -145,12 +148,10 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] TextureTransfer
-	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
-	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                       uint64_t destination_size, ImageDownload transfer);
+	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -194,6 +195,9 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

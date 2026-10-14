@@ -4,6 +4,8 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "emulator.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -94,8 +96,13 @@ struct SystemServiceHdrToneMapLuminance {
 
 static int KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
 	PRINT_NAME();
-
+	Graphics::HideSplashScreen();
 	return OK;
+}
+
+int KYTY_SYSV_ABI SystemServiceLoadExec(const char* path, const char* const argv[]) {
+	PRINT_NAME();
+	return Emulator::LoadExec(path, argv);
 }
 
 static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
@@ -558,6 +565,7 @@ LIB_DEFINE(InitSystemGesture_1) {
 } // namespace SystemGesture
 
 LIB_DEFINE(InitSystemService_1) {
+	LIB_FUNC("JoBqSQt1yyA", SystemService::SystemServiceLoadExec);
 	LIB_FUNC("Vo5V8KAwCmk", SystemService::SystemServiceHideSplashScreen);
 	LIB_FUNC("fZo48un7LK4", SystemService::SystemServiceParamGetInt);
 	LIB_FUNC("SsC-m-S9JTA", SystemService::SystemServiceParamGetString);

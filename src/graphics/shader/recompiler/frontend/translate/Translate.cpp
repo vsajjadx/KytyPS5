@@ -875,30 +875,70 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_FLOOR_F64:
 		case Decoder::Opcode::V_FRACT_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_F_F64:
+		case Decoder::Opcode::V_CMP_LT_F64:
 		case Decoder::Opcode::V_CMP_EQ_F64:
 		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMP_GT_F64:
+		case Decoder::Opcode::V_CMP_LG_F64:
+		case Decoder::Opcode::V_CMP_GE_F64:
+		case Decoder::Opcode::V_CMP_O_F64:
+		case Decoder::Opcode::V_CMP_U_F64:
+		case Decoder::Opcode::V_CMP_NGE_F64:
+		case Decoder::Opcode::V_CMP_NLG_F64:
+		case Decoder::Opcode::V_CMP_NGT_F64:
+		case Decoder::Opcode::V_CMP_NLE_F64:
+		case Decoder::Opcode::V_CMP_NEQ_F64:
+		case Decoder::Opcode::V_CMP_NLT_F64:
+		case Decoder::Opcode::V_CMP_TRU_F64:
+		case Decoder::Opcode::V_CMPX_F_F64:
+		case Decoder::Opcode::V_CMPX_LT_F64:
+		case Decoder::Opcode::V_CMPX_EQ_F64:
 		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GT_F64:
+		case Decoder::Opcode::V_CMPX_LG_F64:
 		case Decoder::Opcode::V_CMPX_GE_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMPX_O_F64:
+		case Decoder::Opcode::V_CMPX_U_F64:
+		case Decoder::Opcode::V_CMPX_NGE_F64:
+		case Decoder::Opcode::V_CMPX_NLG_F64:
+		case Decoder::Opcode::V_CMPX_NGT_F64:
+		case Decoder::Opcode::V_CMPX_NLE_F64:
+		case Decoder::Opcode::V_CMPX_NEQ_F64:
+		case Decoder::Opcode::V_CMPX_NLT_F64:
+		case Decoder::Opcode::V_CMPX_TRU_F64:
+		case Decoder::Opcode::V_CMP_F_I64:
 		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
 		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_GT_I64:
 		case Decoder::Opcode::V_CMP_NE_I64:
+		case Decoder::Opcode::V_CMP_GE_I64:
+		case Decoder::Opcode::V_CMP_T_I64:
+		case Decoder::Opcode::V_CMP_F_U64:
 		case Decoder::Opcode::V_CMP_LT_U64:
 		case Decoder::Opcode::V_CMP_EQ_U64:
 		case Decoder::Opcode::V_CMP_LE_U64:
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMP_T_U64:
+		case Decoder::Opcode::V_CMPX_F_I64:
 		case Decoder::Opcode::V_CMPX_LT_I64:
 		case Decoder::Opcode::V_CMPX_EQ_I64:
 		case Decoder::Opcode::V_CMPX_LE_I64:
+		case Decoder::Opcode::V_CMPX_GT_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_GE_I64:
+		case Decoder::Opcode::V_CMPX_T_I64:
+		case Decoder::Opcode::V_CMPX_F_U64:
 		case Decoder::Opcode::V_CMPX_LT_U64:
 		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
 		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
 		case Decoder::Opcode::V_CMPX_GE_U64:
+		case Decoder::Opcode::V_CMPX_T_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -908,9 +948,14 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
+			case Decoder::Opcode::DS_MAX_RTN_U64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
+				include_vector(inst.src1, 2u);
+				include_vector(inst.src2, 2u);
+				break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
@@ -1123,9 +1168,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
-		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
-		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
-		                                            : IR::U32(IR::Value(0u)));
+		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
+		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
+		                                               : IR::U32(IR::Value(0u));
+		entry_ir.SetExecLo(initial_lo);
+		entry_ir.SetExecHi(initial_hi);
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1341,11 +1388,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// ESVertCount describes input vertices, independently of lane ordinals.
+			auto vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+			if (options.wave_size == 64u) {
+				vertex_count = entry_ir.IAdd(vertex_count, IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitCount32, {initial_hi})));
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
@@ -1356,7 +1408,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, flush_f32_inputs);
+		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

@@ -47,6 +47,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1du, Opcode::BUFFER_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
+    {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
+    {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
@@ -114,7 +116,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
-    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
+    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x68u, Opcode::DS_MAX_RTN_U64, 2, 32},
+    {0x70u, Opcode::DS_CMPST_RTN_B64, 2, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
     {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
     {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
@@ -190,6 +193,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
@@ -209,6 +214,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_MSKOR_B32: return 3u;
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
@@ -298,8 +304,10 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X) {
-		inst.dst.sdwa_sel = 4u;
+	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X ||
+	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
+	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
+		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;
 	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
@@ -371,7 +379,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (lds != 0 || inst.glc || inst.slc || seg == 3u) {
+	if (lds != 0 || inst.glc || (inst.slc && !IsFlatStoreOpcode(inst.opcode)) || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
 		return;
 	}

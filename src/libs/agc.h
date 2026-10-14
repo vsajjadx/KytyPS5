@@ -101,6 +101,10 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
                                     const volatile uint32_t* buffer1, uint32_t size_in_dwords1,
                                     uint8_t cache_policy2, const volatile uint32_t* buffer2,
                                     uint32_t size_in_dwords2);
+uint64_t KYTY_SYSV_ABI AgcCbBranchGetSize();
+int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
+                                               const volatile uint32_t* target,
+                                               uint32_t size_in_dwords);
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32_t offset,
                                                       const uint32_t* values, uint32_t num_values);
 uint32_t KYTY_SYSV_ABI  AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values);
@@ -134,6 +138,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegi
 uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs);
+uint64_t KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs);
@@ -265,6 +270,7 @@ uint32_t KYTY_SYSV_ABI  AgcGetPacketSize(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcSetPacketPredication(uint32_t* packet, uint32_t predication);
 int KYTY_SYSV_ABI       AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                                uint32_t predication);
+int KYTY_SYSV_ABI       AgcSetNop(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
@@ -301,6 +307,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 } // namespace Gen5
 
 namespace Gen5Driver {
+
+int Initialize();
 
 struct Packet {
 	uint32_t* addr;

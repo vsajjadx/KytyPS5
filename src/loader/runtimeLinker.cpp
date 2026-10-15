@@ -246,7 +246,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	Loader::GuestFaultRecovery::RecoveryPoint recovery_point {};
 	auto* const previous_recovery_point = Loader::GuestFaultRecovery::g_active;
 	Loader::GuestFaultRecovery::g_active = &recovery_point;
-	if (std::setjmp(recovery_point.env) != 0) {
+	if (setjmp(recovery_point.env) != 0) {
 		Loader::GuestFaultRecovery::g_active = previous_recovery_point;
 		std::printf("Guest entry thread unwound after an unresolvable fault; emulator continues\n");
 		std::fflush(stdout);

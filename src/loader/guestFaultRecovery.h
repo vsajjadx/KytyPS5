@@ -47,7 +47,7 @@ inline thread_local uint64_t g_recovered_faults = 0;
 //   RecoveryPoint point {};
 //   auto* previous = g_active;
 //   g_active = &point;
-//   if (std::setjmp(point.env) != 0) {
+//   if (setjmp(point.env) != 0) {
 //       g_active = previous;
 //       ...report and return...
 //   }

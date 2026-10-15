@@ -12,6 +12,7 @@
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string_view>
 #include <vector>
 #include <fmt/format.h>
@@ -485,9 +486,47 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// Expands a single "@file" argument: the file holds one UTF-8 argument per line.
+// Used by desktop shortcuts created by the launcher to keep the shortcut command line short.
+static bool LoadArgFile(const std::string& path, std::vector<std::string>& out) {
+	std::ifstream file(Common::PathFromUtf8(path), std::ios::in | std::ios::binary);
+	if (!file) {
+		return false;
+	}
+	std::string line;
+	bool        first = true;
+	while (std::getline(file, line)) {
+		if (first && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+		    static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF) {
+			line.erase(0, 3); // UTF-8 BOM
+		}
+		first = false;
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		out.push_back(line);
+	}
+	return true;
+}
+
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+
+	std::vector<std::string> arg_file_storage;
+	std::vector<char*>       arg_file_argv;
+	if (argc == 2 && argv[1][0] == '@') {
+		arg_file_storage.emplace_back(argv[0]);
+		if (!LoadArgFile(std::string(argv[1] + 1), arg_file_storage)) {
+			::printf("can't read argument file: %s\n", argv[1] + 1);
+			return 1;
+		}
+		for (auto& arg: arg_file_storage) {
+			arg_file_argv.push_back(arg.data());
+		}
+		argc = static_cast<int>(arg_file_argv.size());
+		argv = arg_file_argv.data();
+	}
 
 	RunOptions options;
 	bool       show_help = false;

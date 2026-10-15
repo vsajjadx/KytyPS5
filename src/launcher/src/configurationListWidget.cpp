@@ -1229,6 +1229,8 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	QAction* action_shortcut = menu.addAction(tr("Create desktop shortcut"), this,
+	                                          SIGNAL(CreateShortcut()));
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));
@@ -1266,6 +1268,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 
 	if (item != nullptr) {
 		action_run->setDisabled(item->IsRunning());
+		action_shortcut->setDisabled(item->GetInfo().basedir.isEmpty());
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
@@ -1274,6 +1277,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
 	} else {
 		action_run->setDisabled(true);
+		action_shortcut->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
 		action_remove_save_data->setDisabled(true);

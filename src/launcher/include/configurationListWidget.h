@@ -49,6 +49,7 @@ public:
 signals:
 
 	void Run();
+	void CreateShortcut();
 	void Select();
 	void PreviewControllerColor(const QString& color);
 

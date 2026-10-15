@@ -20,18 +20,23 @@ enum class WaitSite : uint32_t {
 	SwapchainFrame,
 	Finish,
 	FlushAndWait,
+	DlFaultRead,
+	DlInvalidate,
+	DlIndirect,
+	DlTexMeta,
 	Count
 };
 
 inline const char* WaitSiteName(WaitSite site) {
 	static const char* const names[] = {"other",      "stream_buffer", "buffer_download_sync",
 	                                    "buffer_retire", "fault_manager", "swapchain_frame",
-	                                    "finish",     "flush_and_wait"};
+	                                    "finish",     "flush_and_wait", "dl_fault_read", "dl_invalidate", "dl_indirect_args", "dl_tex_meta"};
 	const auto index = static_cast<size_t>(site);
 	return index < (sizeof(names) / sizeof(names[0])) ? names[index] : "?";
 }
 
 inline thread_local WaitSite g_wait_site = WaitSite::Other;
+inline thread_local WaitSite g_download_site = WaitSite::BufferDownloadSync;
 
 class WaitSiteScope {
 public:
@@ -46,6 +51,16 @@ public:
 
 private:
 	WaitSite m_previous;
+};
+
+class DownloadSiteScope {
+public:
+	explicit DownloadSiteScope(WaitSite s) : m_prev(g_download_site) { g_download_site = s; }
+	~DownloadSiteScope() { g_download_site = m_prev; }
+	DownloadSiteScope(const DownloadSiteScope&)            = delete;
+	DownloadSiteScope& operator=(const DownloadSiteScope&) = delete;
+private:
+	WaitSite m_prev;
 };
 
 // Cheap always-on counters printed every couple of seconds by NotePresentedFrame(), so a plain
@@ -79,7 +94,7 @@ inline FrameStats g_frame_stats;
 
 // Wall-clock time spent inside the main host-GPU entry points, so a log shows which one eats the
 // frame (printed as PERF3 and replayed when the device is lost).
-enum class StatSlotId : uint32_t { DrawIndex, DrawAuto, PrepareDraw, ExecuteDraw, Dispatch, Count };
+enum class StatSlotId : uint32_t { DrawIndex, DrawAuto, PrepareDraw, ExecuteDraw, Dispatch, Programs, ResolveColor, ResolveDepth, Bindings, GfxBindings, VertexIdx, Pipeline, RenderTargets, CommitBind, DrawLock, Count };
 
 struct StatSlot {
 	std::atomic<uint64_t> calls {0};

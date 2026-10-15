@@ -890,6 +890,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	ScopedStat programs_stat(StatSlotId::Programs);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -919,6 +920,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
+			ScopedStat color_stat(StatSlotId::ResolveColor);
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
@@ -929,7 +931,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
+	{
+		ScopedStat depth_stat(StatSlotId::ResolveDepth);
+		ResolveRenderDepthTarget(buffer, state.depth_info);
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1147,6 +1152,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	std::optional<ScopedStat>        bind_stat;
+	bind_stat.emplace(StatSlotId::Bindings);
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
@@ -1157,10 +1164,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	bind_stat.reset();
+	{
+		ScopedStat gb_stat(StatSlotId::GfxBindings);
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		ScopedStat vi_stat(StatSlotId::VertexIdx);
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1168,15 +1180,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	std::optional<ScopedStat> pl_stat;
+	pl_stat.emplace(StatSlotId::Pipeline);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	pl_stat.reset();
 	vk::ImageAspectFlags feedback_aspects;
+	std::optional<ScopedStat> rt_stat;
+	rt_stat.emplace(StatSlotId::RenderTargets);
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 
+	rt_stat.reset();
+	rt_stat.emplace(StatSlotId::CommitBind);
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
@@ -1263,7 +1282,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
+	std::optional<ScopedStat> lock_stat;
+	lock_stat.emplace(StatSlotId::DrawLock);
 	Common::LockGuard lock(m_context.GetMutex());
+	lock_stat.reset();
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}

@@ -20,6 +20,7 @@ void RecordPerfLine(const char* line);
 // Remembers the guest hash of the most recently bound vertex/pixel/compute shader so the submit
 // history can name the shaders of the work that was in flight when the device was lost.
 void NoteBoundShader(uint32_t stage_slot, uint64_t hash);
+void GetBoundShaders(uint64_t& vs, uint64_t& ps, uint64_t& cs);
 // True when the draw that is being recorded uses a shader on the skip list. The default list holds
 // empty by default (skipping b3b6b0fc2e9a1de7 did not prevent the UFC device loss);
 // KYTY_SKIP_SHADERS=<hex>[,<hex>...] replaces it and KYTY_SKIP_SHADERS=none disables skipping.

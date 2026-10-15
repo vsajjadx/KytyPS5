@@ -9,12 +9,16 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <unordered_map>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -159,6 +163,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+struct DbgWriter {
+	uint64_t addr, size, vs, ps, cs;
+};
+static std::vector<DbgWriter> g_dbg_writers; // GPU thread only; diagnostics
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -179,6 +188,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
+	{
+		static uint64_t dl_bytes = 0, dl_count = 0;
+		static auto dl_last = std::chrono::steady_clock::now();
+		dl_bytes += total_size;
+		dl_count++;
+		const auto dl_now = std::chrono::steady_clock::now();
+		if (dl_now - dl_last > std::chrono::seconds(2)) {
+			std::printf("DOWNLOADS: %llu in 2s, %.1f MB total, last=%llu KB\n", static_cast<unsigned long long>(dl_count),
+			            static_cast<double>(dl_bytes) / 1048576.0, static_cast<unsigned long long>(total_size / 1024));
+			dl_bytes = dl_count = 0;
+			dl_last = dl_now;
+		}
+	}
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -231,7 +253,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::BufferDownloadSync);
+		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::g_download_site);
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
@@ -297,7 +319,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	                                  [this, vaddr, size] {
+		                                  Libs::Graphics::DownloadSiteScope ds(Libs::Graphics::WaitSite::DlInvalidate);
+		                                  ReadMemory(vaddr, size, true);
+	                                  });
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -310,10 +335,70 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		{
+			// Diagnostics: which guest pages keep faulting? Printed every 2 s.
+			static std::unordered_map<uint64_t, uint32_t> hot[2];
+			static auto last = std::chrono::steady_clock::now();
+			hot[is_write ? 1 : 0][vaddr >> 12]++;
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last > std::chrono::seconds(2)) {
+				last = now;
+				for (int k = 0; k < 2; k++) {
+					std::vector<std::pair<uint32_t, uint64_t>> top;
+					uint64_t total = 0;
+					for (const auto& [page, n]: hot[k]) {
+						top.emplace_back(n, page);
+						total += n;
+					}
+					std::sort(top.rbegin(), top.rend());
+					std::printf("FAULTS %s: %llu total, %zu pages; top:", k ? "write" : "read",
+					            static_cast<unsigned long long>(total), hot[k].size());
+					for (size_t i = 0; i < top.size() && i < 6; i++) {
+						std::printf(" 0x%llx x%u", static_cast<unsigned long long>(top[i].second << 12),
+						            top[i].first);
+					}
+					std::printf("\n");
+					for (size_t i = 0; k == 0 && i < top.size() && i < 3; i++) {
+						const uint64_t pa = top[i].second << 12;
+						uint32_t shown = 0;
+						for (auto it = g_dbg_writers.rbegin(); it != g_dbg_writers.rend() && shown < 2; ++it) {
+							if (pa >= it->addr && pa < it->addr + it->size) {
+								std::printf("  writer of 0x%llx: range=0x%llx+0x%llx vs=%016llx ps=%016llx cs=%016llx\n",
+								            static_cast<unsigned long long>(pa),
+								            static_cast<unsigned long long>(it->addr),
+								            static_cast<unsigned long long>(it->size),
+								            static_cast<unsigned long long>(it->vs),
+								            static_cast<unsigned long long>(it->ps),
+								            static_cast<unsigned long long>(it->cs));
+								shown++;
+							}
+						}
+					}
+					g_dbg_writers.clear();
+					hot[k].clear();
+				}
+				std::fflush(stdout);
+			}
+		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// A CPU access fault only reports one byte. Games usually read a GPU-written buffer
+		// sequentially (or writes it back), so fetching just that page costs one full GPU wait per page. Download
+		// the surrounding 2 MiB window (clipped to the buffer) in a single wait instead.
+		uint64_t dl_addr = vaddr;
+		uint64_t dl_size = size;
+		{
+			constexpr uint64_t Window = 4096; // diagnostics showed 2 MiB windows only inflated copies (575 MB / 2 s)
+			const uint64_t lo = std::max<uint64_t>(vaddr & ~(Window - 1), buffer.CpuAddress());
+			const uint64_t hi = std::min<uint64_t>((vaddr & ~(Window - 1)) + Window,
+			                                       buffer.CpuAddress() + buffer.Size());
+			if (lo <= vaddr && hi >= vaddr + size) {
+				dl_addr = lo;
+				dl_size = hi - lo;
+			}
+		}
+		if (DownloadBufferMemory<false>(buffer, dl_addr, dl_size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(dl_addr, dl_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -518,6 +603,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		DbgWriter w {vaddr, size, 0, 0, 0};
+		GetBoundShaders(w.vs, w.ps, w.cs);
+		if (g_dbg_writers.size() < 20000) {
+			g_dbg_writers.push_back(w);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
@@ -73,6 +74,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		g_frame_stats.write_faults.fetch_add(1, std::memory_order_relaxed);
 	} else {
+		Libs::Graphics::DownloadSiteScope ds(Libs::Graphics::WaitSite::DlFaultRead);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 		g_frame_stats.read_faults.fetch_add(1, std::memory_order_relaxed);
 	}

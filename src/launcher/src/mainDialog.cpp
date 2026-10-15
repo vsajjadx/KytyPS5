@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "gameShortcut.h"
 #include "titleSound.h"
 #include "updateChecker.h"
 
@@ -77,6 +78,7 @@ public:
 	void Update();
 	void FindInterpreter();
 	void Run();
+	void CreateShortcut();
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -140,6 +142,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	connect(m_ui->widget, &ConfigurationListWidget::CreateShortcut, this,
+	        &MainDialogPrivate::CreateShortcut);
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
@@ -547,6 +551,41 @@ void MainDialogPrivate::Run() {
 	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
+}
+
+void MainDialogPrivate::CreateShortcut() {
+	const auto* item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr) {
+		return;
+	}
+
+	if (m_interpreter.isEmpty() || !QFileInfo::exists(m_interpreter)) {
+		QMessageBox::critical(m_main_dialog, tr("Error"), tr("Emulator executable was not found."));
+		return;
+	}
+
+	const auto info = m_ui->widget->CreateConfiguration(*item);
+	const auto args = CreateEmulatorArgs(*info);
+	if (args.isEmpty()) {
+		QMessageBox::critical(m_main_dialog, tr("Error"), tr("Invalid emulator configuration"));
+		return;
+	}
+
+	const auto icon = GameContent::ReadFile(info->basedir, QStringLiteral("sce_sys/icon0.png"),
+	                                        GameContent::MaxImageSize);
+
+	const auto result =
+	    GameShortcut::CreateOnDesktop(info->name, info->title_id, m_interpreter, args, icon);
+	if (result.ok) {
+		QMessageBox::information(
+		    m_main_dialog, tr("Desktop shortcut"),
+		    tr("Shortcut created:\n%1\n\nIt starts the game directly in the emulator with the "
+		       "current settings. Create it again after changing the game's settings.")
+		        .arg(QDir::toNativeSeparators(result.path)));
+	} else {
+		QMessageBox::critical(m_main_dialog, tr("Error"),
+		                      tr("Failed to create the shortcut:\n%1").arg(result.error));
+	}
 }
 
 void MainDialogPrivate::Update() {

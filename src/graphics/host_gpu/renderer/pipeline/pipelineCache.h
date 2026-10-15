@@ -107,6 +107,7 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;

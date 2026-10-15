@@ -135,10 +135,23 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The PERF log shows tens of thousands of these faults per second. Logging every one of
+		// them to the console (with a flush) was itself part of the cost, so report the first
+		// few addresses of each batch and then a count. Nothing is hidden: the number of
+		// addresses still shows how much memory went uncached.
+		constexpr uint32_t logged_samples = 4;
+		uint32_t           logged         = 0;
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			if (logged < logged_samples) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+				++logged;
+			}
+		}
+		if (count > logged) {
+			LOGF("Accessed non-GPU cached memory: %u more addresses in this batch\n",
+			     count - logged);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

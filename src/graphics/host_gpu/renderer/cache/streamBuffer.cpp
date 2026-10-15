@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <atomic>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -54,6 +56,21 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	return true;
 }
 
+std::atomic<uint64_t> g_vram_spill_log_count {0};
+
+void LogVramSpill(uint64_t size, vk::Result device_result) {
+	const auto count = g_vram_spill_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count > 16 && count % 64 != 0) {
+		return;
+	}
+	std::printf("VRAM spill: %" PRIu64
+	            " bytes moved to system RAM because device-local memory refused the "
+	            "allocation (%s, #%" PRIu64
+	            "); device access to spilled memory goes over PCIe and is slower\n",
+	            size, vk::to_string(device_result).c_str(), count);
+	std::fflush(stdout);
+}
+
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
@@ -68,6 +85,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// A vertex/index/indirect buffer is walked by the GPU for every draw; if its contents end up
+	// on the PCIe bus instead of in VRAM the frame rate collapses. Those stay device-local and a
+	// failure there is reported rather than spent on a slow allocation.
+	const bool spill_allowed =
+	    usage == MemoryUsage::DeviceLocal &&
+	    !bool(flags & (vk::BufferUsageFlagBits::eVertexBuffer |
+	                   vk::BufferUsageFlagBits::eIndexBuffer |
+	                   vk::BufferUsageFlagBits::eIndirectBuffer));
+
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
@@ -80,13 +106,57 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
+	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
+
+	if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal && spill_allowed) {
+		// Device-local memory is genuinely exhausted. Retry the same buffer in system RAM: every
+		// desktop GPU exposes a host-visible heap that does not count against VRAM, so the buffer
+		// gets created and the emulator keeps running. This used to reach EXIT_NOT_IMPLEMENTED
+		// and kill the process.
+		//
+		// spill_allowed is false for buffers whose contents are read every frame (per-draw
+		// state, vertex/index data, render targets): those live on the PCIe bus once spilled and
+		// that is what took the frame rate down to 1. Only buffers whose access is rare enough
+		// that a slow read is preferable to a crash may spill.
+		const auto device_result = result;
 		graphics.LogMemoryBudget();
+
+		VmaAllocationCreateInfo fallback_info {};
+		fallback_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+		                      VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		fallback_info.usage          = VMA_MEMORY_USAGE_AUTO;
+		fallback_info.requiredFlags  = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		fallback_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		result                       = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &fallback_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+
+		if (result != vk::Result::eSuccess) {
+			// Nothing host-visible matched. Last resort: take whatever memory type exists.
+			VmaAllocationCreateInfo any_info {};
+			any_info.usage = VMA_MEMORY_USAGE_AUTO;
+			result         = static_cast<vk::Result>(vmaCreateBuffer(
+			    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &any_info,
+			    &native_buffer, &m_allocation, &allocation_result));
+		}
+
+		if (result == vk::Result::eSuccess) {
+			LogVramSpill(size, device_result);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	if (result != vk::Result::eSuccess) {
+		// Both device-local and system RAM refused: the emulator cannot function without the
+		// buffer, so this stays the one fatal case, with the numbers needed to size the limit.
+		graphics.LogMemoryBudget();
+		EXIT("Buffer allocation failed in device-local memory and in system RAM: %s (%d), "
+		     "size=%" PRIu64 ", usage=%d, device budget=%" PRIu64
+		     " -- lower the in-game resolution/texture setting or the emulator memory cap\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), size,
+		     static_cast<int>(usage), graphics.GetTotalMemoryBudget());
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {

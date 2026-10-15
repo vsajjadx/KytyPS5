@@ -116,7 +116,24 @@ jobs:
             audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel > build.log 2>&1
+          set BUILD_RC=%ERRORLEVEL%
+          type build.log
+          exit /b %BUILD_RC%
+
+      - name: Surface build errors as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path build.log) {
+            $pat = '(error[: ]|error C\d+|LNK\d+|undefined (symbol|reference)|FAILED:)'
+            $lines = Select-String -Path build.log -Pattern $pat | ForEach-Object { $_.Line.Trim() } | Select-Object -Unique | Select-Object -First 9
+            foreach ($l in $lines) {
+              if ($l.Length -gt 600) { $l = $l.Substring(0, 600) }
+              $l = $l.Replace('%','%25').Replace("`r",'').Replace("`n",'')
+              Write-Host "::error title=build error::$l"
+            }
+          }
 
       - name: Test
         continue-on-error: true # fork: a failing unit test must not block the exe artifact

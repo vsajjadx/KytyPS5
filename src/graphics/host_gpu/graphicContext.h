@@ -9,6 +9,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <span>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -34,6 +35,7 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               maintenance8_enabled                  = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -102,6 +104,14 @@ struct GraphicContext {
 	// ceiling learned from device-local allocation failures (see CreateImage).
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] uint64_t GetReportedMemoryBudget() const;
+
+	struct HeapUsage {
+		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
+		uint64_t budget       = 0;
+		uint32_t allocations  = 0;
+		bool     device_local = false;
+	};
+	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 

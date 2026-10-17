@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <array>
@@ -152,6 +153,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto wait_begin = std::chrono::steady_clock::now();
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	    std::chrono::steady_clock::now() - wait_begin).count()));

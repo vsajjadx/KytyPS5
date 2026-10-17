@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "titleSound.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -90,6 +91,7 @@ private:
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
 	ControllerPreview m_controller_preview;
+	TitleSound      m_title_sound;
 	QString         m_interpreter;
 
 	QProcess m_process;
@@ -124,7 +126,13 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
+		Update();
+		const auto* item = m_ui->widget->GetSelectedItem();
+		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
+		                           ? item->GetInfo().basedir
+		                           : QString());
+	});
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
@@ -238,6 +246,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
+	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -245,13 +254,20 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}
+	if (info.hdr_enabled) {
+		args << "--hdr";
+	}
 	if (info.hide_cursor_enabled) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
+	args << "--support-zmask" << BoolArg(info.support_zmask);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
+	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
 	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
+	args << "--network-connected" << BoolArg(info.network_connected);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -290,6 +306,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
+	if (!info.addons_dir.isEmpty()) {
+		args << "--addcont-dir" << info.addons_dir;
+	}
 
 	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
@@ -522,6 +541,7 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 	m_controller_preview.SetSuspended(true);
+	m_title_sound.SetTitle({});
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 	m_main_dialog->RunInterpreter(&m_process, *info);

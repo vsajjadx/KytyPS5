@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -25,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,16 +89,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 		FreeTlsBlock(&block);
 	}
 }
-
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
@@ -199,6 +191,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -661,6 +654,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -675,6 +669,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -1283,11 +1278,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 

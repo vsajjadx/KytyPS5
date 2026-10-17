@@ -12,9 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <bitset>
 #include <map>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,7 +26,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
@@ -80,8 +87,9 @@ private:
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		Type type;
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {
@@ -111,7 +119,6 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -170,7 +177,6 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -188,6 +194,9 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

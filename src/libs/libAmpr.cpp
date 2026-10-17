@@ -25,6 +25,9 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <atomic>
+#include <cinttypes>
+#include <iterator>
 #include <variant>
 #include <vector>
 
@@ -176,6 +179,14 @@ static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::Fi
 	return OK;
 }
 
+// Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
+void InvalidateFailedResolves() {
+	std::scoped_lock lock(g_mutex);
+	for (auto it = g_resolved_paths.begin(); it != g_resolved_paths.end();) {
+		it = it->second.result != OK ? g_resolved_paths.erase(it) : std::next(it);
+	}
+}
+
 static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) {
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -224,6 +235,10 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
+		}
+		if (!log_missing && info.result == OK && path.starts_with("/addcont")) {
+			LOGF("\tAPR resolve: %s -> %s (%" PRIu64 " bytes)\n", guest_path,
+			     Common::PathToString(info.host_path).c_str(), info.file_size);
 		}
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(info.host_path).c_str());
@@ -868,6 +883,10 @@ static uint64_t AprReadFileRecordSize(uint64_t file_offset) {
 	return (file_offset >> 32u) != 0 ? READ_FILE_RECORD_SIZE_EXT : READ_FILE_RECORD_SIZE;
 }
 
+static uint64_t WriteAddressRecordSize(uint64_t value) {
+	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
+}
+
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
 	return file_offset > 0x3ffffu ? READ_GATHER_RECORD_SIZE_EXT : READ_GATHER_RECORD_SIZE;
 }
@@ -1177,6 +1196,13 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		uint64_t bytes_read = 0;
 		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
 		                                      command.size, &bytes_read);
+		static std::atomic<uint32_t> s_logged_dlc_reads {0};
+		if (host_path.filename() == "re_dlc_000.pak" && s_logged_dlc_reads.fetch_add(1) < 32) {
+			LOGF("\tAPR read dlc: id=0x%08" PRIx32 ", offset=0x%016" PRIx64 ", size=0x%016" PRIx64
+			     ", read=0x%016" PRIx64 ", result=0x%08" PRIx32 "\n",
+			     command.file_id, command.file_offset, command.size, bytes_read,
+			     static_cast<uint32_t>(result));
+		}
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
 			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
@@ -1207,7 +1233,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		const auto& command = *payload;
 		int         result  = OK;
 		if (command.kind == AmmCommandKind::Unmap) {
-			result = LibKernel::Memory::KernelMunmap(command.va, command.size);
+			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
 		} else {
 			result = ExecuteAmmMapCommand(command);
 		}
@@ -1617,11 +1643,10 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeFixed32(uint64_t, uint64_t, uint
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddressOnCompletion(volatile uint64_t*,
-                                                                         uint64_t) {
+static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddress(volatile uint64_t*, uint64_t value) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WriteAddressRecordSize(value);
 }
 
 static uint64_t KYTY_SYSV_ABI
@@ -1950,7 +1975,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_
 }
 
 static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* address,
-                                     uint64_t value) {
+                                     uint64_t value, uint64_t record_size) {
 	if (command_buffer == nullptr || address == nullptr ||
 	    (reinterpret_cast<uint64_t>(address) & 7) != 0) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -1958,7 +1983,7 @@ static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* ad
 	return AppendCommandRecord(
 	           reinterpret_cast<uint64_t>(command_buffer),
 	           CommandBufferState::WriteAddressCommand {reinterpret_cast<uint64_t>(address), value},
-	           0x20)
+	           record_size)
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
@@ -1967,7 +1992,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddress(void* command_buffer, volatil
                                                    uint64_t value, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, value);
+	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*              command_buffer,
@@ -1975,7 +2000,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
                                                                uint64_t           value) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, value);
+	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t index,
@@ -2007,14 +2032,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*         
                                                                   uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
@@ -2022,14 +2047,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*             
                                                               uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
@@ -2037,14 +2062,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*         
                                                                   uint8_t, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
@@ -2452,14 +2477,14 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("vWU-odnS+fU", Ampr::MeasureCommandSizeReadFile);
 	LIB_FUNC("sSAUCCU1dv4", Ampr::MeasureCommandSizeWriteKernelEventQueue);
 	LIB_FUNC("Zi3dBUjgyXI", Ampr::MeasureCommandSizeWriteKernelEventQueue);
-	LIB_FUNC("C+IEj+BsAFM", Ampr::MeasureCommandSizeWriteAddressOnCompletion);
+	LIB_FUNC("C+IEj+BsAFM", Ampr::MeasureCommandSizeWriteAddress);
 	LIB_FUNC("x7SQEXfeovg", Ampr::MeasureCommandSizeWriteAddressFromTimeCounterOnCompletion);
 	LIB_FUNC("32AcaTaBPSY", Ampr::MeasureCommandSizeWriteAddressFromCounterOnCompletion);
 	LIB_FUNC("vxC58+DRk-U", Ampr::MeasureCommandSizeWriteAddressFromCounterPairOnCompletion);
 	LIB_FUNC("4muPEJ-x5N8", Ampr::MeasureCommandSizeWriteCounterOnCompletion);
 	LIB_FUNC("0BMj1hgG+kE", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("ClnsFLLLcss", Ampr::MeasureCommandSizeFixed32);
-	LIB_FUNC("4fgtGfXDrFc", Ampr::MeasureCommandSizeFixed32);
+	LIB_FUNC("4fgtGfXDrFc", Ampr::MeasureCommandSizeWriteAddress);
 	LIB_FUNC("gAtc79UTt5E", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("JYd9g9L+TmE", Ampr::MeasureCommandSizeFixed32);
 	LIB_FUNC("2Hw8gjMdwSY", Ampr::MeasureCommandSizeFixed32);

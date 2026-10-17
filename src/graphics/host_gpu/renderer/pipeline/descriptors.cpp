@@ -555,9 +555,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			            static_cast<uint32_t>(descriptor.Type()), descriptor.Base40());
 			std::fflush(stdout);
 		}
-		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		// Same native null binding as an unbound descriptor above.
+		return {.layout = vk::ImageLayout::eGeneral};
 	}
 
 	const auto address         = descriptor.Base40();

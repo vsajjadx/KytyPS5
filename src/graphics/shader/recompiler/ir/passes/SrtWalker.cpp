@@ -136,11 +136,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
-		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
-		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
@@ -161,9 +159,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32:
 		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -259,9 +259,7 @@ private:
 			}
 			return finish(Validate(inst->Arg(1)));
 		}
-		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
-		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
-		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
+		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 || op == ValueOpcode::Void) {
 			return finish(false);
 		}
 		if (op == ValueOpcode::GetUserData) {
@@ -341,9 +339,7 @@ private:
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u ||
-			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
-			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
+			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
 				return finish(false);
 			}
 		}
@@ -656,18 +652,6 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
 	}
-	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
-		uint64_t lhs = 0;
-		uint64_t rhs = 0;
-		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
-			return false;
-		}
-		const auto sum =
-		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-		result =
-		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
-		return true;
-	}
 	return false;
 }
 
@@ -846,12 +830,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::IMul64:
-			if (binary()) {
-				result = a * b;
-				return true;
-			}
-			return false;
 		case ValueOpcode::UMulHi:
 			if (binary()) {
 				result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
@@ -875,12 +853,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::ConvertU32F32:
 			if (Arg(inst, 0, a)) {
+				// The conversion saturates and maps NaN to zero.
 				const auto value = Float32(a);
-				if (!std::isfinite(value) || value < 0.0f ||
-				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
-				}
-				result = static_cast<uint32_t>(value);
+				result           = std::isnan(value) || value <= 0.0f ? 0u
+				                   : value >= 4294967296.0f ? UINT32_MAX
+				                                            : static_cast<uint32_t>(value);
 				return true;
 			}
 			return false;
@@ -1069,6 +1046,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+			if (!binary()) return false;
+			result = inst.GetOpcode() == ValueOpcode::IEqual64 ? a == b : a != b;
+			return true;
 		case ValueOpcode::ULessThan32:
 			// No U32 is below zero, including an unknown loop-carried value.
 			if (!Arg(inst, 1, b)) return false;
@@ -1152,10 +1134,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU8:
-		case ValueOpcode::UndefU16:
-		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
+		case ValueOpcode::UndefU32: return false;
 		default: break;
 	}
 	return false;

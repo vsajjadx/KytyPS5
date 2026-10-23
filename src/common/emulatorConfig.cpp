@@ -185,12 +185,12 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-bool SyncRawImageBuffersEnabled() {
-	return g_config->sync_raw_image_buffers;
+bool ReadbackTiledImagesEnabled() {
+	return g_config->readback_tiled_images;
 }
 
-bool SupportZmaskEnabled() {
-	return g_config->support_zmask;
+bool SyncRawImageBuffersEnabled() {
+	return g_config->sync_raw_image_buffers;
 }
 
 bool TessellationEnabled() {

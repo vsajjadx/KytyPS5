@@ -13,8 +13,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(hdr_enabled);
 	KYTY_CFG_SET(hide_cursor_enabled);
 	KYTY_CFG_SET(readback_linear_images);
+	KYTY_CFG_SET(readback_tiled_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
-	KYTY_CFG_SET(support_zmask);
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -63,8 +63,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
 	KYTY_CFG_GET(readback_linear_images);
+	KYTY_CFG_GET(readback_tiled_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
-	KYTY_CFG_GET(support_zmask);
 	KYTY_CFG_GET(tessellation_enabled);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);

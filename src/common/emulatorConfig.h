@@ -85,8 +85,8 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   support_zmask               = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -151,8 +151,8 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
-bool SupportZmaskEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();

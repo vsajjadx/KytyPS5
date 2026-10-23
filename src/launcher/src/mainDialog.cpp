@@ -13,6 +13,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -27,6 +28,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStringList>
+#include <QStyleHints>
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
@@ -62,7 +64,8 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
-constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
+constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
+constexpr char SETTINGS_THEME[]              = "theme";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -88,6 +91,17 @@ public:
 private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
+	static int        g_theme;
+
+	static void ApplyTheme(int theme) {
+		auto scheme = Qt::ColorScheme::Unknown;
+		switch (theme) {
+			case 1: scheme = Qt::ColorScheme::Dark; break;
+			case 2: scheme = Qt::ColorScheme::Light; break;
+			default: break;
+		}
+		QApplication::styleHints()->setColorScheme(scheme);
+	}
 
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
@@ -103,6 +117,7 @@ private:
 
 QByteArray MainDialogPrivate::g_last_geometry;
 bool       MainDialogPrivate::g_check_updates_on_startup = true;
+int        MainDialogPrivate::g_theme                    = 0;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
 	m_p->Setup(this);
@@ -121,6 +136,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
+	m_ui->theme_combo->setCurrentIndex(g_theme);
+	ApplyTheme(g_theme);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
@@ -151,6 +168,11 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_update_checker, &UpdateChecker::InstallingChanged, this, &MainDialogPrivate::Update);
 	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
 		g_check_updates_on_startup = checked;
+		m_ui->widget->WriteSettings();
+	});
+	connect(m_ui->theme_combo, &QComboBox::currentIndexChanged, this, [this](int index) {
+		g_theme = index;
+		ApplyTheme(index);
 		m_ui->widget->WriteSettings();
 	});
 	connect(main_dialog, &MainDialog::Resize, [this]() {
@@ -226,8 +248,10 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 }
 
-static QString BoolArg(bool value) {
-	return value ? QStringLiteral("true") : QStringLiteral("false");
+static void AddFlag(QStringList& args, bool enabled, const char* name) {
+	if (enabled) {
+		args << name;
+	}
 }
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
@@ -255,55 +279,38 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
-	if (info.fullscreen_enabled) {
-		args << "--fullscreen";
-	}
-	if (info.hdr_enabled) {
-		args << "--hdr";
-	}
-	if (info.hide_cursor_enabled) {
-		args << "--hide-cursor";
-	}
-	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
-	args << "--support-zmask" << BoolArg(info.support_zmask);
-	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
+	AddFlag(args, info.hdr_enabled, "--hdr");
+	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
+	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
+	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
+	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
+	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
-	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
-	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
-	args << "--network-connected" << BoolArg(info.network_connected);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
+	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
+	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
+	AddFlag(args, info.network_connected, "--network-connected");
+	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
-	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
-	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
+	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
+	AddFlag(args, info.shader_validation_enabled, "--shader-validation");
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
-	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
+	AddFlag(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
-	if (info.profiler_enabled) {
-		args << "--profile";
-	}
-	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
-		args << "--amd-cpu";
-	}
+	AddFlag(args, info.profiler_enabled, "--profile");
+	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
-	if (info.red_zone_protection_enabled) {
-		args << "--redzone";
-	}
+	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}
-	if (info.renderdoc_enabled) {
-		args << "--rd";
-	}
+	AddFlag(args, info.renderdoc_enabled, "--rd");
 
 	QString game = info.basedir;
 	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
@@ -521,6 +528,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
 	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
+	s.setValue(SETTINGS_THEME, g_theme);
 
 	s.endGroup();
 }
@@ -530,6 +538,10 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
 	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
+	g_theme                    = s.value(SETTINGS_THEME, 0).toInt();
+	if (g_theme < 0 || g_theme > 2) {
+		g_theme = 0;
+	}
 
 	s.endGroup();
 }

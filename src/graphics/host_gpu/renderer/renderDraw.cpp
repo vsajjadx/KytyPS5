@@ -1254,7 +1254,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages,
+		vk_buffer.pushConstants(pipeline->pipeline_layout, draw_stages,
 		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());

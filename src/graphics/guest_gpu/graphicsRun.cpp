@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -241,6 +242,32 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+// Submitting once per guest submission recorded ~17 draws per vkQueueSubmit in UFC 5 fights,
+// far below the 50-100 a command list should carry. Accumulate across guest submissions
+// instead. Guest EOP interrupts, frame boundaries, blocked submissions and an idle GPU thread
+// still submit at once, and CommandScheduler::Wait/Finish submit before waiting, so deferred
+// work can always complete. KYTY_SUBMIT_DRAW_THRESHOLD=0 restores a submit per guest
+// submission. Ported from ReeceKetley/KytyPS5-UFC5 (UFC 5: +10% fights, ~+46% menus).
+static uint32_t SubmitWorkThreshold() {
+	static const uint32_t value = []() -> uint32_t {
+		const char* raw = std::getenv("KYTY_SUBMIT_DRAW_THRESHOLD");
+		if (raw == nullptr) {
+			return 64;
+		}
+		return static_cast<uint32_t>(std::strtoul(raw, nullptr, 10));
+	}();
+	return value;
+}
+
+bool CommandProcessor::BufferFlushDeferred() {
+	const auto threshold = SubmitWorkThreshold();
+	if (threshold != 0 && GetScheduler().CurrentSubmitWorkCount() < threshold) {
+		return false;
+	}
+	GetScheduler().Flush();
+	return true;
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -446,14 +473,22 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		bool                         flush_deferred = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_deferred_flush) {
+					// Submit batched work before going idle; nothing else would.
+					flush_deferred = true;
+					break;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (flush_deferred) {
+				gpu->m_processing = true;
+			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
@@ -471,7 +506,11 @@ void GuestGpu::ThreadRun(void* data) {
 						break;
 					}
 				}
-				if (selected_queue < 0) {
+				if (selected_queue < 0 && gpu->m_deferred_flush) {
+					// Blocked submissions may wait on batched work that is not submitted yet.
+					flush_deferred    = true;
+					gpu->m_processing = true;
+				} else if (selected_queue < 0) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
@@ -492,6 +531,14 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = true;
 				has_submission    = true;
 			}
+		}
+		if (flush_deferred) {
+			gpu->m_deferred_flush = false;
+			gpu->m_gfx_cp->BufferInit();
+			gpu->m_gfx_cp->BufferFlush();
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			gpu->m_processing = false;
+			continue;
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
@@ -531,6 +578,22 @@ void GuestGpu::ThreadRun(void* data) {
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 			gpu->m_idle.SignalAll();
 		}
+	}
+}
+
+void GuestGpu::FlushSubmission(CommandProcessor& cp, bool complete) {
+	// A blocked submission may be waiting on a label written by work that is not submitted
+	// yet, and nothing else will submit while the queue is idle, so both submit at once.
+	bool idle = !complete;
+	if (!idle) {
+		Common::LockGuard lock(m_queue_mutex);
+		idle = m_commands.empty() && m_submission_count == 0;
+	}
+	if (idle) {
+		m_deferred_flush = false;
+		cp.BufferFlush();
+	} else if (!cp.BufferFlushDeferred()) {
+		m_deferred_flush = true;
 	}
 }
 
@@ -574,7 +637,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				cp.BufferFlush();
+				FlushSubmission(cp, complete);
 			}
 			break;
 		}
@@ -595,7 +658,7 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				FlushSubmission(cp, complete);
 			}
 			break;
 		}

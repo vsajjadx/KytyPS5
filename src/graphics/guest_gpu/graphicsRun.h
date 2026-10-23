@@ -73,6 +73,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	void              FlushSubmission(CommandProcessor& cp, bool complete);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -91,6 +92,8 @@ private:
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;
+	// GPU thread only: batched work was recorded but not submitted yet.
+	bool                                           m_deferred_flush    = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);

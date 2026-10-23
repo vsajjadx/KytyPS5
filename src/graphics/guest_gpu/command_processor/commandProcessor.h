@@ -68,6 +68,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits only once enough work has accumulated; returns false when it deferred.
+	bool            BufferFlushDeferred();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

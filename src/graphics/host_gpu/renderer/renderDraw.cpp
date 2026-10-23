@@ -1301,6 +1301,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	m_context.GetCommandScheduler().NoteRecordedWork();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (!draw.IsIndexed()) {

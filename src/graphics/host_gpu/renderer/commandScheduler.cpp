@@ -426,6 +426,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 void CommandScheduler::BeginNext() {
 	CheckActive();
+	m_submit_work_count = 0;
 	BeginCommand();
 }
 

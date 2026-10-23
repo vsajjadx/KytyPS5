@@ -47,6 +47,9 @@ public:
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	// Draws and dispatches recorded into the command buffer that has not been submitted yet.
+	[[nodiscard]] uint32_t         CurrentSubmitWorkCount() const noexcept { return m_submit_work_count; }
+	void                           NoteRecordedWork() noexcept { m_submit_work_count++; }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
@@ -88,6 +91,8 @@ private:
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
+
+	uint32_t                     m_submit_work_count = 0;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

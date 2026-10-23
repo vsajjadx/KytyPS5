@@ -16,6 +16,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -120,6 +121,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		m_registered_bytes += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -135,6 +137,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		m_registered_bytes -= std::min(m_registered_bytes, buffer.Size());
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -682,7 +685,23 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// m_total_used_memory is total device memory, shared with the texture cache, which cannot
+	// evict GPU-modified tiled images. Gating `aggressive` on it alone kept the GC downloading
+	// dirty buffers (each a full GPU drain) under pressure it could not relieve. Require this
+	// cache to hold a material share of the budget first. KYTY_BUFGC_OWN_SHARE=0 restores the
+	// old behaviour. Ported from ReeceKetley/KytyPS5-UFC5 (UFC 5: 1 -> 3-6 fps in fights).
+	static const uint64_t own_share_pct = []() -> uint64_t {
+		const char* env = std::getenv("KYTY_BUFGC_OWN_SHARE");
+		if (env == nullptr) {
+			return uint64_t {25};
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(env, &end, 10);
+		return end == env ? uint64_t {25} : static_cast<uint64_t>(parsed);
+	}();
+	const bool own_pressure =
+	    own_share_pct == 0 || m_registered_bytes >= m_critical_gc_memory * own_share_pct / 100;
+	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory && own_pressure;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

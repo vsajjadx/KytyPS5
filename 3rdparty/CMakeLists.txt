@@ -228,3 +228,44 @@ endif()
 if (CLANG AND MSVC)
 add_subdirectory(winpthread)
 endif()
+
+# AMD FSR 3.1 frame generation, built against the bundled Vulkan headers. Its Vulkan calls go
+# through the emulator's dynamic dispatcher (frameGenerationShims.cpp).
+if (WIN32)
+	if (NOT TARGET Vulkan::Vulkan)
+		add_library(Vulkan::Vulkan INTERFACE IMPORTED GLOBAL)
+		target_link_libraries(Vulkan::Vulkan INTERFACE Vulkan::Headers)
+	endif()
+	foreach(component TESTS PROBE FSR3_HOST FSR3_VK_BACKEND FSR4_V07_VULKAN)
+		set(FFX_VK_PORTABLE_BUILD_${component} OFF CACHE BOOL "" FORCE)
+	endforeach()
+	set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+	set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/fsr-vulkan-cmake")
+	# The frame generation context never tells its bridge which frame it records and never
+	# retires frames, so the descriptor sets and constant buffers it allocates for every dispatch
+	# were only freed when the context was destroyed (as in shadPS4).
+	set(FFX_FG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/fsr-vulkan/src/ffx_vk_fsr3_3_1_6_framegen.cpp")
+	file(READ "${FFX_FG_SOURCE}" FFX_FG_TEXT)
+	if (NOT FFX_FG_TEXT MATCHES "ffxVkFsr3_3_1_5BridgeBeginFrame")
+		set(FFX_FG_PATCHED "${FFX_FG_TEXT}")
+		string(REPLACE "    context->frameId = info->frameId;"
+		               "    context->frameId = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId);"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REPLACE "    dispatch.frameID = info->frameId;"
+		               "    dispatch.frameID = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId);"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REPLACE "    if (context->prepared && context->frameId <= completedFrameId) {"
+		               "    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId);\n    if (context->prepared && context->frameId <= completedFrameId) {"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REGEX MATCHALL "ffxVkFsr3_3_1_5Bridge(Begin|Retire)Frame" FFX_FG_HITS "${FFX_FG_PATCHED}")
+		list(LENGTH FFX_FG_HITS FFX_FG_HIT_COUNT)
+		if (FFX_FG_HIT_COUNT EQUAL 3)
+			file(WRITE "${FFX_FG_SOURCE}" "${FFX_FG_PATCHED}")
+		else()
+			message(WARNING "fsr-vulkan: could not apply the frame generation memory fix")
+		endif()
+	endif()
+	add_subdirectory(fsr-vulkan EXCLUDE_FROM_ALL)
+	list(POP_BACK CMAKE_MODULE_PATH)
+endif()

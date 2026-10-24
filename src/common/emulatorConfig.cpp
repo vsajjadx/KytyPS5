@@ -101,6 +101,10 @@ bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
+bool FrameGenerationEnabled() {
+	return g_config->frame_generation_enabled;
+}
+
 bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }

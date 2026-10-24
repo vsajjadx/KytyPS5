@@ -1,5 +1,4 @@
 #include "common/assert.h"
-#include "graphics/host_gpu/frameStats.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -8,10 +7,12 @@
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/frameGeneration.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
@@ -22,6 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -324,6 +328,96 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		const char* env = std::getenv("KYTY_FRAME_GENERATION");
+		FrameGeneration::SetEnabled(Config::FrameGenerationEnabled() ||
+		                            (env != nullptr && env[0] == '1'));
+	}
+	~Impl() {
+		frame_generator.reset();
+		if (generated.image.image != nullptr) {
+			present_scheduler.Wait(present_scheduler.CurrentTick() - 1);
+			window.graphic_ctx.device.destroyImageView(generated.view, nullptr);
+			window.graphic_ctx.DeleteImage(generated.image);
+		}
+	}
+
+	// Shows a generated frame between the previous game frame and `real`, and keeps `real` for
+	// a later vblank. Returns false when the frame should be shown right away instead.
+	bool PresentWithGeneratedFrame(Frame* real) {
+		using namespace std::chrono_literals;
+		const auto now = std::chrono::steady_clock::now();
+		if (last_real_frame.time_since_epoch().count() != 0) {
+			const auto interval = now - last_real_frame;
+			real_interval = real_interval.count() == 0 || interval > real_interval * 3
+			                    ? std::chrono::duration_cast<std::chrono::nanoseconds>(interval)
+			                    : (real_interval * 7 + interval) / 8;
+		}
+		last_real_frame = now;
+		const auto vblank =
+		    std::chrono::nanoseconds(1'000'000'000 / std::max(Config::GetVblankFrequency(), 1u));
+		const auto format           = real->image.format;
+		const bool generated_format = format == vk::Format::eR8G8B8A8Unorm ||
+		                              format == vk::Format::eB8G8R8A8Unorm ||
+		                              format == vk::Format::eA2R10G10B10UnormPack32 ||
+		                              format == vk::Format::eA2B10G10R10UnormPack32;
+		// A game already at the display rate gains nothing, and a slide show is no animation.
+		const bool wanted = FrameGeneration::IsEnabled() && !real->blank && !real->hdr &&
+		                    generated_format && layers[1].frame == nullptr &&
+		                    real_interval >= vblank * 9 / 5 && real_interval <= 150ms;
+		if (!wanted) {
+			if (frame_generator != nullptr) {
+				frame_generator->Reset();
+			}
+			pending_real = false;
+			return false;
+		}
+		if (frame_generator == nullptr) {
+			frame_generator =
+			    std::make_unique<FrameGenerator>(window.graphic_ctx, present_scheduler);
+		}
+		if (generated.present_tick != 0) {
+			present_scheduler.Wait(generated.present_tick);
+		}
+		const vk::Extent2D extent {real->image.extent.width, real->image.extent.height};
+		generated.Configure(window.graphic_ctx, extent, format);
+		auto& command = present_scheduler.BeginCommand();
+		real->Transit(command.Handle(), vk::ImageLayout::eGeneral,
+		              vk::AccessFlagBits2::eTransferRead);
+		const bool ok =
+		    frame_generator->Generate(command.Handle(), real->image.image, generated.image.image,
+			                          extent.width, extent.height);
+		real->image.state = {vk::PipelineStageFlagBits2::eAllCommands,
+		                     vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+		                     vk::ImageLayout::eGeneral};
+		generated.image.state = {
+		    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+		    ok ? vk::ImageLayout::eTransferSrcOptimal : generated.image.state.layout};
+		present_scheduler.Submit();
+		if (!ok) {
+			pending_real = false;
+			return false;
+		}
+		layers[0].frame = &generated;
+		Present();
+		layers[0].frame = real;
+		if (++generated_count % 300 == 1) {
+			std::printf("Frame generation: %llu frames generated, game frame every %.1f ms\n",
+			            static_cast<unsigned long long>(generated_count),
+			            std::chrono::duration<double, std::milli>(real_interval).count());
+		}
+		pending_real = true;
+		real_due     = now + real_interval / 2;
+		return true;
+	}
+
+	// Shows the game frame a generated frame went ahead of, once its time has come.
+	bool PresentPendingRealFrame() {
+		if (!pending_real || std::chrono::steady_clock::now() < real_due) {
+			return false;
+		}
+		pending_real = false;
+		Present();
+		return true;
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -364,6 +458,13 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	Frame                                 generated;
+	std::unique_ptr<FrameGenerator>       frame_generator;
+	std::chrono::steady_clock::time_point last_real_frame {};
+	std::chrono::steady_clock::time_point real_due {};
+	std::chrono::nanoseconds              real_interval {};
+	bool                                  pending_real    = false;
+	uint64_t                              generated_count = 0;
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1016,7 +1117,16 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
+	auto* main_frame = m_impl->layers[0].frame;
+	if (main_frame != nullptr && m_impl->PresentWithGeneratedFrame(main_frame)) {
+		return;
+	}
 	m_impl->Present();
+}
+
+bool Presenter::PresentPendingFrame() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	return m_impl->PresentPendingRealFrame();
 }
 
 void Presenter::ClearLayer(int bus) {

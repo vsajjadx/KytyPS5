@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/frameGeneration.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -479,6 +480,11 @@ void WindowContext::ProcessEvent(double time_s) {
 				}
 				[[fallthrough]];
 #endif
+			case SDLK_F3:
+				if (pressed) {
+					FrameGeneration::Toggle();
+				}
+				return;
 			case SDLK_F2:
 				if (pressed) {
 					if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {

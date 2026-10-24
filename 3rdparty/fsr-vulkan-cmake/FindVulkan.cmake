@@ -1,0 +1,5 @@
+if (TARGET Vulkan::Vulkan)
+    set(Vulkan_FOUND TRUE)
+    return()
+endif()
+include(${CMAKE_ROOT}/Modules/FindVulkan.cmake)

@@ -30,6 +30,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <xmmintrin.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -1037,6 +1038,10 @@ void PthreadInitSelfForMainThread() {
 	     g_pthread_self->unique_id, os_thread_id,
 	     reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr),
 	     static_cast<uint64_t>(g_pthread_self->attr->stack_size));
+}
+
+void PthreadInitGuestFloatingPoint() {
+	_mm_setcsr(0x9fc0);
 }
 
 void* PthreadCreateMainGuestStack() {
@@ -3249,6 +3254,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	PthreadInitGuestFloatingPoint();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)

@@ -1338,6 +1338,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
+		Libs::LibKernel::PthreadInitGuestFloatingPoint();
 		RunEntry(entry, params, ProgramExitHandler,
 		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
 	}

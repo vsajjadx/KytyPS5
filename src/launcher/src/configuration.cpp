@@ -11,6 +11,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
+	KYTY_CFG_SET(output_1080p_enabled);
+	KYTY_CFG_SET(frame_generation_enabled);
 	KYTY_CFG_SET(hide_cursor_enabled);
 	KYTY_CFG_SET(readback_linear_images);
 	KYTY_CFG_SET(readback_tiled_images);
@@ -61,6 +63,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	}
 	KYTY_CFG_GET(fullscreen_enabled);
 	KYTY_CFG_GET(hdr_enabled);
+	KYTY_CFG_GET(output_1080p_enabled);
+	KYTY_CFG_GET(frame_generation_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
 	KYTY_CFG_GET(readback_linear_images);
 	KYTY_CFG_GET(readback_tiled_images);

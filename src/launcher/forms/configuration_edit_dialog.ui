@@ -185,6 +185,18 @@
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
+            <item row="9" column="1">
+             <widget class="QCheckBox" name="checkBox_output_1080p">
+              <property name="toolTip"><string>Report a 1080p display instead of 4K, as a PS5 connected to a 1080p TV does. Games then render at 1080p, which is much lighter on the GPU.</string></property>
+              <property name="text"><string>Use a 1080p display</string></property>
+             </widget>
+            </item>
+            <item row="10" column="1">
+             <widget class="QCheckBox" name="checkBox_frame_generation">
+              <property name="toolTip"><string>Show an AMD FSR 3.1 generated frame between game frames when the game runs below the display rate. Toggle in game with F3.</string></property>
+              <property name="text"><string>Enable frame generation</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

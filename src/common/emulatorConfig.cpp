@@ -101,6 +101,10 @@ bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
+bool Output1080pEnabled() {
+	return g_config->output_1080p_enabled;
+}
+
 bool FrameGenerationEnabled() {
 	return g_config->frame_generation_enabled;
 }

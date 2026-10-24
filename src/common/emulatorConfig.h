@@ -63,6 +63,7 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
+	bool                   output_1080p_enabled        = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
@@ -123,6 +124,7 @@ PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
+bool     Output1080pEnabled();
 bool        FrameGenerationEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();

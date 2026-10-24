@@ -284,6 +284,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
+	m_ui->checkBox_output_1080p->setChecked(info.output_1080p_enabled);
+	m_ui->checkBox_frame_generation->setChecked(info.frame_generation_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
@@ -478,6 +480,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
+	info.output_1080p_enabled      = ui.checkBox_output_1080p->isChecked();
+	info.frame_generation_enabled  = ui.checkBox_frame_generation->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();

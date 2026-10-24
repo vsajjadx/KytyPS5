@@ -678,8 +678,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	// Dynamic resolution reuses one allocation at several extents; a smaller native image
+	// cannot back the larger render area.
 	bool recreate = cached.info.resources < requested.resources ||
-	                requested.IsVolume() != cached.info.IsVolume();
+	                requested.IsVolume() != cached.info.IsVolume() ||
+	                requested.extent.width > cached.info.extent.width ||
+	                requested.extent.height > cached.info.extent.height;
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();

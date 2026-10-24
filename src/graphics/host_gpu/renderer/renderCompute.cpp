@@ -221,7 +221,9 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
+	if (indirect_args != 0 &&
+	    !LibKernel::Memory::TryReadBufferBacking(indirect_args, input.workgroup_counts,
+	                                             sizeof(input.workgroup_counts))) {
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));

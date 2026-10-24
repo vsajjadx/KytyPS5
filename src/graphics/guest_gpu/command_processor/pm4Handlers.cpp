@@ -1916,6 +1916,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// Indirect register tables often share a tracker page with data the GPU wrote. Reading them
+// through the pointer faults and downloads the whole page; the backing read downloads only
+// when the table itself holds GPU-written bytes.
+static uint32_t* ReadIndirectRegisterPairs(uint32_t* table, uint32_t pairs) {
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(static_cast<size_t>(pairs) * 2u);
+	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(table), copy.data(),
+	                                            copy.size() * sizeof(uint32_t))) {
+		return copy.data();
+	}
+	return table;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1933,6 +1946,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = ReadIndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2004,6 +2018,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	indirect_buffer             = ReadIndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

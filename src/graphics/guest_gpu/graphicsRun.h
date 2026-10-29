@@ -31,12 +31,9 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
-	// Retries blocked submissions now instead of after the 100 ms stall timeout.
-	void               Wake();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
-	void Submit(std::span<const uint32_t> draw_commands,
-	            std::span<const uint32_t> constant_commands);
+	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
@@ -60,14 +57,10 @@ private:
 		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
-		std::span<const uint32_t> constant_commands;
-		Pm4Execution              command_execution;
-		Pm4Execution              constant_execution;
-		bool                      started           = false;
-		bool                      command_complete  = false;
-		bool                      constant_complete = false;
-		bool                      blocked           = false;
-		uint64_t                  flip_request_id   = 0;
+		Pm4Execution              execution;
+		bool                      started         = false;
+		bool                      blocked         = false;
+		uint64_t                  flip_request_id = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -90,7 +83,6 @@ private:
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
-	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;
 	// GPU thread only: batched work was recorded but not submitted yet.
 	bool                                           m_deferred_flush    = false;

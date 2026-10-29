@@ -43,6 +43,7 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -191,7 +192,6 @@ private:
 	uint32_t         m_seen_oom_events        = 0;
 	uint64_t         m_emergency_ticks        = 0;
 	uint64_t         m_ticks_since_oom        = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 

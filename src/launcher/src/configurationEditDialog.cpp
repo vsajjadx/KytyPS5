@@ -298,6 +298,13 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
+	m_ui->checkBox_async_shaders->setChecked(info.async_shaders_enabled);
+	m_ui->checkBox_async_compute->setChecked(info.async_compute_enabled);
+	m_ui->checkBox_async_pipelines->setChecked(info.async_pipelines_enabled);
+	m_ui->spinBox_gpu_timestamp_scale->setValue(info.gpu_timestamp_scale);
+	m_ui->spinBox_vram_budget->setValue(info.vram_budget_mb);
+	m_ui->lineEdit_skip_shaders->setText(info.skip_shaders);
+	m_ui->checkBox_game_tuning->setChecked(info.game_tuning_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
@@ -535,6 +542,13 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
+	info.async_shaders_enabled     = ui.checkBox_async_shaders->isChecked();
+	info.async_compute_enabled     = ui.checkBox_async_compute->isChecked();
+	info.async_pipelines_enabled   = ui.checkBox_async_pipelines->isChecked();
+	info.gpu_timestamp_scale       = ui.spinBox_gpu_timestamp_scale->value();
+	info.vram_budget_mb            = ui.spinBox_vram_budget->value();
+	info.skip_shaders              = ui.lineEdit_skip_shaders->text().trimmed();
+	info.game_tuning_enabled       = ui.checkBox_game_tuning->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();

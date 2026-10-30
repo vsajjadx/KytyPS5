@@ -93,6 +93,26 @@ uint32_t GetGpuTimestampScale() {
 	return g_config->gpu_timestamp_scale;
 }
 
+bool AsyncShadersEnabled() {
+	return g_config->async_shaders_enabled;
+}
+
+bool AsyncComputeEnabled() {
+	return g_config->async_compute_enabled;
+}
+
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled;
+}
+
+uint32_t GetVramBudgetMb() {
+	return g_config->vram_budget_mb;
+}
+
+const std::string& GetSkipShaders() {
+	return g_config->skip_shaders;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

@@ -221,6 +221,72 @@
               <property name="text"><string>Cache shaders</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_async_shaders">
+              <property name="toolTip"><string>Compile new shaders in the background instead of freezing the game. Whatever needs a shader that is still compiling is left out for a few frames.</string></property>
+              <property name="text"><string>Skip stutters: compile shaders in the background</string></property>
+             </widget>
+            </item>
+            <item row="14" column="1">
+             <widget class="QCheckBox" name="checkBox_async_compute">
+              <property name="toolTip"><string>Also compile compute shaders in the background. Turn off if a game crashes or loses effects with it on.</string></property>
+              <property name="text"><string>Include compute shaders</string></property>
+             </widget>
+            </item>
+            <item row="15" column="1">
+             <widget class="QCheckBox" name="checkBox_async_pipelines">
+              <property name="toolTip"><string>Create new pipelines in the background too. Can leave screens white in some games (UFC 6's tutorial).</string></property>
+              <property name="text"><string>Create pipelines in the background (experimental)</string></property>
+             </widget>
+            </item>
+            <item row="16" column="0">
+             <widget class="QLabel" name="label_gpu_timestamp_scale">
+              <property name="text"><string>GPU timestamp scale:</string></property>
+             </widget>
+            </item>
+            <item row="16" column="1">
+             <widget class="QSpinBox" name="spinBox_gpu_timestamp_scale">
+              <property name="toolTip"><string>How fast GPU time runs as the game measures it. Above 100%, games with dynamic resolution render smaller and faster; below, larger.</string></property>
+              <property name="suffix"><string>%</string></property>
+              <property name="minimum"><number>10</number></property>
+              <property name="maximum"><number>1000</number></property>
+              <property name="singleStep"><number>25</number></property>
+              <property name="value"><number>100</number></property>
+             </widget>
+            </item>
+            <item row="17" column="0">
+             <widget class="QLabel" name="label_vram_budget">
+              <property name="text"><string>VRAM budget:</string></property>
+             </widget>
+            </item>
+            <item row="17" column="1">
+             <widget class="QSpinBox" name="spinBox_vram_budget">
+              <property name="toolTip"><string>Video memory the emulator's caches stay under. Automatic leaves 1.3 GB of the card for Windows and the driver.</string></property>
+              <property name="specialValueText"><string>Automatic</string></property>
+              <property name="suffix"><string> MB</string></property>
+              <property name="minimum"><number>0</number></property>
+              <property name="maximum"><number>131072</number></property>
+              <property name="singleStep"><number>256</number></property>
+              <property name="value"><number>0</number></property>
+             </widget>
+            </item>
+            <item row="18" column="0">
+             <widget class="QLabel" name="label_skip_shaders">
+              <property name="text"><string>Skip shaders:</string></property>
+             </widget>
+            </item>
+            <item row="18" column="1">
+             <widget class="QLineEdit" name="lineEdit_skip_shaders">
+              <property name="toolTip"><string>Guest shader hashes, as the log's "Compiled vs ..." lines show them, separated by commas, or a text file of them. Whatever draws with them is not drawn.</string></property>
+              <property name="placeholderText"><string>none</string></property>
+             </widget>
+            </item>
+            <item row="19" column="1">
+             <widget class="QCheckBox" name="checkBox_game_tuning">
+              <property name="toolTip"><string>Start known games (UFC 5 and UFC 6) with the settings they were tuned with: a 1080p display, Immediate presentation and the shader cache.</string></property>
+              <property name="text"><string>Recommended settings for known games</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

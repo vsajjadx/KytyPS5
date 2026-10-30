@@ -302,11 +302,11 @@ private:
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
 
-	// Async compilation, on by default. New shader variants (KYTY_ASYNC_SHADERS) and pipelines
-	// (KYTY_ASYNC_PIPELINES) are built by background workers; the render thread gets null and
-	// skips the affected draw/dispatch for those frames instead of stalling. Set either to 0 to
-	// build synchronously; KYTY_ASYNC_COMPUTE=0 keeps compute shaders synchronous. Modules are
-	// copied because a program's module vector can grow, and move, while the job waits.
+	// Async compilation (--async-shaders, --async-compute, --async-pipelines; the launcher turns the
+	// first two on). New shader variants and pipelines are built by background workers; the render
+	// thread gets null and skips the affected draw/dispatch for those frames instead of stalling.
+	// KYTY_ASYNC_SHADERS, KYTY_ASYNC_COMPUTE and KYTY_ASYNC_PIPELINES (0 or 1) override the options.
+	// Modules are copied because a program's module vector can grow, and move, while the job waits.
 	enum class JobKind { GraphicsPipeline, ComputePipeline, Module };
 	struct ModuleJob;
 	struct CompileJob {
@@ -341,9 +341,9 @@ private:
 	std::vector<GraphicsPipelineKey>                                 m_created_graphics;
 	// Compiled by a worker, not yet added to their programs.
 	std::vector<CompletedModule>                                     m_completed_modules;
-	bool                                                             m_async_enabled = true;
-	bool                                                             m_async_shaders = true;
-	bool                                                             m_async_compute = true;
+	bool                                                             m_async_enabled = false;
+	bool                                                             m_async_shaders = false;
+	bool                                                             m_async_compute = false;
 	std::vector<std::thread>                                         m_compile_threads;
 	std::atomic<bool>                                                m_shutdown {false};
 };

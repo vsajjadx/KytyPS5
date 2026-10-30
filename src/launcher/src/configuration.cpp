@@ -2,6 +2,8 @@
 
 #include <QRegularExpression>
 
+#include <algorithm>
+
 QString Configuration::NormalizeResolution(const QString& text) {
 	// Older settings stored the enum key, e.g. "R1920X1080".
 	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
@@ -39,6 +41,13 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(shader_cache_enabled);
+	KYTY_CFG_SET(async_shaders_enabled);
+	KYTY_CFG_SET(async_compute_enabled);
+	KYTY_CFG_SET(async_pipelines_enabled);
+	KYTY_CFG_SET(gpu_timestamp_scale);
+	KYTY_CFG_SET(vram_budget_mb);
+	KYTY_CFG_SET(skip_shaders);
+	KYTY_CFG_SET(game_tuning_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
@@ -95,6 +104,17 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
+	// Settings saved before these existed keep the defaults.
+	async_shaders_enabled   = s.value("async_shaders_enabled", async_shaders_enabled).toBool();
+	async_compute_enabled   = s.value("async_compute_enabled", async_compute_enabled).toBool();
+	async_pipelines_enabled = s.value("async_pipelines_enabled", async_pipelines_enabled).toBool();
+	gpu_timestamp_scale     = s.value("gpu_timestamp_scale", gpu_timestamp_scale).toInt();
+	if (gpu_timestamp_scale < 10 || gpu_timestamp_scale > 1000) {
+		gpu_timestamp_scale = 100;
+	}
+	vram_budget_mb = std::max(0, s.value("vram_budget_mb", vram_budget_mb).toInt());
+	skip_shaders   = s.value("skip_shaders", skip_shaders).toString();
+	game_tuning_enabled = s.value("game_tuning_enabled", game_tuning_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
@@ -179,6 +199,12 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (gpu_timestamp_scale < 10 || gpu_timestamp_scale > 1000) {
+		return fail(tr("GPU timestamp scale must be between 10 and 1000."));
+	}
+	if (vram_budget_mb < 0) {
+		return fail(tr("VRAM budget must be 0 (automatic) or more."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

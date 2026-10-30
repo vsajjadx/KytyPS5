@@ -243,8 +243,19 @@ static void AddFlag(QStringList& args, bool enabled, const char* name) {
 	}
 }
 
+// UFC 5 and UFC 6 (PS5): PORTHEON's UFC 6 build runs them at 33-40 fps on an RTX 4060 with a
+// 1080p display, Immediate presentation, its shader journal and no background pipelines (those
+// left UFC 6's tutorial white). Matched by title ID, or by name for other regions' releases.
+static bool IsTunedGame(const Configuration& info) {
+	static const QStringList title_ids = {QStringLiteral("PPSA23566"), QStringLiteral("PPSA03541")};
+	static const QRegularExpression name(QStringLiteral("\\bUFC\\W*[56]\\b"),
+	                                     QRegularExpression::CaseInsensitiveOption);
+	return title_ids.contains(info.title_id.trimmed().toUpper()) || name.match(info.name).hasMatch();
+}
+
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
+	const bool  tuned = info.game_tuning_enabled && IsTunedGame(info);
 	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
@@ -264,13 +275,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
-	args << "--present-mode" << EnumToText(info.present_mode);
+	args << "--present-mode"
+	     << (tuned ? EnumToText(Configuration::PresentMode::Immediate) : EnumToText(info.present_mode));
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
-	AddFlag(args, info.output_1080p_enabled, "--output-1080p");
+	AddFlag(args, info.output_1080p_enabled || tuned, "--output-1080p");
 	AddFlag(args, info.frame_generation_enabled, "--frame-generation");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
 	AddFlag(args, info.stretch_enabled, "--stretch");
@@ -284,7 +296,18 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
-	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
+	AddFlag(args, info.shader_cache_enabled || tuned, "--shader-cache");
+	AddFlag(args, info.async_shaders_enabled, "--async-shaders");
+	AddFlag(args, info.async_shaders_enabled && info.async_compute_enabled, "--async-compute");
+	AddFlag(args, info.async_pipelines_enabled && !tuned, "--async-pipelines");
+	if (info.gpu_timestamp_scale != 100) {
+		args << "--gpu-timestamp-scale" << QString::number(info.gpu_timestamp_scale);
+	}
+	args << "--vram-budget-mb"
+	     << (info.vram_budget_mb > 0 ? QString::number(info.vram_budget_mb) : QStringLiteral("auto"));
+	if (!info.skip_shaders.isEmpty()) {
+		args << "--skip-shaders" << info.skip_shaders;
+	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

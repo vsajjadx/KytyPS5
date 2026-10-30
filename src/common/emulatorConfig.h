@@ -62,6 +62,14 @@ struct ConfigOptions {
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	// Percent by which GPU time is stretched as the guest sees it (100 = real time).
 	uint32_t               gpu_timestamp_scale         = 100;
+	// Build new shaders / compute shaders / pipelines on workers, skipping the draws that need them.
+	bool                   async_shaders_enabled       = false;
+	bool                   async_compute_enabled       = false;
+	bool                   async_pipelines_enabled     = false;
+	// Fixed VRAM ceiling for the caches: 0 = none, VRAM_BUDGET_AUTO = the card's memory - 1.3 GB.
+	uint32_t               vram_budget_mb              = 0;
+	// Guest shader hashes, or a file of them, whose draws and dispatches are skipped.
+	std::string            skip_shaders;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -127,6 +135,12 @@ int      GetPlayerFromUserId(int32_t user_id);
 bool     IsGuestUserId(int32_t user_id);
 PresentMode GetPresentMode();
 uint32_t    GetGpuTimestampScale();
+bool        AsyncShadersEnabled();
+bool        AsyncComputeEnabled();
+bool        AsyncPipelinesEnabled();
+inline constexpr uint32_t VRAM_BUDGET_AUTO = std::numeric_limits<uint32_t>::max();
+uint32_t    GetVramBudgetMb();
+const std::string& GetSkipShaders();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();

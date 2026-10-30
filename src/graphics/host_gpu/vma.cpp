@@ -16,6 +16,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -121,12 +122,30 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	const auto reported = GetReportedMemoryBudget();
 	const auto cap      = m_memory_cap.load(std::memory_order_relaxed);
 	auto budget = cap != 0 && (reported == 0 || cap < reported) ? cap : reported;
-	// KYTY_VRAM_BUDGET_MB: a fixed ceiling the caches stay under, never relaxed. PORTHEON runs
-	// UFC 6 with the card's memory minus 1.3 GB, leaving room for Windows, the driver and the
-	// window, so the caches evict before the driver starts paging.
-	static const uint64_t user_budget = [] {
-		const char* value = std::getenv("KYTY_VRAM_BUDGET_MB");
-		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : uint64_t {0};
+	// --vram-budget-mb (or KYTY_VRAM_BUDGET_MB): a fixed ceiling the caches stay under, never
+	// relaxed. "auto" is what PORTHEON runs UFC 6 with: a discrete card's memory minus 1.3 GB,
+	// leaving room for Windows, the driver and the window, so the caches evict before the driver
+	// starts paging.
+	static const uint64_t user_budget = [this] {
+		uint64_t megabytes = Config::GetVramBudgetMb();
+		if (const char* value = std::getenv("KYTY_VRAM_BUDGET_MB"); value != nullptr) {
+			megabytes = std::strtoull(value, nullptr, 10);
+		}
+		if (megabytes != Config::VRAM_BUDGET_AUTO) {
+			return megabytes << 20u;
+		}
+		if (physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+			return uint64_t {0};
+		}
+		uint64_t local = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+			if (properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local += properties.size;
+			}
+		}
+		constexpr uint64_t Reserve = 1300ull << 20u;
+		return local > Reserve + (1ull << 30u) ? local - Reserve : uint64_t {0};
 	}();
 	if (user_budget != 0 && (budget == 0 || user_budget < budget)) {
 		budget = user_budget;

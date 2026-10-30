@@ -91,6 +91,12 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
+	::printf("  --async-shaders                      Compile new shaders in the background, skipping the\n"
+	         "                                       draws that need them until they are ready.\n");
+	::printf("  --async-compute                      With --async-shaders, compute shaders too.\n");
+	::printf("  --async-pipelines                    Create new pipelines in the background likewise.\n");
+	::printf("  --vram-budget-mb <num|auto>          VRAM the caches stay under; auto = the card - 1.3 GB.\n");
+	::printf("  --skip-shaders <hashes|file>         Skip draws and dispatches of these guest shaders.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -221,6 +227,9 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--async-shaders", &ConfigOptions::async_shaders_enabled},
+    {"--async-compute", &ConfigOptions::async_compute_enabled},
+    {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
@@ -387,6 +396,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--vram-budget-mb") {
+			if (value == "auto") {
+				options.config.vram_budget_mb = Config::VRAM_BUDGET_AUTO;
+			} else if (!ParseUint32(value, options.config.vram_budget_mb) ||
+			           options.config.vram_budget_mb == Config::VRAM_BUDGET_AUTO) {
+				::printf("invalid VRAM budget: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-shaders") {
+			options.config.skip_shaders = value;
 		} else if (arg == "--gpu-timestamp-scale") {
 			if (!ParseUint32(value, options.config.gpu_timestamp_scale) ||
 			    options.config.gpu_timestamp_scale < 10 || options.config.gpu_timestamp_scale > 1000) {

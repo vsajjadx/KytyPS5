@@ -399,15 +399,19 @@ ShaderModule& PipelineCache::AdoptModule(Program& program, const ProgramKey& key
 	return module;
 }
 
-// KYTY_SKIP_SHADERS: guest shader hashes, as the "Compiled vs <hash>" lines print them, whose draws
-// and dispatches are skipped. Either the hashes themselves (separated by commas, spaces or new
+// --skip-shaders (or KYTY_SKIP_SHADERS): guest shader hashes, as the "Compiled vs <hash>" lines
+// print them, whose draws and dispatches are skipped. Either the hashes themselves (separated by commas, spaces or new
 // lines) or a file holding them, re-read when it changes so shaders can be added while the game
 // runs. PORTHEON skips UFC 6's crowd this way: vs c342cc1c86e12a66. GPU thread only.
 static bool ShaderSkipped(uint64_t hash) {
-	static const char* const setting = std::getenv("KYTY_SKIP_SHADERS");
-	if (setting == nullptr || setting[0] == '\0') {
+	static const std::string setting_text = [] {
+		const char* env = std::getenv("KYTY_SKIP_SHADERS");
+		return env != nullptr ? std::string(env) : Config::GetSkipShaders();
+	}();
+	if (setting_text.empty()) {
 		return false;
 	}
+	const char* const setting = setting_text.c_str();
 	static std::unordered_set<uint64_t>       skipped;
 	static std::unordered_set<uint64_t>       reported;
 	static std::filesystem::file_time_type    file_time {};
@@ -692,6 +696,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_async_shaders = Config::AsyncShadersEnabled();
+	m_async_compute = Config::AsyncComputeEnabled();
+	m_async_enabled = Config::AsyncPipelinesEnabled();
+	// The environment overrides the options (KYTY_ASYNC_*=0 or 1).
 	const auto env_flag = [](const char* name, bool& flag) {
 		if (const char* value = std::getenv(name)) {
 			flag = value[0] != '\0' && value[0] != '0';

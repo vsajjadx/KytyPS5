@@ -30,9 +30,16 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #include <fmt/format.h>
 #include <limits>
 #include <ranges>
@@ -392,6 +399,69 @@ ShaderModule& PipelineCache::AdoptModule(Program& program, const ProgramKey& key
 	return module;
 }
 
+// KYTY_SKIP_SHADERS: guest shader hashes, as the "Compiled vs <hash>" lines print them, whose draws
+// and dispatches are skipped. Either the hashes themselves (separated by commas, spaces or new
+// lines) or a file holding them, re-read when it changes so shaders can be added while the game
+// runs. PORTHEON skips UFC 6's crowd this way: vs c342cc1c86e12a66. GPU thread only.
+static bool ShaderSkipped(uint64_t hash) {
+	static const char* const setting = std::getenv("KYTY_SKIP_SHADERS");
+	if (setting == nullptr || setting[0] == '\0') {
+		return false;
+	}
+	static std::unordered_set<uint64_t>       skipped;
+	static std::unordered_set<uint64_t>       reported;
+	static std::filesystem::file_time_type    file_time {};
+	static auto                               next_check = std::chrono::steady_clock::time_point {};
+	static bool                               loaded     = false;
+	const auto parse = [](std::string_view text) {
+		std::unordered_set<uint64_t> hashes;
+		size_t                       pos = 0;
+		while (pos < text.size()) {
+			const auto end   = text.find_first_of(", \t\r\n", pos);
+			const auto token = text.substr(pos, end == std::string_view::npos ? text.npos : end - pos);
+			if (!token.empty()) {
+				uint64_t value = 0;
+				if (std::from_chars(token.data(), token.data() + token.size(), value, 16).ec ==
+				    std::errc {}) {
+					hashes.insert(value);
+				}
+			}
+			if (end == std::string_view::npos) break;
+			pos = end + 1;
+		}
+		return hashes;
+	};
+	std::error_code error;
+	const std::filesystem::path path(setting);
+	const auto now = std::chrono::steady_clock::now();
+	if (!loaded || now >= next_check) {
+		next_check = now + std::chrono::milliseconds(500);
+		if (std::filesystem::is_regular_file(path, error)) {
+			const auto time = std::filesystem::last_write_time(path, error);
+			if (!error && (!loaded || time != file_time)) {
+				std::ifstream file(path, std::ios::binary);
+				const std::string text((std::istreambuf_iterator<char>(file)),
+				                       std::istreambuf_iterator<char>());
+				skipped   = parse(text);
+				file_time = time;
+				std::printf("KYTY_SKIP_SHADERS: %zu shaders from %s\n", skipped.size(), setting);
+			}
+		} else if (!loaded) {
+			skipped = parse(setting);
+			std::printf("KYTY_SKIP_SHADERS: %zu shaders\n", skipped.size());
+		}
+		loaded = true;
+	}
+	if (!skipped.contains(hash)) {
+		return false;
+	}
+	if (reported.insert(hash).second) {
+		std::printf("KYTY_SKIP_SHADERS: skipping draws and dispatches of shader %016llx\n",
+		            static_cast<unsigned long long>(hash));
+	}
+	return true;
+}
+
 // Owned copies of everything the render thread's compile options pointed at.
 struct PipelineCache::ModuleJob {
 	Program*                                         program     = nullptr;
@@ -481,6 +551,10 @@ void PipelineCache::DrainAsyncModules() {
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
+	if (ShaderSkipped(params.hash)) {
+		input_info.stage = {};
+		return nullptr;
+	}
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,

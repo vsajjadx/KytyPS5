@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -119,7 +120,18 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	const auto reported = GetReportedMemoryBudget();
 	const auto cap      = m_memory_cap.load(std::memory_order_relaxed);
-	return cap != 0 && (reported == 0 || cap < reported) ? cap : reported;
+	auto budget = cap != 0 && (reported == 0 || cap < reported) ? cap : reported;
+	// KYTY_VRAM_BUDGET_MB: a fixed ceiling the caches stay under, never relaxed. PORTHEON runs
+	// UFC 6 with the card's memory minus 1.3 GB, leaving room for Windows, the driver and the
+	// window, so the caches evict before the driver starts paging.
+	static const uint64_t user_budget = [] {
+		const char* value = std::getenv("KYTY_VRAM_BUDGET_MB");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : uint64_t {0};
+	}();
+	if (user_budget != 0 && (budget == 0 || user_budget < budget)) {
+		budget = user_budget;
+	}
+	return budget;
 }
 
 void GraphicContext::LowerMemoryCap(uint64_t bytes) {

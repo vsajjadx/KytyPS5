@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string_view>
@@ -67,6 +69,10 @@ static void PrintUsage() {
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
+	::printf(
+	    "  --gpu-timestamp-scale <10-1000>      Stretch GPU time as the game measures it, in percent.\n"
+	    "                                       Above 100, games with dynamic resolution lower it.\n"
+	    "                                       Default: 100.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf("  --output-1080p                       Report a 1080p display, so games render at 1080p.\n");
@@ -381,6 +387,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-timestamp-scale") {
+			if (!ParseUint32(value, options.config.gpu_timestamp_scale) ||
+			    options.config.gpu_timestamp_scale < 10 || options.config.gpu_timestamp_scale > 1000) {
+				::printf("invalid gpu timestamp scale: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -466,6 +478,10 @@ static bool LoadArgFile(const std::string& path, std::vector<std::string>& out) 
 }
 
 static int Main(int argc, char* argv[]) {
+	// As PORTHEON starts UFC 6; KYTY_NORMAL_PRIORITY=1 keeps the default priority.
+	if (const char* normal = std::getenv("KYTY_NORMAL_PRIORITY"); normal == nullptr || normal[0] == '0') {
+		SysRaiseProcessPriority();
+	}
 	VirtualMemory::Init();
 	InitializeThreads();
 

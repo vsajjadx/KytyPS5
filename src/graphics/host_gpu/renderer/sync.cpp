@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -46,7 +47,17 @@ uint64_t ReadReferenceClock() {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
-	return value;
+	// --gpu-timestamp-scale: time since the first read runs that many percent as fast. A game that
+	// times its GPU work with these labels then sees it take longer (or shorter), and one with
+	// dynamic resolution renders smaller (or larger). PORTHEON drives UFC 6 to 960x544 fights
+	// with a timestamp scale in its own engine build.
+	const auto scale = Config::GetGpuTimestampScale();
+	if (scale == 100) {
+		return value;
+	}
+	static const uint64_t base    = value;
+	const uint64_t        elapsed = value > base ? value - base : 0;
+	return base + elapsed / 100u * scale + elapsed % 100u * scale / 100u;
 }
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,

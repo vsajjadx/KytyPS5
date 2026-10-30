@@ -15,6 +15,21 @@
 #include "common/assert.h"
 #include "common/platform/sysDbg.h"
 
+void SysRaiseProcessPriority() {
+	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+#ifdef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+	// Windows' EcoQoS slows down and coarsens the timers of processes it thinks are idle.
+	PROCESS_POWER_THROTTLING_STATE state {};
+	state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+	state.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+#endif
+	state.StateMask = 0;
+	SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+#endif
+}
+
 void SysStackUsage(sys_dbg_stack_info_t& s) {
 	MEMORY_BASIC_INFORMATION mbi {};
 	[[maybe_unused]] size_t  ss = VirtualQuery(&mbi, &mbi, sizeof(mbi));

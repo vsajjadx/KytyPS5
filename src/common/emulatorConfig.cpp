@@ -89,6 +89,10 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+uint32_t GetGpuTimestampScale() {
+	return g_config->gpu_timestamp_scale;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

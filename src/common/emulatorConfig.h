@@ -60,6 +60,8 @@ struct ConfigOptions {
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	uint32_t               keyboard_player                = 0;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	// Percent by which GPU time is stretched as the guest sees it (100 = real time).
+	uint32_t               gpu_timestamp_scale         = 100;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -124,6 +126,7 @@ int      GetPlayerFromUserId(int32_t user_id);
 // Players after the first are guests: they have no profile, trophies or NP account.
 bool     IsGuestUserId(int32_t user_id);
 PresentMode GetPresentMode();
+uint32_t    GetGpuTimestampScale();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();

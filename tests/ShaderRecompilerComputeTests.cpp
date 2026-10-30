@@ -52908,6 +52908,14 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // The cases check results right after the first draw or dispatch, so build synchronously.
+  for (const char *name : {"KYTY_ASYNC_SHADERS", "KYTY_ASYNC_PIPELINES"}) {
+#ifdef _WIN32
+    _putenv_s(name, "0");
+#else
+    setenv(name, "0", 1);
+#endif
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {

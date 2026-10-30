@@ -199,7 +199,7 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	// Null while KYTY_ASYNC_PIPELINES=1 is building the pipeline on the worker; skip the draw.
+	// Null while the async worker is still building the pipeline; skip the draw.
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
@@ -213,6 +213,12 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		// Variants an async worker is compiling; draws needing one are skipped until it lands.
+		struct PendingModule {
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			uint32_t                                     push_data_cursor = 0;
+		};
+		std::vector<PendingModule> pending;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
@@ -264,6 +270,22 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	// The thread-safe half of CompileModule: SPIR-V and the host module.
+	struct BuiltModule {
+		ShaderRecompiler::IR::CompiledShaderInfo info;
+		std::vector<uint32_t>                    spirv;
+		vk::ShaderModule                         module     = nullptr;
+		uint64_t                                 compile_us = 0;
+	};
+	BuiltModule BuildModule(ShaderRecompiler::CompileOptions                    options,
+	                        ShaderRecompiler::TranslateResult                   translated,
+	                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                        uint32_t                                            push_data_cursor);
+	// The render-thread half: records the module in its program.
+	ShaderModule& AdoptModule(Program& program, const ProgramKey& key,
+	                          const ShaderRecompiler::CompileOptions&             options,
+	                          const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                          BuiltModule                                         built);
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 
@@ -280,16 +302,32 @@ private:
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
 
-	// Async pipeline creation (KYTY_ASYNC_PIPELINES=1). New pipelines are created by a background
-	// worker; the render thread gets null and skips the affected draw/dispatch for that frame
-	// instead of stalling on vkCreate*Pipelines. Modules are copied because a program's module
-	// vector can grow, and move, while the job waits.
+	// Async compilation, on by default. New shader variants (KYTY_ASYNC_SHADERS) and pipelines
+	// (KYTY_ASYNC_PIPELINES) are built by background workers; the render thread gets null and
+	// skips the affected draw/dispatch for those frames instead of stalling. Set either to 0 to
+	// build synchronously; KYTY_ASYNC_COMPUTE=0 keeps compute shaders synchronous. Modules are
+	// copied because a program's module vector can grow, and move, while the job waits.
+	enum class JobKind { GraphicsPipeline, ComputePipeline, Module };
+	struct ModuleJob;
 	struct CompileJob {
-		bool                                       graphics = false;
+		JobKind                                    kind = JobKind::GraphicsPipeline;
 		GraphicsPipelineKey                        graphics_key {};
 		std::array<std::optional<ShaderModule>, 4> stages;
 		std::optional<ShaderModule>                compute_module;
+		// Module: the variant to translate and compile (defined in pipelineCache.cpp).
+		std::shared_ptr<ModuleJob> module;
 	};
+	struct CompletedModule {
+		CompileJob  job;
+		BuiltModule built;
+	};
+	template <typename InputInfo>
+	void QueueModule(Program& program, const ProgramKey& key,
+	                 const ShaderRecompiler::CompileOptions&          options,
+	                 std::optional<ShaderRecompiler::TranslateResult> translated,
+	                 std::span<const uint32_t> code, const InputInfo& input_info,
+	                 uint32_t push_data_cursor);
+	void DrainAsyncModules();
 	void DrainAsyncPipelines();
 	void EnsureWorker();
 	void WorkerLoop();
@@ -301,8 +339,12 @@ private:
 	std::unordered_set<uint64_t>                                     m_pending_compute;
 	// Created by the worker, not yet recorded in the shader store.
 	std::vector<GraphicsPipelineKey>                                 m_created_graphics;
-	bool                                                             m_async_enabled = false;
-	std::optional<std::thread>                                       m_compile_thread;
+	// Compiled by a worker, not yet added to their programs.
+	std::vector<CompletedModule>                                     m_completed_modules;
+	bool                                                             m_async_enabled = true;
+	bool                                                             m_async_shaders = true;
+	bool                                                             m_async_compute = true;
+	std::vector<std::thread>                                         m_compile_threads;
 	std::atomic<bool>                                                m_shutdown {false};
 };
 

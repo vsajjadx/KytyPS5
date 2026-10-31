@@ -302,9 +302,10 @@ private:
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
 
-	// Async compilation (--async-shaders, --async-compute, --async-pipelines; the launcher turns the
-	// first two on). New shader variants and pipelines are built by background workers; the render
-	// thread gets null and skips the affected draw/dispatch for those frames instead of stalling.
+	// Async compilation (--async-shaders, --async-compute, --async-pipelines; the launcher turns
+	// them on). New shader variants and pipelines are built by background workers; the render
+	// thread gets null and skips the affected draw/dispatch for those frames instead of stalling,
+	// after a short bounded wait for pipelines (WaitForPipeline).
 	// KYTY_ASYNC_SHADERS, KYTY_ASYNC_COMPUTE and KYTY_ASYNC_PIPELINES (0 or 1) override the options.
 	// Modules are copied because a program's module vector can grow, and move, while the job waits.
 	enum class JobKind { GraphicsPipeline, ComputePipeline, Module };
@@ -329,11 +330,23 @@ private:
 	                 uint32_t push_data_cursor);
 	void DrainAsyncModules();
 	void DrainAsyncPipelines();
+	// Waits a little for a pending pipeline (the lock is m_compile_mutex); true once ready.
+	template <typename Ready>
+	bool WaitForPipeline(std::unique_lock<std::mutex>& lock, Ready ready);
+	// Counts a draw or dispatch skipped while its shader or pipeline builds, and reports them.
+	void NoteSkipped();
 	void EnsureWorker();
 	void WorkerLoop();
 
 	std::mutex                                                       m_compile_mutex;
 	std::condition_variable                                          m_compile_cv;
+	// Signalled when a worker finishes a pipeline, for WaitForPipeline.
+	std::condition_variable                                          m_ready_cv;
+	// Waiting allowance (ns) for pipelines that are nearly done; see WaitForPipeline.
+	int64_t                                                          m_wait_budget_ns = 0;
+	std::chrono::steady_clock::time_point                            m_wait_refill {};
+	uint64_t                                                         m_skipped_draws  = 0;
+	std::chrono::steady_clock::time_point                            m_skip_report {};
 	std::queue<CompileJob>                                           m_compile_queue;
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_graphics;
 	std::unordered_set<uint64_t>                                     m_pending_compute;

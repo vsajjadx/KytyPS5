@@ -244,8 +244,8 @@ static void AddFlag(QStringList& args, bool enabled, const char* name) {
 }
 
 // UFC 5 and UFC 6 (PS5): PORTHEON's UFC 6 build runs them at 33-40 fps on an RTX 4060 with a
-// 1080p display, Immediate presentation, its shader journal and no background pipelines (those
-// left UFC 6's tutorial white). Matched by title ID, or by name for other regions' releases.
+// 1080p display, Immediate presentation and its shader journal. Matched by title ID, or by name
+// for other regions' releases.
 static bool IsTunedGame(const Configuration& info) {
 	static const QStringList title_ids = {QStringLiteral("PPSA23566"), QStringLiteral("PPSA03541")};
 	static const QRegularExpression name(QStringLiteral("\\bUFC\\W*[56]\\b"),
@@ -299,7 +299,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.shader_cache_enabled || tuned, "--shader-cache");
 	AddFlag(args, info.async_shaders_enabled, "--async-shaders");
 	AddFlag(args, info.async_shaders_enabled && info.async_compute_enabled, "--async-compute");
-	AddFlag(args, info.async_pipelines_enabled && !tuned, "--async-pipelines");
+	AddFlag(args, info.async_pipelines_enabled, "--async-pipelines");
 	if (info.gpu_timestamp_scale != 100) {
 		args << "--gpu-timestamp-scale" << QString::number(info.gpu_timestamp_scale);
 	}

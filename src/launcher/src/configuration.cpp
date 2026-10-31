@@ -43,7 +43,9 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(async_shaders_enabled);
 	KYTY_CFG_SET(async_compute_enabled);
-	KYTY_CFG_SET(async_pipelines_enabled);
+	// Renamed when it became the default: earlier settings saved it off.
+	values.insert(QStringLiteral("background_pipelines_enabled"),
+	              QVariant::fromValue(async_pipelines_enabled).toString());
 	KYTY_CFG_SET(gpu_timestamp_scale);
 	KYTY_CFG_SET(vram_budget_mb);
 	KYTY_CFG_SET(skip_shaders);
@@ -107,7 +109,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	// Settings saved before these existed keep the defaults.
 	async_shaders_enabled   = s.value("async_shaders_enabled", async_shaders_enabled).toBool();
 	async_compute_enabled   = s.value("async_compute_enabled", async_compute_enabled).toBool();
-	async_pipelines_enabled = s.value("async_pipelines_enabled", async_pipelines_enabled).toBool();
+	async_pipelines_enabled =
+	    s.value("background_pipelines_enabled", async_pipelines_enabled).toBool();
 	gpu_timestamp_scale     = s.value("gpu_timestamp_scale", gpu_timestamp_scale).toInt();
 	if (gpu_timestamp_scale < 10 || gpu_timestamp_scale > 1000) {
 		gpu_timestamp_scale = 100;

@@ -125,12 +125,12 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   shader_cache_enabled        = true;
-	// Compile new shaders in the background and skip the draws waiting on them, so the game
-	// does not stutter. Background pipelines are off: PORTHEON saw them leave UFC 6's
-	// tutorial white.
+	// Compile new shaders and pipelines in the background and skip the draws waiting on them,
+	// so the game does not stutter. A pipeline the driver builds in a few milliseconds is still
+	// waited for, so passes drawn only once are not lost.
 	bool                   async_shaders_enabled       = true;
 	bool                   async_compute_enabled       = true;
-	bool                   async_pipelines_enabled     = false;
+	bool                   async_pipelines_enabled     = true;
 	int                    gpu_timestamp_scale         = 100; // percent
 	int                    vram_budget_mb              = 0;   // 0 = automatic
 	QString                skip_shaders;

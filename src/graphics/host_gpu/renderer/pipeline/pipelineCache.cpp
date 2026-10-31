@@ -621,6 +621,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		});
 		input_info.stage = {};
 		if (pending) {
+			NoteSkipped();
 			return nullptr;
 		}
 	}
@@ -634,6 +635,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		// A new variant of a known program: translate and compile it on a worker.
 		QueueModule(entry->second, entry->first, options, std::nullopt, params.code, input_info,
 		            push_data_cursor);
+		NoteSkipped();
 		return nullptr;
 	}
 	ShaderRecompiler::ShaderSource source;
@@ -684,6 +686,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		QueueModule(entry->second, entry->first, options, std::move(translated), params.code,
 		            input_info, push_data_cursor);
 		input_info.stage = {};
+		NoteSkipped();
 		return nullptr;
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
@@ -1313,11 +1316,19 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		// Create the pipeline on the background worker; the caller skips this draw until it is
 		// ready instead of stalling on vkCreateGraphicsPipelines.
 		std::unique_lock lock(m_compile_mutex);
+		const auto       ready = [&] { return m_graphics_pipelines.contains(key); };
+		const auto       wait  = [&]() -> Pipeline* {
+			if (WaitForPipeline(lock, ready)) {
+				return &m_graphics_pipelines.find(key)->second;
+			}
+			NoteSkipped();
+			return nullptr;
+		};
 		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-			return iter->second.pipeline != nullptr ? &iter->second : nullptr;
+			return &iter->second;
 		}
 		if (m_pending_graphics.contains(key)) {
-			return nullptr;
+			return wait();
 		}
 		CompileJob job {.kind = JobKind::GraphicsPipeline, .graphics_key = key};
 		for (size_t i = 0; i < stages.size(); i++) {
@@ -1330,7 +1341,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		lock.unlock();
 		m_compile_cv.notify_one();
 		EnsureWorker();
-		return nullptr;
+		lock.lock();
+		return wait();
 	}
 
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
@@ -1370,11 +1382,19 @@ PipelineCache::Pipeline* PipelineCache::GetComputePipeline(const ShaderComputeIn
 
 	if (m_async_enabled) {
 		std::unique_lock lock(m_compile_mutex);
+		const auto       ready = [&] { return m_compute_pipelines.contains(module.id); };
+		const auto       wait  = [&]() -> Pipeline* {
+			if (WaitForPipeline(lock, ready)) {
+				return &m_compute_pipelines.find(module.id)->second;
+			}
+			NoteSkipped();
+			return nullptr;
+		};
 		if (auto iter = m_compute_pipelines.find(module.id); iter != m_compute_pipelines.end()) {
-			return iter->second.pipeline != nullptr ? &iter->second : nullptr;
+			return &iter->second;
 		}
 		if (m_pending_compute.contains(module.id)) {
-			return nullptr;
+			return wait();
 		}
 		if (graphics_debug_dump_enabled()) {
 			ShaderDbgDumpInputInfo(input_info);
@@ -1385,7 +1405,8 @@ PipelineCache::Pipeline* PipelineCache::GetComputePipeline(const ShaderComputeIn
 		lock.unlock();
 		m_compile_cv.notify_one();
 		EnsureWorker();
-		return nullptr;
+		lock.lock();
+		return wait();
 	}
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
@@ -1478,7 +1499,45 @@ void PipelineCache::WorkerLoop() {
 			m_pending_compute.erase(job.compute_module->id);
 			m_compute_pipelines.emplace(job.compute_module->id, created);
 		}
+		m_ready_cv.notify_all();
 	}
+}
+
+// A pipeline that the driver builds in a few milliseconds is worth waiting for: the draw is not
+// skipped, which matters for passes a game renders only once (PORTHEON saw UFC 6's tutorial stay
+// white with background pipelines). The waits draw on an allowance that grows with wall time at
+// 15%, up to 6 ms, so they can never add up to a stall; past it, the draw is skipped.
+template <typename Ready>
+bool PipelineCache::WaitForPipeline(std::unique_lock<std::mutex>& lock, Ready ready) {
+	constexpr int64_t MaxBudgetNs = 6'000'000;
+	const auto        now         = std::chrono::steady_clock::now();
+	if (m_wait_refill.time_since_epoch().count() == 0) {
+		m_wait_refill = now;
+	}
+	const auto elapsed =
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_wait_refill).count();
+	m_wait_budget_ns = std::min(MaxBudgetNs, m_wait_budget_ns + elapsed * 15 / 100);
+	m_wait_refill    = now;
+	if (m_wait_budget_ns <= 0) {
+		return ready();
+	}
+	const bool done = m_ready_cv.wait_for(lock, std::chrono::nanoseconds(m_wait_budget_ns), ready);
+	const auto after = std::chrono::steady_clock::now();
+	m_wait_budget_ns -= std::chrono::duration_cast<std::chrono::nanoseconds>(after - now).count();
+	m_wait_refill = after;
+	return done;
+}
+
+void PipelineCache::NoteSkipped() {
+	m_skipped_draws++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_skip_report) {
+		return;
+	}
+	m_skip_report = now + std::chrono::seconds(2);
+	std::printf("Async compilation: %llu draws/dispatches skipped so far while shaders or "
+	            "pipelines were building\n",
+	            static_cast<unsigned long long>(m_skipped_draws));
 }
 
 void PipelineCache::DrainAsyncPipelines() {

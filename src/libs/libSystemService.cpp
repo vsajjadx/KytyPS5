@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "emulator.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
@@ -97,6 +98,11 @@ static int KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
 	PRINT_NAME();
 	Graphics::HideSplashScreen();
 	return OK;
+}
+
+int KYTY_SYSV_ABI SystemServiceLoadExec(const char* path, const char* const argv[]) {
+	PRINT_NAME();
+	return Emulator::LoadExec(path, argv);
 }
 
 static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
@@ -249,6 +255,10 @@ static int KYTY_SYSV_ABI SystemServiceSetNoticeScreenSkipFlag() {
 static int KYTY_SYSV_ABI SystemServicePowerTick() {
 	PRINT_NAME();
 
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
 	return OK;
 }
 
@@ -559,6 +569,7 @@ LIB_DEFINE(InitSystemGesture_1) {
 } // namespace SystemGesture
 
 LIB_DEFINE(InitSystemService_1) {
+	LIB_FUNC("JoBqSQt1yyA", SystemService::SystemServiceLoadExec);
 	LIB_FUNC("Vo5V8KAwCmk", SystemService::SystemServiceHideSplashScreen);
 	LIB_FUNC("fZo48un7LK4", SystemService::SystemServiceParamGetInt);
 	LIB_FUNC("SsC-m-S9JTA", SystemService::SystemServiceParamGetString);
@@ -570,6 +581,7 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("8Lo6Zv94aho", SystemService::SystemServiceDisableNoticeScreenSkipFlagAutoSet);
 	LIB_FUNC("Q3utJvma4Mo", SystemService::SystemServiceSetNoticeScreenSkipFlag);
 	LIB_FUNC("XbbJC3E+L5M", SystemService::SystemServicePowerTick);
+	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
 	SystemGesture::InitSystemGesture_1(s);
 }

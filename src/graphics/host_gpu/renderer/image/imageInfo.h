@@ -17,9 +17,15 @@
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Rotate2_10_10_10 };
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Dcc128_128_128,
+	Unsupported
+};
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 
@@ -27,7 +33,7 @@ struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
-	uint32_t            clear_word           = 0;
+	uint64_t            clear_word           = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -69,7 +75,7 @@ struct ImageInfo {
 	GuestRange                   data;
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
-	uint32_t                     htile_clear_mask = UINT32_MAX;
+	bool                         htile_initial_clear = true;
 	vk::Format                   pixel_format     = vk::Format::eUndefined;
 	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
 	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
@@ -88,6 +94,7 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
@@ -98,6 +105,8 @@ struct ImageInfo {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k10_11_11Float:
 				return ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm:
+				return ColorTransform::Rotate2_10_10_10;
 			default: return ColorTransform::None;
 		}
 	}
@@ -136,53 +145,7 @@ struct ImageInfo {
 		}
 		return -1;
 	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
-		if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-		    container.resources.layers == 0 || mip < 0 ||
-		    static_cast<uint32_t>(mip) >= container.resources.levels ||
-		    container.resources.levels > container.mip_layout.size() ||
-		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
-		    data.End() > container.data.End()) {
-			return -1;
-		}
-		if (HasStencil() != container.HasStencil() ||
-		    (HasStencil() && (stencil.address < container.stencil.address ||
-		                      stencil.End() > container.stencil.End()))) {
-			return -1;
-		}
-
-		const auto  level  = static_cast<uint32_t>(mip);
-		const auto& layout = container.mip_layout[level];
-		if (extent.width != std::max(container.extent.width >> level, 1u) ||
-		    extent.height != std::max(container.extent.height >> level, 1u) ||
-		    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
-		    mip_layout[0].height != layout.height || layout.size == 0 ||
-		    layout.size % container.resources.layers != 0 ||
-		    container.data.size % container.resources.layers != 0 ||
-		    data.size % resources.layers != 0) {
-			return -1;
-		}
-
-		// PS5 block slices contain the entire reversed mip chain.
-		const auto slice_stride = container.data.size / container.resources.layers;
-		const auto child_stride = data.size / resources.layers;
-		if (child_stride != layout.size / container.resources.layers ||
-		    layout.offset >= slice_stride || child_stride > slice_stride - layout.offset ||
-		    (resources.layers > 1 && child_stride != slice_stride)) {
-			return -1;
-		}
-		const auto address_delta = data.address - container.data.address;
-		if (address_delta < layout.offset || (address_delta - layout.offset) % slice_stride != 0) {
-			return -1;
-		}
-		const auto layer = (address_delta - layout.offset) / slice_stride;
-		if (layer > INT32_MAX || layer >= container.resources.layers ||
-		    resources.layers > container.resources.layers - layer) {
-			return -1;
-		}
-		return static_cast<int32_t>(layer);
-	}
+	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
 };
 
 struct ImageViewInfo {
@@ -332,8 +295,9 @@ inline bool ImageInfo::IsDepth() const noexcept {
 [[nodiscard]] inline VideoOutCompression
 ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t dcc_control,
                             uint64_t dcc_clear_color) noexcept {
-	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
-	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
+	constexpr uint32_t DCC_256_256_0   = 0x00000048u;
+	constexpr uint32_t DCC_256_64_64   = 0x00000208u;
+	constexpr uint32_t DCC_128_128_128 = 0x00100024u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
@@ -345,6 +309,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	switch (dcc_control) {
 		case DCC_256_256_0: return VideoOutCompression::Dcc256_256_0;
 		case DCC_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		case DCC_128_128_128: return VideoOutCompression::Dcc128_128_128;
 		default: return VideoOutCompression::Unsupported;
 	}
 }
@@ -362,8 +327,17 @@ struct VideoOutFormatPolicy {
 };
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
 
-inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {{
+[[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
+	switch (format) {
+		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		default: return false;
+	}
+}
+
+inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -374,6 +348,8 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ,
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
@@ -403,13 +379,17 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return false;
 }
 
-[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint32_t packed,
+[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint64_t clear_words,
                                                  vk::ClearColorValue& clear) {
 	vk::ClearColorValue next {};
+	const auto packed = static_cast<uint32_t>(clear_words);
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
 	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+	};
+	const auto unorm16 = [](uint64_t value) {
+		return static_cast<float>(value & 0xffffu) / 65535.0f;
 	};
 	const auto float16 = [](uint32_t value) {
 		const auto sign = (value & 0x8000u) << 16u;
@@ -423,22 +403,62 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		                            (mantissa << 13u));
 	};
 	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+			next.float32[0] = float16((packed & 0x7ffu) << 4u);
+			next.float32[1] = float16(((packed >> 11u) & 0x7ffu) << 4u);
+			next.float32[2] = float16((packed >> 22u) << 5u);
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			next.float32[2] = float16(static_cast<uint32_t>(clear_words >> 32u));
+			next.float32[3] = float16(static_cast<uint32_t>(clear_words >> 48u));
+			[[fallthrough]];
 		case vk::Format::eR16G16Sfloat:
 			next.float32[1] = float16(packed >> 16u);
 			[[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[2] = unorm16(clear_words >> 32u);
+			next.float32[3] = unorm16(clear_words >> 48u);
 			[[fallthrough]];
-		case vk::Format::eR16Unorm:
-			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = unorm16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
+		case vk::Format::eR16G16B16A16Uint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.uint32[i] = static_cast<uint16_t>(clear_words >> (16u * i));
+			}
 			break;
-		// A single-plane float target carries its clear as raw float bits, the same encoding the
-		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
-		// contents.
+		case vk::Format::eR16G16B16A16Sint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.int32[i] = static_cast<int16_t>(clear_words >> (16u * i));
+			}
+			break;
+		// Each clear register stores one raw 32-bit channel.
+		case vk::Format::eR32G32Sfloat:
+			next.float32[1] = std::bit_cast<float>(static_cast<uint32_t>(clear_words >> 32u));
+			[[fallthrough]];
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
-		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
-		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+			next.uint32[1] = static_cast<uint32_t>(clear_words >> 32u);
+			[[fallthrough]];
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint: next.uint32[0] = packed; break;
+		// Narrow targets hold their channels in the low bits of the first word. UFC 6 (PPSA23566)
+		// fast-clears an R8_UINT map through CMASK every frame and then writes only part of it;
+		// without these the clear was dropped and old contents piled up.
+		case vk::Format::eR8Uint: next.uint32[0] = packed & 0xffu; break;
+		case vk::Format::eR8Unorm: next.float32[0] = unorm8(packed); break;
+		case vk::Format::eR8G8Uint:
+			next.uint32[0] = packed & 0xffu;
+			next.uint32[1] = (packed >> 8u) & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = unorm8(packed);
+			next.float32[1] = unorm8(packed >> 8u);
+			break;
+		case vk::Format::eR16Uint: next.uint32[0] = packed & 0xffffu; break;
 		case vk::Format::eR8G8B8A8Srgb:
 			next.float32[0] = srgb8(packed);
 			next.float32[1] = srgb8(packed >> 8u);
@@ -485,8 +505,14 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm ||
+	     format == vk::Format::eR16Uint || format == vk::Format::eR8G8Unorm ||
+	     format == vk::Format::eR8G8Uint) &&
 	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
+	if ((format == vk::Format::eR8Unorm || format == vk::Format::eR8Uint) &&
+	    packed != (packed & 0xffu) * 0x01010101u) {
 		return false;
 	}
 	if (format == vk::Format::eR16G16B16A16Sfloat) {
@@ -496,7 +522,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		clear = vk::ClearColorValue {};
 		return true;
 	}
-	return DecodePackedColorClear(format, packed, clear);
+	return DecodePackedColorClear(format, uint64_t {packed} | (uint64_t {packed} << 32u), clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

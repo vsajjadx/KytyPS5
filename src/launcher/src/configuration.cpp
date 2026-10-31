@@ -1,5 +1,25 @@
 #include "configuration.h"
 
+#include <QRegularExpression>
+
+#include <algorithm>
+
+QString Configuration::NormalizeResolution(const QString& text) {
+	// Older settings stored the enum key, e.g. "R1920X1080".
+	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
+	const auto match = re.match(text);
+	if (!match.hasMatch()) {
+		return {};
+	}
+	const int width  = match.captured(1).toInt();
+	const int height = match.captured(2).toInt();
+	if (width < MIN_SCREEN_SIZE || height < MIN_SCREEN_SIZE || width > MAX_SCREEN_SIZE ||
+	    height > MAX_SCREEN_SIZE) {
+		return {};
+	}
+	return QStringLiteral("%1x%2").arg(width).arg(height);
+}
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -10,12 +30,31 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(present_mode);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
+	KYTY_CFG_SET(hdr_enabled);
+	KYTY_CFG_SET(output_1080p_enabled);
+	KYTY_CFG_SET(frame_generation_enabled);
 	KYTY_CFG_SET(hide_cursor_enabled);
+	KYTY_CFG_SET(stretch_enabled);
 	KYTY_CFG_SET(readback_linear_images);
+	KYTY_CFG_SET(readback_tiled_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
 	KYTY_CFG_SET(tessellation_enabled);
+	KYTY_CFG_SET(occlusion_queries_enabled);
+	KYTY_CFG_SET(shader_cache_enabled);
+	KYTY_CFG_SET(async_shaders_enabled);
+	KYTY_CFG_SET(async_compute_enabled);
+	// Renamed when it became the default: earlier settings saved it off.
+	values.insert(QStringLiteral("background_pipelines_enabled"),
+	              QVariant::fromValue(async_pipelines_enabled).toString());
+	KYTY_CFG_SET(gpu_timestamp_scale);
+	KYTY_CFG_SET(vram_budget_mb);
+	KYTY_CFG_SET(skip_shaders);
+	KYTY_CFG_SET(game_tuning_enabled);
 	KYTY_CFG_SET(trophy_enabled);
+	KYTY_CFG_SET(trophy_duration_seconds);
+	KYTY_CFG_SET(perf_overlay_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
+	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
@@ -41,7 +80,8 @@ QVariantMap Configuration::GameSettings() const {
 template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
-	KYTY_CFG_GET(screen_resolution);
+	const auto resolution = NormalizeResolution(s.value("screen_resolution").toString());
+	screen_resolution     = resolution.isEmpty() ? QStringLiteral("1280x720") : resolution;
 	user_name          = s.value("user_name", user_name).toString();
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);
@@ -55,12 +95,34 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 		present_mode = PresentMode::Mailbox;
 	}
 	KYTY_CFG_GET(fullscreen_enabled);
+	KYTY_CFG_GET(hdr_enabled);
+	KYTY_CFG_GET(output_1080p_enabled);
+	KYTY_CFG_GET(frame_generation_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
+	KYTY_CFG_GET(stretch_enabled);
 	KYTY_CFG_GET(readback_linear_images);
+	KYTY_CFG_GET(readback_tiled_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(tessellation_enabled);
-	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
+	KYTY_CFG_GET(occlusion_queries_enabled);
+	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
+	// Settings saved before these existed keep the defaults.
+	async_shaders_enabled   = s.value("async_shaders_enabled", async_shaders_enabled).toBool();
+	async_compute_enabled   = s.value("async_compute_enabled", async_compute_enabled).toBool();
+	async_pipelines_enabled =
+	    s.value("background_pipelines_enabled", async_pipelines_enabled).toBool();
+	gpu_timestamp_scale     = s.value("gpu_timestamp_scale", gpu_timestamp_scale).toInt();
+	if (gpu_timestamp_scale < 10 || gpu_timestamp_scale > 1000) {
+		gpu_timestamp_scale = 100;
+	}
+	vram_budget_mb = std::max(0, s.value("vram_budget_mb", vram_budget_mb).toInt());
+	skip_shaders   = s.value("skip_shaders", skip_shaders).toString();
+	game_tuning_enabled = s.value("game_tuning_enabled", game_tuning_enabled).toBool();
+	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
+	KYTY_CFG_GET(trophy_duration_seconds);
+	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
+	KYTY_CFG_GET(network_connected);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -120,7 +182,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
-		values.insert(it.key(), it.value().toString());
+		const auto value = it.value().toString();
+		values.insert(it.key(), it.key() == "screen_resolution" ? NormalizeResolution(value)
+		                                                       : value);
 	}
 
 	ReadGameSettingsValues(values);
@@ -138,6 +202,15 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (gpu_timestamp_scale < 10 || gpu_timestamp_scale > 1000) {
+		return fail(tr("GPU timestamp scale must be between 10 and 1000."));
+	}
+	if (vram_budget_mb < 0) {
+		return fail(tr("VRAM budget must be 0 (automatic) or more."));
+	}
+	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
+		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));
 	}
 	if ((shader_log_direction == LogDirection::File && shader_log_folder.isEmpty()) ||
 	    (printf_direction == LogDirection::File && printf_output_file.isEmpty()) ||

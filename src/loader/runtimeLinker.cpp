@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -13,10 +14,12 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
+#include "loader/guestFaultRecovery.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
@@ -25,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,16 +92,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 	}
 }
 
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
-
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
 using module_ini_fini_func_t = KYTY_SYSV_ABI int (*)(size_t args, const void* argp,
@@ -150,7 +144,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
 		    "unresolved_import_thunk");
-		EXIT_NOT_IMPLEMENTED(page == 0);
+		if (page == 0) {
+			LOGF("Relocate: unresolved-import thunk page allocation failed\\n");
+			return GuestFaultRecovery::INVALID_MEMORY_SENTINEL;
+		}
 		g_unresolved_stub_thunk_pages.push_back(page);
 		g_unresolved_stub_thunk_offset = 0;
 	}
@@ -194,11 +191,22 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	g_stubbed_imports.push_back(record);
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
+	if (thunk == 0) {
+		// No executable thunk is available. Point the relocation at the invalid-memory
+		// sentinel instead of aborting the process: the failure stays diagnosable and the
+		// guest fault it produces is recoverable by the exception handler.
+		g_stubbed_imports.pop_back();
+		LOGF("Relocate: unresolved-import thunk allocation failed for %s, using invalid-memory "
+		     "sentinel\\n",
+		     ri.name.c_str());
+		return GuestFaultRecovery::INVALID_MEMORY_SENTINEL;
+	}
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
 	return thunk;
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -233,6 +241,18 @@ static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
+	// A null/unresolved-import fault inside the guest unwinds back to this frame instead of
+	// killing the process; this thread then returns through its normal exit path. The setjmp()
+	// deliberately lives in this function's own frame.
+	Loader::GuestFaultRecovery::RecoveryPoint recovery_point {};
+	auto* const previous_recovery_point = Loader::GuestFaultRecovery::g_active;
+	Loader::GuestFaultRecovery::g_active = &recovery_point;
+	if (setjmp(recovery_point.env) != 0) {
+		Loader::GuestFaultRecovery::g_active = previous_recovery_point;
+		std::printf("Guest entry thread unwound after an unresolvable fault; emulator continues\n");
+		std::fflush(stdout);
+		return;
+	}
 #if defined(__x86_64__) || defined(_M_X64)
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -661,6 +681,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -675,7 +696,34 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
+		}
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+			return true;
+		}
+		// A guest thread that dereferences a null or unresolved-import pointer cannot be
+		// resumed, but it must not take the whole emulator down with it either. Unwind only
+		// that guest thread back to the recovery point its entry wrapper armed and leave every
+		// other thread running; the old behaviour terminated the process here.
+		if (info->access_violation_type != CoreAccess::Execute &&
+		    Loader::GuestFaultRecovery::CanRecover(info->access_violation_vaddr)) {
+			char recovered_thread[64] = "(host thread)";
+			if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+				if (Libs::LibKernel::PthreadGetname(self, recovered_thread) != 0) {
+					std::snprintf(recovered_thread, sizeof(recovered_thread),
+					              "(unnamed guest thread)");
+				}
+			}
+			std::printf("Guest fault recovered: thread %s faulted at pc=0x%016" PRIx64
+			            " accessing 0x%016" PRIx64
+			            "; unwound that guest thread, emulator continues\n",
+			            recovered_thread, info->exception_address,
+			            info->access_violation_vaddr);
+			std::fflush(stdout);
+			Loader::GuestFaultRecovery::Unwind();
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
@@ -1283,14 +1331,20 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
+		Libs::LibKernel::PthreadInitGuestFloatingPoint();
 		RunEntry(entry, params, ProgramExitHandler,
 		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
 	}
@@ -1630,6 +1684,8 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	}
 }
 
+constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -1641,6 +1697,20 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 		}
 	}
 	return base_size;
+}
+
+// A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
+// since it lies inside an RW LOAD.
+uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
+	uint64_t size = 0;
+	for (Elf64_Half i = 0; i < phnum; i++) {
+		const auto flags = phdr[i].p_flags;
+		if (phdr[i].p_type == PT_LOAD &&
+		    (flags == PF_X || flags == PF_R || flags == (PF_R | PF_W))) {
+			size += AlignUp(phdr[i].p_memsz, GUEST_PAGE_SIZE);
+		}
+	}
+	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1662,8 +1732,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
-	program->base_size                 = CalcBaseSize(ehdr, phdr);
-	constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+	program->base_size = CalcBaseSize(ehdr, phdr);
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
@@ -1688,6 +1757,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
+	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -1873,6 +1944,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
+		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 

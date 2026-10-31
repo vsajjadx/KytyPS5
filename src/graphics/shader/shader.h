@@ -15,17 +15,6 @@
 
 namespace Libs::Graphics {
 
-namespace ShaderError {
-
-[[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
-	if (error != nullptr) {
-		error->assign(message.data(), message.size());
-	}
-	return false;
-}
-
-} // namespace ShaderError
-
 namespace HW {
 struct VertexShaderInfo;
 struct PixelShaderInfo;
@@ -45,16 +34,14 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
-namespace ShaderRecompiler::IR {
-struct CompiledShaderInfo;
-} // namespace ShaderRecompiler::IR
+struct ShaderModule;
 
 struct ShaderStageRuntime {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	const ShaderModule*                           module    = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr && resources != nullptr;
+		return module != nullptr && resources != nullptr;
 	}
 };
 
@@ -64,6 +51,18 @@ constexpr uint32_t DstSel(uint32_t x, uint32_t y = 0, uint32_t z = 0, uint32_t w
 
 inline uint8_t GetDstSel(uint32_t swizzle, uint32_t channel) {
 	return (swizzle >> (channel * 3u)) & 0x7u;
+}
+
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
+                                             uint32_t component_count = 4) noexcept {
+	if ((swizzle & ~0xfffu) != 0) {
+		return false;
+	}
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		const auto selector = GetDstSel(swizzle, channel);
+		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
+	}
+	return true;
 }
 
 struct ShaderClipSpaceTransform {
@@ -118,9 +117,22 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+};
+
+// GS user-data slots an indirect draw packet writes its record's base vertex and first instance
+// to. A packet can leave both slots unused even when its record contains nonzero offsets.
+struct ShaderIndirectOffsets {
+	static constexpr uint8_t None = UINT8_MAX;
+
+	uint8_t vertex   = None;
+	uint8_t instance = None;
+
+	bool operator==(const ShaderIndirectOffsets&) const = default;
 };
 
 struct ShaderVertexInputInfo {
@@ -137,12 +149,19 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
+	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
+	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
-	bool                    fetch_external      = false;
-	bool                    fetch_embedded      = false;
+	ShaderIndirectOffsets   indirect_offsets;
+	// GPU-read records add Vulkan bases even when the packet patches no user SGPRs.
+	bool                    indirect_draw       = false;
+	// Attribute-table metadata enables dynamic fetch detection; loads are matched later.
+	bool                    has_dynamic_vertex_fetch = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -150,6 +169,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
+	uint64_t           indirect_args_address       = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
@@ -174,12 +194,21 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	uint8_t                                        target_packed_unorm_mask      = 0;
+	// Exports to UINT and SINT targets, which take integer outputs of the same signedness.
+	uint8_t                                        target_uint_mask             = 0;
+	uint8_t                                        target_sint_mask             = 0;
+	// CB round mode per converted export: zero adds half an LSB, one truncates.
+	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
+	bool                                           ps_front_face_all_bits       = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
@@ -188,6 +217,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
+	bool                                           object_primitive_id          = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -15,12 +16,14 @@
 #endif
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -97,7 +100,81 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto count = physical_device_memory_properties.memoryHeapCount;
+	for (uint32_t heap = 0; heap < count; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		heaps[heap] = {.usage        = budgets[heap].usage,
+		               .budget       = budgets[heap].budget,
+		               .allocations  = budgets[heap].statistics.allocationCount,
+		               .device_local = static_cast<bool>(properties.flags &
+		                                                 vk::MemoryHeapFlagBits::eDeviceLocal)};
+	}
+	return count;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
+	const auto reported = GetReportedMemoryBudget();
+	const auto cap      = m_memory_cap.load(std::memory_order_relaxed);
+	auto budget = cap != 0 && (reported == 0 || cap < reported) ? cap : reported;
+	// --vram-budget-mb (or KYTY_VRAM_BUDGET_MB): a fixed ceiling the caches stay under, never
+	// relaxed. "auto" is what PORTHEON runs UFC 6 with: a discrete card's memory minus 1.3 GB,
+	// leaving room for Windows, the driver and the window, so the caches evict before the driver
+	// starts paging.
+	static const uint64_t user_budget = [this] {
+		uint64_t megabytes = Config::GetVramBudgetMb();
+		if (const char* value = std::getenv("KYTY_VRAM_BUDGET_MB"); value != nullptr) {
+			megabytes = std::strtoull(value, nullptr, 10);
+		}
+		if (megabytes != Config::VRAM_BUDGET_AUTO) {
+			return megabytes << 20u;
+		}
+		if (physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+			return uint64_t {0};
+		}
+		uint64_t local = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+			if (properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local += properties.size;
+			}
+		}
+		constexpr uint64_t Reserve = 1300ull << 20u;
+		return local > Reserve + (1ull << 30u) ? local - Reserve : uint64_t {0};
+	}();
+	if (user_budget != 0 && (budget == 0 || user_budget < budget)) {
+		budget = user_budget;
+	}
+	return budget;
+}
+
+void GraphicContext::LowerMemoryCap(uint64_t bytes) {
+	if (bytes == 0) {
+		return;
+	}
+	auto current = m_memory_cap.load(std::memory_order_relaxed);
+	while ((current == 0 || bytes < current) &&
+	       !m_memory_cap.compare_exchange_weak(current, bytes, std::memory_order_relaxed)) {
+	}
+}
+
+void GraphicContext::RelaxMemoryCap() {
+	const auto current = m_memory_cap.load(std::memory_order_relaxed);
+	if (current == 0) {
+		return;
+	}
+	const auto reported = GetReportedMemoryBudget();
+	const auto relaxed  = current + current / 20;
+	m_memory_cap.store(reported != 0 && relaxed >= reported ? 0 : relaxed,
+	                   std::memory_order_relaxed);
+}
+
+uint64_t GraphicContext::GetReportedMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;
 	}
@@ -136,14 +213,51 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
+	auto             result       = static_cast<vk::Result>(
+        vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+                       &alloc_info, &native_image, &image.allocation, nullptr));
 	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+		// A failed device-local allocation means VRAM is effectively full at this usage level,
+		// whatever the driver budget claims (other processes, fragmentation, WDDM limits).
+		// Remember that level so the caches size their eviction thresholds below it, and ask them
+		// (via the event counter) to evict at their next safe point.
+		const auto events = device_oom_events.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (const auto usage = GetDeviceMemoryUsage(); usage != 0) {
+			constexpr uint64_t GiB = 1024ull * 1024 * 1024;
+			LowerMemoryCap(std::max<uint64_t>(usage / 100 * 95, GiB));
+		}
+		if (events <= 16 || events % 128 == 0) {
+			std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u "
+			            "layers=%u (failure #%u); using fallback memory now, caches evict "
+			            "at the next garbage collection\n",
+			            vk::to_string(result).c_str(), static_cast<int>(result),
+			            image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+			            static_cast<int>(image_info.format), image_info.mipLevels,
+			            image_info.arrayLayers, events);
+			std::fflush(stdout);
+			LogMemoryBudget();
+		}
+
+		// Fallback: let VMA pick any memory type (device-local preferred). A hard DEVICE_LOCAL
+		// requirement can fail even when VRAM looks free (driver/OS budget limits, allocation
+		// count limits, or a heap that does not report DEVICE_LOCAL on some GPUs).
+		VmaAllocationCreateInfo fallback_info {};
+		fallback_info.usage         = VMA_MEMORY_USAGE_AUTO;
+		fallback_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		native_image                = VK_NULL_HANDLE;
+		image.allocation            = nullptr;
+		result                      = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+            &fallback_info, &native_image, &image.allocation, nullptr));
+		if (result != vk::Result::eSuccess) {
+			std::printf("vmaCreateImage fallback failed: %s (%d)\n", vk::to_string(result).c_str(),
+			            static_cast<int>(result));
+			std::fflush(stdout);
+			image.image = nullptr;
+			return false;
+		}
 	}
+	image.image = native_image;
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;

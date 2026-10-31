@@ -12,9 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <bitset>
 #include <map>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,7 +26,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
@@ -36,6 +43,7 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -73,11 +81,13 @@ public:
 	void RunGarbageCollector();
 
 private:
-	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile };
+	// Derives the GC thresholds from a VRAM budget; called at start-up and whenever an allocation
+	// failure teaches the graphics context a lower ceiling.
+	void UpdateGcThresholds(uint64_t budget);
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+	struct MetaDataInfo {
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {
@@ -107,7 +117,6 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -146,6 +155,12 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
+	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
+	// render area.
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	                               vk::CommandBuffer command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -166,7 +181,6 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -175,12 +189,19 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
+	uint32_t         m_seen_oom_events        = 0;
+	uint64_t         m_emergency_ticks        = 0;
+	uint64_t         m_ticks_since_oom        = 0;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class ImageHeap;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

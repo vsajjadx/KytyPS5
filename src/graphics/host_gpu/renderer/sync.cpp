@@ -1,10 +1,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
-#include "common/common.h"
-#include "common/logging/log.h"
-#include "common/threads.h"
-#include "graphics/host_gpu/graphicContext.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -50,110 +47,17 @@ uint64_t ReadReferenceClock() {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
-	return value;
-}
-
-enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
-enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
-
-static CommandBufferDebugOp DebugOperation(EndOfPipeWriteAction action) {
-	switch (action) {
-		case EndOfPipeWriteAction::Write: return CommandBufferDebugOp::EopWrite;
-		case EndOfPipeWriteAction::WriteBack:
-		case EndOfPipeWriteAction::InterruptWriteBack: return CommandBufferDebugOp::EopWriteBack;
-		case EndOfPipeWriteAction::Interrupt: return CommandBufferDebugOp::EopInterrupt;
+	// --gpu-timestamp-scale: time since the first read runs that many percent as fast. A game that
+	// times its GPU work with these labels then sees it take longer (or shorter), and one with
+	// dynamic resolution renders smaller (or larger). PORTHEON drives UFC 6 to 960x544 fights
+	// with a timestamp scale in its own engine build.
+	const auto scale = Config::GetGpuTimestampScale();
+	if (scale == 100) {
+		return value;
 	}
-	EXIT("unsupported end-of-pipe write action\n");
-	return CommandBufferDebugOp::Unknown;
-}
-
-static bool TriggersInterrupt(EndOfPipeWriteAction action) {
-	return action == EndOfPipeWriteAction::Interrupt ||
-	       action == EndOfPipeWriteAction::InterruptWriteBack;
-}
-
-static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint64_t destination,
-                                 uint64_t value, EndOfPipeWriteSize size,
-                                 EndOfPipeWriteAction action, int interrupt_event_id = 0,
-                                 uint32_t context_id = 0) {
-	EXIT_IF(destination == 0);
-	(void)buffer.Handle();
-
-	const auto width      = static_cast<uint32_t>(size);
-	const auto value_low  = static_cast<uint32_t>(value);
-	const auto value_high = static_cast<uint32_t>(value >> 32u);
-	const auto operation  = static_cast<uint32_t>(DebugOperation(action));
-	if (TriggersInterrupt(action)) {
-		buffer.SetDebugInfo(operation, submit_id, width, context_id, value_low, value_high,
-		                    destination);
-		TriggerEopEventAtEndOfPipe(buffer, interrupt_event_id, context_id);
-	} else {
-		buffer.SetDebugInfo(operation, submit_id, width, value_low, value_high, 0, destination);
-	}
-}
-
-void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
-                        uint32_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::Write);
-}
-
-void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
-                           uint32_t dw_offset, uint32_t dw_num) {
-	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
-	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
-}
-
-void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
-                        uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
-}
-
-void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint64_t* dst_gpu_addr, uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
-}
-
-void WriteAtEndOfPipeWithWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint32_t* dst_gpu_addr, uint32_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::WriteBack);
-}
-
-void WriteAtEndOfPipeWithInterruptWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint64_t* dst_gpu_addr, uint64_t value, int event_id,
-                                              uint32_t context_id) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::InterruptWriteBack,
-	                     event_id, context_id);
-}
-
-void WriteAtEndOfPipeWithInterruptWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint32_t* dst_gpu_addr, uint32_t value, int event_id,
-                                              uint32_t context_id) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::InterruptWriteBack,
-	                     event_id, context_id);
-}
-
-void WriteAtEndOfPipeWithInterrupt64(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint64_t* dst_gpu_addr, uint64_t value, int event_id,
-                                     uint32_t context_id) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Interrupt, event_id,
-	                     context_id);
-}
-
-void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint32_t* dst_gpu_addr, uint32_t value, int event_id,
-                                     uint32_t context_id) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::Interrupt, event_id,
-	                     context_id);
+	static const uint64_t base    = value;
+	const uint64_t        elapsed = value > base ? value - base : 0;
+	return base + elapsed / 100u * scale + elapsed % 100u * scale / 100u;
 }
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
@@ -174,65 +78,6 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		}
 		video_out.WaitForSubmitSlot(handle);
 	}
-}
-
-void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuffer& buffer,
-                                                  uint32_t* dst_gpu_addr, uint32_t value,
-                                                  int handle, int index, int flip_mode,
-                                                  int64_t flip_arg, uint64_t request_id,
-                                                  int event_id) {
-	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWriteBackFlip), submit_id,
-	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
-
-	auto& renderer  = buffer.GetContext();
-	auto& scheduler = renderer.GetCommandScheduler();
-	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
-		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
-	});
-}
-
-void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
-                                uint32_t value, int handle, int index, int flip_mode,
-                                int64_t flip_arg, uint64_t request_id) {
-	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopFlip), submit_id,
-	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
-
-	auto& renderer  = buffer.GetContext();
-	auto& scheduler = renderer.GetCommandScheduler();
-	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
-}
-
-void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
-                              int flip_mode, int64_t flip_arg, uint64_t request_id) {
-	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopOnlyFlip), submit_id,
-	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                    static_cast<uint32_t>(flip_mode), 0, static_cast<uint64_t>(flip_arg));
-
-	auto& renderer  = buffer.GetContext();
-	auto& scheduler = renderer.GetCommandScheduler();
-	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
-}
-
-void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
-	(void)buffer.Handle();
-	auto& renderer  = buffer.GetContext();
-	auto& scheduler = renderer.GetCommandScheduler();
-	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

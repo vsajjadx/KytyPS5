@@ -32,8 +32,12 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
-	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
-		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+	switch (guest_format) {
+		case Prospero::BufferFormat::k10_11_11Float:
+			return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+		case Prospero::BufferFormat::k2_10_10_10UNorm:
+			return {vk::Format::eA2R10G10B10UnormPack32, Prospero::ColorMappingAbgr};
+		default: break;
 	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
@@ -64,7 +68,10 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
                                                     Prospero::ChannelOrder  order) {
 	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
-		const auto host_format = ResolveHostFormat(encoding.buffer_format, order);
+		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
+		                                ? Prospero::RemapTextureFormat(encoding.buffer_format)
+		                                : encoding.buffer_format;
+		const auto host_format = ResolveHostFormat(backing_format, order);
 		const auto bytes       = Prospero::RenderTargetBytesPerElement(encoding.buffer_format);
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =

@@ -15,6 +15,9 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/route.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
@@ -27,6 +30,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -41,10 +45,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,6 +137,7 @@ public:
 	bool HttpValidTemplate(Id tmpl_id);
 	bool HttpValidConnection(Id conn_id);
 	bool HttpValidRequest(Id req_id);
+	bool HttpValidBase(Id id);
 	Id HttpCreateConnection(Id tmpl_id, const char* server_name, const char* scheme, uint16_t port,
 	                        bool enable_keep_alive);
 	Id HttpCreateConnectionWithURL(Id tmpl_id, const char* url, bool enable_keep_alive);
@@ -405,6 +412,12 @@ bool Network::HttpValidRequest(Id req_id) {
 	        m_requests[req_id.GetId()].used);
 }
 
+bool Network::HttpValidBase(Id id) {
+	Common::LockGuard lock(m_mutex);
+
+	return FindHttpBase(id, true) != nullptr;
+}
+
 Network::HttpBase* Network::FindHttpBase(Id id, bool include_request) {
 	const auto index = id.GetId();
 
@@ -453,7 +466,7 @@ Network::Id Network::HttpCreateTemplate(Id http_ctx_id, const char* user_agent, 
 		HttpTemplate tn {};
 		tn.used               = true;
 		tn.http_ver           = http_ver;
-		tn.user_agent         = std::string(user_agent);
+		tn.user_agent         = user_agent != nullptr ? user_agent : "";
 		tn.is_auto_proxy_conf = is_auto_proxy_conf;
 		tn.http_ctx_id        = http_ctx_id.GetId();
 		tn.nonblock           = false;
@@ -886,6 +899,7 @@ struct P2pEndpoint {
 	uint16_t virtual_port   = 0;
 	int      nonblocking    = 0;
 	int      broadcast      = 0;
+	int      use_crypto     = 0;
 	int      send_buffer    = 9216;
 	int      receive_buffer = 40 * 1024;
 };
@@ -1090,6 +1104,7 @@ static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 		case 0x1001: return &endpoint.send_buffer;
 		case 0x1002: return &endpoint.receive_buffer;
 		case 0x1200: return &endpoint.nonblocking;
+		case 0x20000: return &endpoint.use_crypto;
 		default: return nullptr;
 	}
 }
@@ -2091,19 +2106,15 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 		return -1;
 	}
 
-#if defined(_WIN32)
-	if (::shutdown(socket, how) == SOCKET_ERROR) {
+	if (::shutdown(socket, how) != 0) {
 		return SetHostSocketError();
 	}
+#if defined(_WIN32)
 	if (how == SD_RECEIVE || how == SD_BOTH) {
 		transport->receive_shutdown.store(true, std::memory_order_relaxed);
 	}
-
-	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
 #endif
+	return 0;
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
@@ -2458,15 +2469,30 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
-	std::shared_ptr<SocketTransport> transport;
-	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
 	}
 
 	const int host_flags = ConvertMessageFlags(flags);
 	if (host_flags < 0) {
 		return -1;
+	}
+	if (state.p2p) {
+		if (!state.p2p->bound || (!state.p2p->nonblocking && (flags & 0x80) == 0)) {
+			return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+		}
+		char pending;
+		if (::recv(socket, &pending, sizeof(pending), MSG_PEEK) < 0) {
+			SetHostSocketError();
+			// Winsock reports a peeked datagram's truncation as EMSGSIZE.
+			if (*Posix::GetErrorAddr() != Posix::POSIX_EMSGSIZE) {
+				return -1;
+			}
+		}
+		// Pending UDPP2P packets still require framing and optional decryption.
+		return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
 	}
 
 	const auto host_len = static_cast<SocketIoLength>(
@@ -2475,12 +2501,12 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
 #if defined(_WIN32)
-	if (transport->type == SOCK_STREAM) {
+	if (state.transport->type == SOCK_STREAM) {
 		if (addr != nullptr &&
 		    ::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
 			return SetHostSocketError();
 		}
-		result = ReceiveStream(*transport, static_cast<char*>(buf), host_len, host_flags,
+		result = ReceiveStream(*state.transport, static_cast<char*>(buf), host_len, host_flags,
 		                       (flags & 0x80) != 0);
 		if (result < 0) {
 			return result;
@@ -2488,7 +2514,7 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	} else
 #endif
 	{
-		transport.reset();
+		state.transport.reset();
 		if (addr == nullptr) {
 			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 		} else {
@@ -2552,12 +2578,23 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
 	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
+	std::vector<std::pair<void*, int>> ready_files;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
 		const bool write = GuestFdIsSet(writefds, fd);
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
+			continue;
+		}
+		// FreeBSD polls files and devices ready to read and write at once.
+		if (!IsSocket(fd) && LibKernel::FileSystem::IsOpenDescriptor(fd)) {
+			if (read) {
+				ready_files.emplace_back(readfds, fd);
+			}
+			if (write) {
+				ready_files.emplace_back(writefds, fd);
+			}
 			continue;
 		}
 		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
@@ -2611,6 +2648,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
 		host_timeout_ptr = &host_timeout;
 	}
+	if (!ready_files.empty()) {
+		host_timeout     = {};
+		host_timeout_ptr = &host_timeout;
+	}
 
 	int result = 0;
 #if defined(_WIN32)
@@ -2646,6 +2687,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			GuestFdSet(exceptfds, fd);
 			result++;
 		}
+	}
+	for (const auto& [fds, fd]: ready_files) {
+		GuestFdSet(fds, fd);
+		result++;
 	}
 	return result;
 }
@@ -2989,6 +3034,143 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 	     id, enable);
 
 	if (!g_net->HttpSetAuthEnabled(Network::Id(id), enable)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+static int HttpCheckBase(int id) {
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
+}
+
+int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetInflateGZIPEnabled(int id, int is_enable) {
+	PRINT_NAME();
+
+	LOGF("\t id        = %d\n"
+	     "\t is_enable = %d\n",
+	     id, is_enable);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int is_enabled) {
+	PRINT_NAME();
+
+	LOGF("\t id         = %d\n"
+	     "\t is_enabled = %d\n",
+	     id, is_enabled);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (is_enabled != 0 && is_enabled != 1) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpValidRequest(Network::Id(id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsLoadCert(int http_ctx_id, int ca_cert_num, const void** /*ca_list*/,
+                                const void* /*cert*/, const void* /*priv_key*/) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n"
+	     "\t ca_cert_num = %d\n",
+	     http_ctx_id, ca_cert_num);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsUnloadCert(int http_ctx_id) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int32_t* err_num, uint32_t* detail) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n"
+	     "\t detail     = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num), reinterpret_cast<uint64_t>(detail));
+
+	if (err_num == nullptr || detail == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+	*detail  = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* err_num) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num));
+
+	if (err_num == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3386,7 +3568,6 @@ constexpr int NET_CTL_STATE_DISCONNECTED  = 0;
 constexpr int NET_CTL_STATE_IPOBTAINED    = 3;
 constexpr int NET_CTL_DEVICE_WIRED        = 0;
 constexpr int NET_CTL_DEVICE_WIRELESS     = 1;
-constexpr int NET_CTL_LINK_DISCONNECTED   = 0;
 constexpr int NET_CTL_LINK_CONNECTED      = 1;
 constexpr int NET_CTL_EVENT_DISCONNECTED  = 1;
 constexpr int NET_CTL_EVENT_IPOBTAINED    = 3;
@@ -3448,8 +3629,6 @@ struct NetCtlCallbackSlot {
 
 static Common::Mutex                     g_net_ctl_callbacks_mutex;
 static std::array<NetCtlCallbackSlot, 8> g_net_ctl_callbacks;
-static std::atomic_bool                  g_net_ctl_connected          = false;
-static std::atomic_bool                  g_net_ctl_status_initialized = false;
 
 struct HostNetworkInfo {
 	bool         connected = false;
@@ -3463,22 +3642,16 @@ struct HostNetworkInfo {
 };
 
 static void CopyIpv4String(char* dst, size_t dst_size, const sockaddr* addr) {
-#if defined(_WIN32)
 	if (dst == nullptr || dst_size == 0 || addr == nullptr || addr->sa_family != AF_INET) {
 		return;
 	}
 
 	const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
 	inet_ntop(AF_INET, &in->sin_addr, dst, static_cast<socklen_t>(dst_size));
-#else
-	(void)dst;
-	(void)dst_size;
-	(void)addr;
-#endif
 }
 
-static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 #if defined(_WIN32)
+static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 	if (dst == nullptr || dst_size == 0 || prefix_len > 32) {
 		return;
 	}
@@ -3487,26 +3660,22 @@ static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 	in_addr        in {};
 	in.S_un.S_addr = htonl(mask);
 	inet_ntop(AF_INET, &in, dst, static_cast<socklen_t>(dst_size));
-#else
-	(void)dst;
-	(void)dst_size;
-	(void)prefix_len;
-#endif
 }
+#endif
 
 static HostNetworkInfo QueryHostNetworkInfo() {
 	HostNetworkInfo info;
 #if defined(_WIN32)
-	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS;
 	ULONG size  = 0;
-	auto  ret   = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size);
+	auto  ret   = GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &size);
 	if (ret != ERROR_BUFFER_OVERFLOW || size == 0) {
 		return info;
 	}
 
 	std::vector<uint8_t> buffer(size);
 	auto*                adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-	ret = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, adapters, &size);
+	ret = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size);
 	if (ret != NO_ERROR) {
 		return info;
 	}
@@ -3557,39 +3726,75 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 					}
 					return info;
 				}
-			} else if (addr->sa_family == AF_INET6) {
-				const auto* in6 = reinterpret_cast<const sockaddr_in6*>(addr);
-				if (!IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) &&
-				    !IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) {
-					info.connected = true;
-				}
 			}
 		}
 	}
 
 	return info;
 #else
-	info.connected = true;
+	ifaddrs* addresses = nullptr;
+	if (getifaddrs(&addresses) != 0) {
+		return info;
+	}
+	const auto usable = [](const ifaddrs* address) {
+		return address->ifa_addr != nullptr && address->ifa_addr->sa_family == AF_INET &&
+		       (address->ifa_flags & (IFF_UP | IFF_RUNNING | IFF_LOOPBACK)) ==
+		           (IFF_UP | IFF_RUNNING) &&
+		       reinterpret_cast<const sockaddr_in*>(address->ifa_addr)->sin_addr.s_addr != 0;
+	};
+	const ifaddrs* selected = nullptr;
+	for (auto* address = addresses; address != nullptr; address = address->ifa_next) {
+		if (usable(address)) {
+			selected = address;
+			break;
+		}
+	}
+	std::ifstream routes("/proc/net/route");
+	std::string line;
+	uint32_t best_metric = std::numeric_limits<uint32_t>::max();
+	uint32_t gateway = 0;
+	bool has_default_route = false;
+	while (std::getline(routes, line)) {
+		std::istringstream fields(line);
+		std::string name;
+		uint32_t destination = 0, candidate_gateway = 0, flags = 0, refs = 0, uses = 0;
+		uint32_t metric = 0, mask = 0;
+		if (!(fields >> name >> std::hex >> destination >> candidate_gateway >> flags >>
+		      std::dec >> refs >> uses >> metric >> std::hex >> mask) ||
+		    destination != 0 || mask != 0 || (flags & (RTF_UP | RTF_REJECT)) != RTF_UP ||
+		    (has_default_route && metric >= best_metric)) {
+			continue;
+		}
+		for (auto* address = addresses; address != nullptr; address = address->ifa_next) {
+			if (usable(address) && name == address->ifa_name) {
+				selected = address;
+				gateway = candidate_gateway;
+				best_metric = metric;
+				has_default_route = true;
+				break;
+			}
+		}
+	}
+	if (selected != nullptr) {
+		CopyIpv4String(info.ip_address, sizeof(info.ip_address), selected->ifa_addr);
+		CopyIpv4String(info.netmask, sizeof(info.netmask), selected->ifa_netmask);
+		info.connected = info.ip_address[0] != '\0';
+		if (has_default_route) {
+			in_addr address {gateway};
+			inet_ntop(AF_INET, &address, info.default_route, sizeof(info.default_route));
+		}
+	}
+	freeifaddrs(addresses);
 	return info;
 #endif
 }
 
 static bool NetCtlConnected() {
-	if (!g_net_ctl_status_initialized.load()) {
-		g_net_ctl_connected          = false;
-		g_net_ctl_status_initialized = true;
-		LOGF("\t host network connected = false (forced offline)\n");
-	}
-
-	return g_net_ctl_connected.load();
+	return Config::IsNetworkConnected() && QueryHostNetworkInfo().connected;
 }
 
 int KYTY_SYSV_ABI NetCtlInit() {
 	PRINT_NAME();
-
-	g_net_ctl_connected          = false;
-	g_net_ctl_status_initialized = true;
-	LOGF("\t host network connected = false (forced offline)\n");
 
 	return OK;
 }
@@ -3651,7 +3856,7 @@ int KYTY_SYSV_ABI NetCtlGetStateV6(int* state) {
 		return NET_CTL_ERROR_INVALID_ADDR;
 	}
 
-	*state = (NetCtlConnected() ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED);
+	*state = NET_CTL_STATE_DISCONNECTED;
 
 	return OK;
 }
@@ -3720,24 +3925,28 @@ int KYTY_SYSV_ABI NetCtlGetResult(int event_type, int* error_code) {
 int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-
+	if (info == nullptr) {
+		return NET_CTL_ERROR_INVALID_ADDR;
+	}
+	if (code < 1 || code > 21) {
+		return NET_CTL_ERROR_INVALID_CODE;
+	}
+	if (!Config::IsNetworkConnected()) {
+		return NET_CTL_ERROR_NOT_CONNECTED;
+	}
+	const auto host = QueryHostNetworkInfo();
+	if (!host.connected || (code == 16 && host.default_route[0] == '\0')) {
+		return NET_CTL_ERROR_NOT_CONNECTED;
+	}
 	memset(info, 0, sizeof(NetCtlInfo));
-
-	// Online/host-backed info responses are left below for testing, but disabled
-	// to preserve the disconnected-console behavior.
-	return NET_CTL_ERROR_NOT_CONNECTED;
 
 	switch (code) {
 		case 1:
-			info->device =
-			    (QueryHostNetworkInfo().wireless ? NET_CTL_DEVICE_WIRELESS : NET_CTL_DEVICE_WIRED);
+			info->device = (host.wireless ? NET_CTL_DEVICE_WIRELESS : NET_CTL_DEVICE_WIRED);
 			break;
-		case 2: info->ether_addr = QueryHostNetworkInfo().ether_addr; break;
+		case 2: info->ether_addr = host.ether_addr; break;
 		case 3: info->mtu = 1500; break;
-		case 4:
-			info->link = (NetCtlConnected() ? NET_CTL_LINK_CONNECTED : NET_CTL_LINK_DISCONNECTED);
-			break;
+		case 4: info->link = NET_CTL_LINK_CONNECTED; break;
 		case 5: break;
 		case 6: break;
 		case 7: info->wifi_security = 0; break;
@@ -3748,28 +3957,25 @@ int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 		case 12: break;
 		case 13: break;
 		case 14:
-			std::strncpy(info->ip_address, QueryHostNetworkInfo().ip_address,
+			std::strncpy(info->ip_address, host.ip_address,
 			             sizeof(info->ip_address) - 1);
 			break;
 		case 15:
-			std::strncpy(info->netmask, QueryHostNetworkInfo().netmask, sizeof(info->netmask) - 1);
+			std::strncpy(info->netmask, host.netmask, sizeof(info->netmask) - 1);
 			break;
 		case 16:
-			std::strncpy(info->default_route, QueryHostNetworkInfo().default_route,
+			std::strncpy(info->default_route, host.default_route,
 			             sizeof(info->default_route) - 1);
 			break;
 		case 17:
-			std::strncpy(info->primary_dns, QueryHostNetworkInfo().primary_dns,
-			             sizeof(info->primary_dns) - 1);
+			std::strncpy(info->primary_dns, host.primary_dns, sizeof(info->primary_dns) - 1);
 			break;
 		case 18:
-			std::strncpy(info->secondary_dns, QueryHostNetworkInfo().secondary_dns,
-			             sizeof(info->secondary_dns) - 1);
+			std::strncpy(info->secondary_dns, host.secondary_dns, sizeof(info->secondary_dns) - 1);
 			break;
 		case 19: info->http_proxy_config = NET_CTL_HTTP_PROXY_OFF; break;
 		case 20: break;
 		case 21: info->http_proxy_port = 0; break;
-		default: LOGF("\t unknown NetCtl info code: %d\n", code); return NET_CTL_ERROR_INVALID_CODE;
 	}
 
 	return OK;

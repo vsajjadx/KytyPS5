@@ -1,15 +1,20 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/frameGeneration.h"
+#include "graphics/presentation/openxrHeadset.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -17,6 +22,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -31,6 +40,8 @@ struct Presenter::Frame {
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
+	bool          hdr          = false;
+	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -114,6 +125,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
+		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::SwapchainFrame);
 		m_scheduler.Wait(frame->present_tick);
 		return frame;
 	}
@@ -263,7 +275,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -274,20 +286,32 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
+	bool SetHdr(bool hdr) {
+		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
+		m_hdr_requested = hdr;
+		return changed;
+	}
 
 private:
+	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
+	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
+	                 const vk::Rect2D& rect);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
+	std::atomic_bool m_hdr_supported {false};
+	bool             m_hdr_requested = false;
+	bool             m_hdr_active    = false;
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
@@ -305,11 +329,102 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		const char* env = std::getenv("KYTY_FRAME_GENERATION");
+		FrameGeneration::SetEnabled(Config::FrameGenerationEnabled() ||
+		                            (env != nullptr && env[0] == '1'));
+	}
+	~Impl() {
+		frame_generator.reset();
+		if (generated.image.image != nullptr) {
+			present_scheduler.Wait(present_scheduler.CurrentTick() - 1);
+			window.graphic_ctx.device.destroyImageView(generated.view, nullptr);
+			window.graphic_ctx.DeleteImage(generated.image);
+		}
+	}
+
+	// Shows a generated frame between the previous game frame and `real`, and keeps `real` for
+	// a later vblank. Returns false when the frame should be shown right away instead.
+	bool PresentWithGeneratedFrame(Frame* real) {
+		using namespace std::chrono_literals;
+		const auto now = std::chrono::steady_clock::now();
+		if (last_real_frame.time_since_epoch().count() != 0) {
+			const auto interval = now - last_real_frame;
+			real_interval = real_interval.count() == 0 || interval > real_interval * 3
+			                    ? std::chrono::duration_cast<std::chrono::nanoseconds>(interval)
+			                    : (real_interval * 7 + interval) / 8;
+		}
+		last_real_frame = now;
+		const auto vblank =
+		    std::chrono::nanoseconds(1'000'000'000 / std::max(Config::GetVblankFrequency(), 1u));
+		const auto format           = real->image.format;
+		const bool generated_format = format == vk::Format::eR8G8B8A8Unorm ||
+		                              format == vk::Format::eB8G8R8A8Unorm ||
+		                              format == vk::Format::eA2R10G10B10UnormPack32 ||
+		                              format == vk::Format::eA2B10G10R10UnormPack32;
+		// A game already at the display rate gains nothing, and a slide show is no animation.
+		const bool wanted = FrameGeneration::IsEnabled() && !real->blank && !real->hdr &&
+		                    generated_format && layers[1].frame == nullptr &&
+		                    real_interval >= vblank * 9 / 5 && real_interval <= 150ms;
+		if (!wanted) {
+			if (frame_generator != nullptr) {
+				frame_generator->Reset();
+			}
+			pending_real = false;
+			return false;
+		}
+		if (frame_generator == nullptr) {
+			frame_generator =
+			    std::make_unique<FrameGenerator>(window.graphic_ctx, present_scheduler);
+		}
+		if (generated.present_tick != 0) {
+			present_scheduler.Wait(generated.present_tick);
+		}
+		const vk::Extent2D extent {real->image.extent.width, real->image.extent.height};
+		generated.Configure(window.graphic_ctx, extent, format);
+		auto& command = present_scheduler.BeginCommand();
+		real->Transit(command.Handle(), vk::ImageLayout::eGeneral,
+		              vk::AccessFlagBits2::eTransferRead);
+		const bool ok =
+		    frame_generator->Generate(command.Handle(), real->image.image, generated.image.image,
+			                          extent.width, extent.height);
+		real->image.state = {vk::PipelineStageFlagBits2::eAllCommands,
+		                     vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+		                     vk::ImageLayout::eGeneral};
+		generated.image.state = {
+		    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+		    ok ? vk::ImageLayout::eTransferSrcOptimal : generated.image.state.layout};
+		present_scheduler.Submit();
+		if (!ok) {
+			pending_real = false;
+			return false;
+		}
+		layers[0].frame = &generated;
+		Present();
+		layers[0].frame = real;
+		if (++generated_count % 300 == 1) {
+			std::printf("Frame generation: %llu frames generated, game frame every %.1f ms\n",
+			            static_cast<unsigned long long>(generated_count),
+			            std::chrono::duration<double, std::milli>(real_interval).count());
+		}
+		pending_real = true;
+		real_due     = now + real_interval / 2;
+		return true;
+	}
+
+	// Shows the game frame a generated frame went ahead of, once its time has come.
+	bool PresentPendingRealFrame() {
+		if (!pending_real || std::chrono::steady_clock::now() < real_due) {
+			return false;
+		}
+		pending_real = false;
+		Present();
+		return true;
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -344,7 +459,48 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	Frame                                 generated;
+	std::unique_ptr<FrameGenerator>       frame_generator;
+	std::chrono::steady_clock::time_point last_real_frame {};
+	std::chrono::steady_clock::time_point real_due {};
+	std::chrono::nanoseconds              real_interval {};
+	bool                                  pending_real    = false;
+	uint64_t                              generated_count = 0;
 };
+
+vk::SurfaceFormatKHR Swapchain::SelectFormat() {
+	const auto& formats    = m_window.surface_capabilities.formats;
+	auto&       graphics   = m_window.graphic_ctx;
+	const auto  hdr_format = std::ranges::find_if(formats, [&](const auto& candidate) {
+		return candidate.colorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT &&
+		       IsHdrSwapchainFormat(candidate.format) &&
+		       static_cast<bool>(
+		           graphics.GetFormatProperties(candidate.format).optimalTilingFeatures &
+		           vk::FormatFeatureFlagBits::eBlitDst);
+	});
+	m_hdr_supported        = Config::HdrEnabled() && hdr_format != formats.end();
+	m_hdr_active           = m_hdr_requested && IsHdrSupported();
+	if (m_hdr_active) {
+		return *hdr_format;
+	}
+	if (Config::HdrEnabled() && !IsHdrSupported()) {
+		LOGF("HDR10 surface unavailable; using SDR output\n");
+	}
+	if (formats.size() == 1 && formats.front().format == vk::Format::eUndefined) {
+		return {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	}
+	for (const auto& candidate: formats) {
+		if (candidate.colorSpace != vk::ColorSpaceKHR::eSrgbNonlinear) {
+			continue;
+		}
+		switch (candidate.format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eR8G8B8A8Unorm: return candidate;
+			default: break;
+		}
+	}
+	EXIT("no supported UNORM swapchain format\n");
+}
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
@@ -385,18 +541,7 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
-		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
-		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
-		                             });
-		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
-		}
-		format = *it;
-	}
+	const auto format = SelectFormat();
 	m_format                      = format.format;
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
@@ -436,6 +581,7 @@ void Swapchain::Create() {
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
+	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -464,6 +610,7 @@ void Swapchain::Create() {
 	vk::SemaphoreCreateInfo semaphore_info {};
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
+	m_image_acquired_ticks.assign(m_images.size(), 0);
 	m_render_complete.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
@@ -532,6 +679,7 @@ void Swapchain::Destroy() {
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
+	m_image_acquired_ticks.clear();
 	m_render_complete.clear();
 }
 
@@ -557,8 +705,11 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
+	// Wait for the submission that consumed this slot before signaling it again.
+	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -590,7 +741,23 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
+static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& target) {
+	const uint64_t src_w = std::max(source.width, 1u);
+	const uint64_t src_h = std::max(source.height, 1u);
+	uint32_t       w     = target.width;
+	uint32_t       h     = target.height;
+	if (src_w * h > src_h * w) {
+		h = std::max<uint32_t>(1, static_cast<uint32_t>(src_h * w / src_w));
+	} else {
+		w = std::max<uint32_t>(1, static_cast<uint32_t>(src_w * h / src_h));
+	}
+	return {{static_cast<int32_t>((target.width - w) / 2),
+	         static_cast<int32_t>((target.height - h) / 2)},
+	        {w, h}};
+}
+
+void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
+                            const vk::Rect2D& rect) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -692,9 +859,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	const uint32_t premultiplied = layer.premultiplied_alpha;
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
+	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(premultiplied), &premultiplied);
+	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -707,12 +876,14 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
 	command.beginRendering(&rendering);
-	const vk::Viewport viewport {
-	    0.0f, 0.0f, static_cast<float>(m_extent.width), static_cast<float>(m_extent.height),
-	    0.0f, 1.0f};
-	const vk::Rect2D scissor {{0, 0}, m_extent};
+	const vk::Viewport viewport {static_cast<float>(rect.offset.x),
+	                             static_cast<float>(rect.offset.y),
+	                             static_cast<float>(rect.extent.width),
+	                             static_cast<float>(rect.extent.height),
+	                             0.0f,
+	                             1.0f};
 	command.setViewport(0, 1, &viewport);
-	command.setScissor(0, 1, &scissor);
+	command.setScissor(0, 1, &rect);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 }
@@ -750,6 +921,24 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                               ? FitAspect(aspect_source->image.extent, m_extent)
+	                               : vk::Rect2D {{0, 0}, m_extent};
+	if (source == nullptr || game_rect.extent != m_extent) {
+		const vk::ClearColorValue black {};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
+		                           &black, 1, &to_transfer.subresourceRange);
+		if (source != nullptr) {
+			vk::ImageMemoryBarrier after_clear = to_transfer;
+			after_clear.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
+			after_clear.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
+			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                           vk::PipelineStageFlagBits::eTransfer,
+			                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
+			                           &after_clear);
+		}
+	}
 	if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
@@ -763,16 +952,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstSubresource.mipLevel       = 0;
 		region.dstSubresource.baseArrayLayer = 0;
 		region.dstSubresource.layerCount     = 1;
-		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
-		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
+		region.dstOffsets[0].x = game_rect.offset.x;
+		region.dstOffsets[0].y = game_rect.offset.y;
+		region.dstOffsets[1].x = game_rect.offset.x + static_cast<int>(game_rect.extent.width);
+		region.dstOffsets[1].y = game_rect.offset.y + static_cast<int>(game_rect.extent.height);
 		region.dstOffsets[1].z               = 1;
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
-	} else {
-		const vk::ClearColorValue black {};
-		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
-		                           &black, 1, &to_transfer.subresourceRange);
 	}
 
 	vk::ImageMemoryBarrier to_present {};
@@ -799,7 +986,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           &to_present);
 	if (draw_attachment) {
 		if (draw_overlay) {
-			DrawOverlay(vk_command, overlay);
+			DrawOverlay(vk_command, overlay, game_rect);
 			if (draw_system_overlay) {
 				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
@@ -828,7 +1015,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                       = scheduler.Submit(submit);
+	m_image_acquired_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -868,7 +1057,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
+                                          bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -878,6 +1068,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	frame->hdr   = hdr;
+	frame->blank = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -886,6 +1078,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (headset) {
+		// The frame holds the raw display-encoded pixels the headset needs.
+		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		               vk::AccessFlagBits2::eTransferRead);
+		Vr::OpenXrQueueEyeSource(buffer, frame->image);
+	}
 	return *frame;
 }
 
@@ -894,7 +1092,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	frame->hdr   = false;
+	frame->blank = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -902,6 +1101,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -920,6 +1120,10 @@ bool Presenter::PresentLastFrame() {
 
 bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
+}
+
+bool Presenter::IsHdrSupported() const noexcept {
+	return m_impl->swapchain.IsHdrSupported();
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
@@ -948,7 +1152,16 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
+	auto* main_frame = m_impl->layers[0].frame;
+	if (main_frame != nullptr && m_impl->PresentWithGeneratedFrame(main_frame)) {
+		return;
+	}
 	m_impl->Present();
+}
+
+bool Presenter::PresentPendingFrame() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	return m_impl->PresentPendingRealFrame();
 }
 
 void Presenter::ClearLayer(int bus) {
@@ -967,28 +1180,31 @@ void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
+	const auto* main_frame = layers[0].frame;
+	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
+	                         swapchain.SetHdr(main_frame->hdr);
 	// Some window systems keep presenting an old swapchain after a resize.
-	if (swapchain.NeedsResize()) {
+	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
-			const auto tick = swapchain.Submit(present_scheduler);
-			for (const auto& layer: layers) {
-				if (layer.frame != nullptr) {
-					layer.frame->present_tick = tick;
-				}
+		// present_mutex owns the prepared frames and this scheduler. Only queue submission
+		// is shared with rendering, and it has its own queue_mutex.
+		auto&      command = present_scheduler.BeginCommand();
+		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
+		                                 swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		                                draw_system_overlay);
+		const auto tick = swapchain.Submit(present_scheduler);
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) {
+				layer.frame->present_tick = tick;
 			}
 		}
 		status = swapchain.Present();
@@ -1002,6 +1218,7 @@ void Presenter::Impl::Present() {
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

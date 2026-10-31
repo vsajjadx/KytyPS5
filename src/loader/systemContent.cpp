@@ -35,7 +35,7 @@ public:
 	bool     GetParamInt(const char* name, int32_t* value);
 	bool     GetParamString(const char* name, std::string* value);
 	bool     GetParamString(const char* name, char* value, size_t value_size);
-	uint64_t GetFlexibleMemorySize();
+	MemoryParams GetMemoryParams();
 
 	void DbgPrint();
 
@@ -61,7 +61,7 @@ private:
 	Common::Mutex      m_mutex;
 	bool               m_opened = false;
 	std::vector<Param> m_params;
-	uint64_t           m_flexible_memory_size = 0;
+	MemoryParams       m_memory_params;
 };
 
 class PlayGo {
@@ -164,17 +164,29 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	add_string_param("contentId", "CONTENT_ID");
 	add_string_param("contentVersion", "APP_VER");
 	add_string_param("appVersion", "APP_VER");
+	AddParamInt("ATTRIBUTE", 0);
+	add_int_param("attribute", "ATTRIBUTE");
 	add_int_param("attribute3", "ATTRIBUTE3");
 	add_int_param("userDefinedParam1", "USER_DEFINED_PARAM_1");
 	add_int_param("userDefinedParam2", "USER_DEFINED_PARAM_2");
 	add_int_param("userDefinedParam3", "USER_DEFINED_PARAM_3");
 	add_int_param("userDefinedParam4", "USER_DEFINED_PARAM_4");
 
+	auto read_size = [](const nlohmann::ordered_json& object, const char* key, uint64_t* size,
+	                    uint64_t unit = 1) {
+		if (auto it = object.find(key); it != object.end()) {
+			*size = it->get<uint64_t>() * unit;
+		}
+	};
 	if (auto kernel = param_json.find("kernel");
 	    kernel != param_json.end() && kernel->is_object()) {
-		if (auto it = kernel->find("flexibleMemorySize"); it != kernel->end()) {
-			m_flexible_memory_size = it->get<uint64_t>();
-		}
+		read_size(*kernel, "flexibleMemorySize", &m_memory_params.flexible_size);
+		read_size(*kernel, "cpuPageTableSize", &m_memory_params.cpu_table_memory);
+		read_size(*kernel, "gpuPageTableSize", &m_memory_params.gpu_table_memory);
+	}
+	if (auto amm = param_json.find("amm"); amm != param_json.end() && amm->is_object()) {
+		read_size(*amm, "pagetableMemorySizeInMib", &m_memory_params.amm_table_memory,
+		          1024ull * 1024ull);
 	}
 
 	auto localized = param_json.find("localizedParameters");
@@ -225,8 +237,8 @@ void Psf::Close() {
 	Common::LockGuard lock(m_mutex);
 
 	m_params.clear();
-	m_flexible_memory_size = 0;
-	m_opened               = false;
+	m_memory_params = {};
+	m_opened        = false;
 }
 
 bool Psf::IsValid() {
@@ -337,10 +349,10 @@ bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
 	return false;
 }
 
-uint64_t Psf::GetFlexibleMemorySize() {
+MemoryParams Psf::GetMemoryParams() {
 	Common::LockGuard lock(m_mutex);
 
-	return m_flexible_memory_size;
+	return m_memory_params;
 }
 
 PlayGo::~PlayGo() {
@@ -360,10 +372,12 @@ void PlayGo::Open(const std::filesystem::path& file_name) {
 	}
 
 	uint32_t magic1 = 0;
+	constexpr uint32_t PLGO_MAGIC = 0x6f676c70;
+	constexpr uint32_t PLGX_MAGIC = 0x78676c70;
 
 	m_f.Read(&magic1, 4);
 
-	if (magic1 != 0x6f676c70) {
+	if (magic1 != PLGO_MAGIC && magic1 != PLGX_MAGIC) {
 		LOGF("invalid file: magic1 = %08" PRIx32 "\n", magic1);
 		return;
 	}
@@ -642,10 +656,10 @@ bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_
 	return sc->psf.GetParamString(name, value, value_size);
 }
 
-uint64_t SystemContentGetFlexibleMemorySize() {
+MemoryParams SystemContentGetMemoryParams() {
 	auto* sc = Common::Singleton<SystemContent>::Instance();
 
-	return sc->psf.GetFlexibleMemorySize();
+	return sc->psf.GetMemoryParams();
 }
 
 bool SystemContentGetIconPath(std::filesystem::path* path) {

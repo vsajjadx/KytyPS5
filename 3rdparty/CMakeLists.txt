@@ -25,6 +25,45 @@ FetchContent_MakeAvailable(opus)
 set(BUILD_TESTING "${kyty_build_testing_saved}")
 install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
 
+# Headsets are driven through OpenXR. Only the static loader is built; the runtime that serves it
+# (for example SteamVR, Monado or Virtual Desktop) comes from the user's system.
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(openxr
+	GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
+	GIT_SHALLOW FALSE)
+FetchContent_MakeAvailable(openxr)
+# Keep the loader's headers and library out of the installed package.
+set_property(DIRECTORY "${openxr_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+# The loader uses exceptions internally.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(openxr_loader PRIVATE -fexceptions)
+endif()
+install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
+
+# Noto Sans v2.015 (SIL Open Font License 1.1) is libFont's fallback font.
+set(KYTY_NOTO_SANS_REPOSITORY "https://raw.githubusercontent.com/notofonts/notofonts.github.io")
+set(KYTY_NOTO_SANS_COMMIT 42af67ccd12bc0e31ed85384bf73e39248265374)
+set(KYTY_NOTO_SANS_BASE_URL "${KYTY_NOTO_SANS_REPOSITORY}/${KYTY_NOTO_SANS_COMMIT}/fonts")
+set(KYTY_NOTO_SANS_DIR "${FETCHCONTENT_BASE_DIR}/noto-sans")
+function(kyty_fetch_noto_sans path sha256)
+	get_filename_component(name "${path}" NAME)
+	file(DOWNLOAD "${KYTY_NOTO_SANS_BASE_URL}/${path}" "${KYTY_NOTO_SANS_DIR}/${name}"
+		EXPECTED_HASH SHA256=${sha256})
+endfunction()
+kyty_fetch_noto_sans(LICENSE f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Regular.ttf
+	478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Bold.ttf
+	1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Italic.ttf
+	467e3f89eeca4108bb8710a2b9e0cf2281ac56d5b0609211a83776d0505eecb5)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-BoldItalic.ttf
+	1b602a9d6353be42c91df097a4857b69fa2696f26703d7a33b54a15d87c2622c)
+install(FILES "${KYTY_NOTO_SANS_DIR}/LICENSE" DESTINATION "licenses/noto-sans")
+set(KYTY_NOTO_SANS_DIR "${KYTY_NOTO_SANS_DIR}" PARENT_SCOPE)
+
 # The guest instruction patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -210,4 +249,45 @@ endif()
 
 if (CLANG AND MSVC)
 add_subdirectory(winpthread)
+endif()
+
+# AMD FSR 3.1 frame generation, built against the bundled Vulkan headers. Its Vulkan calls go
+# through the emulator's dynamic dispatcher (frameGenerationShims.cpp).
+if (WIN32)
+	if (NOT TARGET Vulkan::Vulkan)
+		add_library(Vulkan::Vulkan INTERFACE IMPORTED GLOBAL)
+		target_link_libraries(Vulkan::Vulkan INTERFACE Vulkan::Headers)
+	endif()
+	foreach(component TESTS PROBE FSR3_HOST FSR3_VK_BACKEND FSR4_V07_VULKAN)
+		set(FFX_VK_PORTABLE_BUILD_${component} OFF CACHE BOOL "" FORCE)
+	endforeach()
+	set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+	set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/fsr-vulkan-cmake")
+	# The frame generation context never tells its bridge which frame it records and never
+	# retires frames, so the descriptor sets and constant buffers it allocates for every dispatch
+	# were only freed when the context was destroyed (as in shadPS4).
+	set(FFX_FG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/fsr-vulkan/src/ffx_vk_fsr3_3_1_6_framegen.cpp")
+	file(READ "${FFX_FG_SOURCE}" FFX_FG_TEXT)
+	if (NOT FFX_FG_TEXT MATCHES "ffxVkFsr3_3_1_5BridgeBeginFrame")
+		set(FFX_FG_PATCHED "${FFX_FG_TEXT}")
+		string(REPLACE "    context->frameId = info->frameId;"
+		               "    context->frameId = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId);"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REPLACE "    dispatch.frameID = info->frameId;"
+		               "    dispatch.frameID = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId);"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REPLACE "    if (context->prepared && context->frameId <= completedFrameId) {"
+		               "    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId);\n    if (context->prepared && context->frameId <= completedFrameId) {"
+		               FFX_FG_PATCHED "${FFX_FG_PATCHED}")
+		string(REGEX MATCHALL "ffxVkFsr3_3_1_5Bridge(Begin|Retire)Frame" FFX_FG_HITS "${FFX_FG_PATCHED}")
+		list(LENGTH FFX_FG_HITS FFX_FG_HIT_COUNT)
+		if (FFX_FG_HIT_COUNT EQUAL 3)
+			file(WRITE "${FFX_FG_SOURCE}" "${FFX_FG_PATCHED}")
+		else()
+			message(WARNING "fsr-vulkan: could not apply the frame generation memory fix")
+		endif()
+	endif()
+	add_subdirectory(fsr-vulkan EXCLUDE_FROM_ALL)
+	list(POP_BACK CMAKE_MODULE_PATH)
 endif()

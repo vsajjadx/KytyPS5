@@ -32,4 +32,8 @@ struct sys_dbg_stack_info_t {
 
 void SysStackUsage(sys_dbg_stack_info_t& s); // NOLINT(google-runtime-references)
 
+// Above-normal priority, never power throttled, so the emulator's threads keep their clocks.
+// Windows only; elsewhere it does nothing.
+void SysRaiseProcessPriority();
+
 #endif /* KYTY_COMMON_PLATFORM_SYSDBG_H_ */

@@ -30,6 +30,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <xmmintrin.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -343,14 +344,21 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 #endif
 
 struct PthreadMutexPrivate {
+	struct Waiter {
+		Pthread                 thread = nullptr;
+		std::condition_variable cv;
+		Waiter*                 previous = nullptr;
+		Waiter*                 next     = nullptr;
+	};
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
-	std::condition_variable cv;
 	Pthread                 owner     = nullptr;
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	Waiter*                 first_waiter = nullptr;
+	Waiter*                 last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1032,6 +1040,10 @@ void PthreadInitSelfForMainThread() {
 	     static_cast<uint64_t>(g_pthread_self->attr->stack_size));
 }
 
+void PthreadInitGuestFloatingPoint() {
+	_mm_setcsr(0x9fc0);
+}
+
 void* PthreadCreateMainGuestStack() {
 	EXIT_IF(g_pthread_self == nullptr);
 	EXIT_IF(g_pthread_self->attr == nullptr);
@@ -1242,6 +1254,20 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
+                                     PthreadMutexPrivate::Waiter* waiter) {
+	if (waiter->previous != nullptr) {
+		waiter->previous->next = waiter->next;
+	} else {
+		mutex->first_waiter = waiter->next;
+	}
+	if (waiter->next != nullptr) {
+		waiter->next->previous = waiter->previous;
+	} else {
+		mutex->last_waiter = waiter->previous;
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1258,54 +1284,53 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			mutex->count++;
 			return OK;
 		}
-		if (timeout_us != nullptr) {
-			if (*timeout_us > 0) {
-				mutex->cv.wait_for(lock, std::chrono::microseconds(*timeout_us));
-			}
-			return ETIMEDOUT;
-		}
 		return EDEADLK;
 	}
 
-	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
-	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
-			return ETIMEDOUT;
-		}
-	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				return ETIMEDOUT;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
+	if (mutex->owner == nullptr) {
+		mutex->owner = self;
+		mutex->count = 1;
+		return OK;
+	}
+	if (timeout_us != nullptr && *timeout_us == 0) {
+		return ETIMEDOUT;
 	}
 
-	mutex->owner = self;
-	mutex->count = 1;
-	return OK;
+	// Guest mutex waits are not cancellation points, unlike the host condition wait.
+	int previous_cancel_state = 0;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
+	PthreadMutexPrivate::Waiter waiter;
+	waiter.thread   = self;
+	waiter.previous = mutex->last_waiter;
+	if (mutex->last_waiter != nullptr) {
+		mutex->last_waiter->next = &waiter;
+	} else {
+		mutex->first_waiter = &waiter;
+	}
+	mutex->last_waiter = &waiter;
+	const auto deadline = timeout_us != nullptr
+	                          ? std::chrono::steady_clock::now() +
+	                                std::chrono::microseconds(*timeout_us)
+	                          : std::chrono::steady_clock::time_point::max();
+	int result = OK;
+	while (mutex->owner != self) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			NativeMutexRemoveWaiter(mutex, &waiter);
+			result = ETIMEDOUT;
+			break;
+		}
+		waiter.cv.wait_until(lock, std::min(deadline, now +
+		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		if (mutex->owner != self) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
+	lock.unlock();
+	pthread_setcancelstate(previous_cancel_state, nullptr);
+	return result;
 }
 
 static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
@@ -1358,10 +1383,16 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 		return OK;
 	}
 
-	mutex->owner = nullptr;
-	mutex->count = 0;
-	lock.unlock();
-	mutex->cv.notify_one();
+	if (auto* waiter = mutex->first_waiter) {
+		NativeMutexRemoveWaiter(mutex, waiter);
+		// Transfer ownership in FIFO order before waking the selected waiter.
+		mutex->owner = waiter->thread;
+		mutex->count = 1;
+		waiter->cv.notify_one();
+	} else {
+		mutex->owner = nullptr;
+		mutex->count = 0;
+	}
 
 	return OK;
 }
@@ -3223,6 +3254,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	PthreadInitGuestFloatingPoint();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
@@ -3363,6 +3395,11 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	// A joined thread's native handle is gone; the guest may still hold its handle.
+	if (thread->free) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
 	int result = pthread_cancel(thread->p);
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
@@ -3466,10 +3503,8 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	sched_param native_param {};
-	int         native_policy = 0;
-	if (pthread_getschedparam(thread->p, &native_policy, &native_param) != 0) {
-		return KERNEL_ERROR_EINVAL;
+	if (thread->free) {
+		return KERNEL_ERROR_ESRCH;
 	}
 
 	*prio = thread->attr->guest_priority;
@@ -3481,6 +3516,11 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 
 	if (thread == nullptr) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	// A joined thread's native handle is gone; the guest may still hold its handle.
+	if (thread->free) {
 		return KERNEL_ERROR_ESRCH;
 	}
 

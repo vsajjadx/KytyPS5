@@ -16,6 +16,8 @@
 #include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
 #endif
 
+void SysRaiseProcessPriority() {}
+
 void SysStackUsage(sys_dbg_stack_info_t& s) {
 	pid_t pid = getpid();
 

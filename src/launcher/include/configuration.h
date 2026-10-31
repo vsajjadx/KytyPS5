@@ -21,10 +21,7 @@ inline QStringList EnumToList() {
 	auto        me    = QMetaEnum::fromType<T>();
 	int         count = me.keyCount();
 	for (int i = 0; i < count; i++) {
-		auto key = QString(me.key(i));
-		ret << (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit()
-		            ? key.remove('R').toLower()
-		            : key);
+		ret << QString(me.key(i));
 	}
 	return ret;
 }
@@ -32,27 +29,26 @@ inline QStringList EnumToList() {
 template <class T>
 T TextToEnum(const QString& text) {
 	auto me = QMetaEnum::fromType<T>();
-	return static_cast<T>(me.keyToValue(
-	    ((text.size() > 1 && text.at(0).isDigit()) ? 'R' + text.toUpper() : text).toUtf8().data()));
+	return static_cast<T>(me.keyToValue(text.toUtf8().constData()));
 }
 
 template <class T>
 QString EnumToText(T value) {
-	auto me  = QMetaEnum::fromType<T>();
-	auto key = QString(me.valueToKey(static_cast<int>(value)));
-	return (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit() ? key.remove('R').toLower()
-	                                                                     : key);
+	return QString(QMetaEnum::fromType<T>().valueToKey(static_cast<int>(value)));
 }
 
 struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
+	int     keyboard_player     = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_keyboard_player", keyboard_player);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -65,6 +61,8 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
+		                         Config::MAX_PLAYERS);
 	}
 };
 
@@ -75,13 +73,10 @@ public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
-	enum class Resolution {
-		R1280X720,
-		R1920X1080,
-		R2560X1440,
-		R3840X2160,
-	};
-	Q_ENUM(Resolution)
+	static constexpr int MIN_SCREEN_SIZE = 320;
+	static constexpr int MAX_SCREEN_SIZE = 16384;
+
+	static QString NormalizeResolution(const QString& text);
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
@@ -97,32 +92,55 @@ public:
 
 	Configuration() = default;
 
-	QString    name;
-	QString    title_id;    /* Serial / title id from sce_sys/param.json */
-	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
-	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
-	QString    basedir;     /* Game base directory */
-	QString    game_path;   /* Launcher-unique game path */
-	bool       custom_settings = false;
-	GameStatus game_status     = GameStatus::Unknown;
-	QString    game_comment;
+	QString     name;
+	QString     title_id;    /* Serial / title id from sce_sys/param.json */
+	QString     gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
+	QString     firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
+	QString     basedir;     /* Game base directory */
+	QString     game_path;   /* Launcher-unique game path */
+	QString     addons_dir;  /* Global setting; not saved per game. */
+	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
+	bool        custom_settings = false;
+	GameStatus  game_status     = GameStatus::Unknown;
+	QString     game_comment;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
+	QString                screen_resolution           = QStringLiteral("1280x720");
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
+	bool                   output_1080p_enabled        = false;
+	bool                   frame_generation_enabled    = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
+	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
+	bool                   shader_cache_enabled        = true;
+	// Compile new shaders and pipelines in the background and skip the draws waiting on them,
+	// so the game does not stutter. A pipeline the driver builds in a few milliseconds is still
+	// waited for, so passes drawn only once are not lost.
+	bool                   async_shaders_enabled       = true;
+	bool                   async_compute_enabled       = true;
+	bool                   async_pipelines_enabled     = true;
+	int                    gpu_timestamp_scale         = 100; // percent
+	int                    vram_budget_mb              = 0;   // 0 = automatic
+	QString                skip_shaders;
+	// Known games (UFC 5 and 6) start with the settings they were tuned with.
+	bool                   game_tuning_enabled         = true;
 	bool                   trophy_enabled              = true;
+	int                    trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
+	bool                   network_connected           = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -152,12 +170,29 @@ public:
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		hdr_enabled                 = other.hdr_enabled;
+		output_1080p_enabled        = other.output_1080p_enabled;
+		frame_generation_enabled    = other.frame_generation_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
+		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		readback_tiled_images       = other.readback_tiled_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		occlusion_queries_enabled   = other.occlusion_queries_enabled;
+		shader_cache_enabled        = other.shader_cache_enabled;
+		async_shaders_enabled       = other.async_shaders_enabled;
+		async_compute_enabled       = other.async_compute_enabled;
+		async_pipelines_enabled     = other.async_pipelines_enabled;
+		gpu_timestamp_scale         = other.gpu_timestamp_scale;
+		vram_budget_mb              = other.vram_budget_mb;
+		skip_shaders                = other.skip_shaders;
+		game_tuning_enabled         = other.game_tuning_enabled;
 		trophy_enabled              = other.trophy_enabled;
+		trophy_duration_seconds     = other.trophy_duration_seconds;
+		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
+		network_connected           = other.network_connected;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;

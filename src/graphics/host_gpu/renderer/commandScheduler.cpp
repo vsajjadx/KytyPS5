@@ -1,8 +1,11 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +29,9 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpSubmitHistory();
+	}
 }
 
 } // namespace
@@ -176,6 +182,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::FlushAndWait, true);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
@@ -186,6 +193,7 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
+	Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::Finish, true);
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
@@ -326,7 +334,7 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
 	return m_command;
 }
 
@@ -372,7 +380,37 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (result == vk::Result::eSuccess) {
+			RecordSubmitHistory(tick, m_command.m_debug_op, m_command.m_debug_submit_id,
+			                    m_command.m_debug_arg0, m_command.m_debug_arg1,
+			                    m_command.m_debug_arg2, m_command.m_debug_arg3,
+			                    m_command.m_debug_arg4);
+		}
 	}
+
+	if (result == vk::Result::eSuccess && GpuSyncDebugEnabled()) {
+		// Debug mode (KYTY_GPU_SYNC=1): wait for every submit so a hung/lost GPU is blamed on the
+		// submit that actually caused it. Slow; use only to locate crashes. The timeout avoids
+		// deadlocking on submits that legitimately wait for later host-signalled work.
+		const auto           semaphore = m_master.Handle();
+		vk::SemaphoreWaitInfo wait_info {};
+		wait_info.semaphoreCount = 1;
+		wait_info.pSemaphores    = &semaphore;
+		wait_info.pValues        = &tick;
+		const auto wait_result   = graphics.device.waitSemaphores(&wait_info, 5'000'000'000ull);
+		if (wait_result != vk::Result::eSuccess && wait_result != vk::Result::eTimeout) {
+			ReportVulkanFatal("GPU sync wait after submit", wait_result, tick,
+			                  m_command.m_debug_op, m_command.m_debug_submit_id,
+			                  m_command.m_debug_arg0, m_command.m_debug_arg1,
+			                  m_command.m_debug_arg2, m_command.m_debug_arg3,
+			                  m_command.m_debug_arg4);
+			if (wait_result != vk::Result::eErrorDeviceLost) {
+				DumpSubmitHistory();
+			}
+			EXIT("GPU failure detected in sync debug mode (see log above)\n");
+		}
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
@@ -388,6 +426,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 void CommandScheduler::BeginNext() {
 	CheckActive();
+	m_submit_work_count = 0;
 	BeginCommand();
 }
 

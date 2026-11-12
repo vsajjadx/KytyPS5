@@ -53,7 +53,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -66,7 +66,7 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
+	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
 		return vk::PolygonMode::eFill;
 	}
@@ -249,7 +249,11 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
 	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps};
+	        .device_clock_period_ps = graphics.device_clock_period_ps,
+	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
+	        .r8_srgb_views          = graphics.r8_srgb_views,
+	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -391,6 +395,8 @@ ShaderModule& PipelineCache::AdoptModule(Program& program, const ProgramKey& key
 	} else if (key.stage == ShaderType::Pixel &&
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
+	} else if (key.stage == ShaderType::Mesh) {
+		module.mesh_task = options.input_info.vertex->indirect_draw;
 	}
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
@@ -574,8 +580,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (options.stage == ShaderType::Mesh ||
 		    options.stage == ShaderType::TessellationControl) {
 			options.user_data_base = 0;
-			options.wave_size =
-			    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+		}
+		if (options.stage == ShaderType::Mesh) {
+			options.wave_size = input_info.mesh.wave_size;
 		}
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;
@@ -742,9 +749,7 @@ PipelineCache::~PipelineCache() {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
 		}
 	}
-	if (m_driver_cache != nullptr) {
-		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -827,17 +832,23 @@ void PipelineCache::CheckpointDriverCache() {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	if (const auto now = std::chrono::steady_clock::now(); now >= m_next_driver_cache_save) {
+		m_driver_cache_dirty     = false;
+		m_next_driver_cache_save = now + DriverCacheSaveInterval;
+		// The cache object is internally synchronized, so pipelines may be created meanwhile.
+		m_store.Post([this] { WriteDriverCache(); });
 	}
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
-		return;
+	m_store.Finish();
+	if (m_driver_cache_dirty) {
+		m_driver_cache_dirty = false;
+		WriteDriverCache();
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+}
 
+void PipelineCache::WriteDriverCache() const {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -892,7 +903,6 @@ void PipelineCache::Save() {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -952,7 +962,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		vertex_info[0].indirect_draw    = state.indirect_draw;
 	}
 	if (object_primitive_id) {
-		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
 		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
 		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
 		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
@@ -982,6 +992,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				    vertex_params[0].hash));
 			}
 			return;
+		}
+		// A task shader launches each record's groups and passes its draw parameters in a
+		// payload beside the LDS, the allocation pair and the Layer array; without room for
+		// it, the CPU reads the records.
+		if (state.indirect_draw &&
+		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+		        limits.maxMeshPayloadAndSharedMemorySize) {
+			vertex_info[0].indirect_offsets = state.indirect_offsets;
+			vertex_info[0].indirect_draw    = true;
 		}
 	}
 	ShaderParams pixel_params;
@@ -1132,10 +1152,11 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 }
 
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
+                                                            const DrawRenderState& state,
+                                                            const DrawTargets&     targets) {
 	DrainAsyncPipelines();
-	const auto* colors        = state.color_info;
-	const auto& depth         = state.depth_info;
+	const auto* colors        = targets.colors;
+	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
@@ -1150,9 +1171,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	if (ps_active) {
 		stages[3] = ps_input_info.stage.module;
 	}
-	EXIT_IF(stages[0] == nullptr || (ps_active && stages[3] == nullptr));
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
+	const auto color_count = targets.color_count;
 
 	auto&             ctx = command.GetRegisters();
 
@@ -1164,9 +1184,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			key.stage_ids[i] = stages[i]->id;
 		}
 	}
-	auto& static_params         = key.static_params;
-	auto& rendering             = key.rendering;
-	rendering.color_count       = 0;
+	auto&    static_params      = key.static_params;
+	auto&    rendering          = key.rendering;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
@@ -1259,13 +1278,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
-	if (ps_active && depth.depth_test_enable && ps_input_info.ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
-		}
-	}
-
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
@@ -1274,9 +1286,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
-	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
-		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
-	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
@@ -1356,9 +1365,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     key.stage_ids[0], static_cast<void*>(stages[0]->module), key.stage_ids[3],
-		     ps_active ? static_cast<void*>(stages[3]->module) : nullptr);
 	}
 
 	{
@@ -1377,7 +1383,6 @@ PipelineCache::Pipeline* PipelineCache::GetComputePipeline(const ShaderComputeIn
 	DrainAsyncPipelines();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(input_info.stage.module == nullptr);
 	const auto& module = *input_info.stage.module;
 
 	if (m_async_enabled) {

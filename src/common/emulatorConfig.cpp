@@ -145,8 +145,32 @@ bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
+bool Ps5ProEnabled() {
+	return g_config->pro_enabled;
+}
+
+PssrUpscaler GetPssrUpscaler() {
+	return g_config->pssr_upscaler;
+}
+
+const std::filesystem::path& GetDlssFolder() {
+	return g_config->dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return g_config->dlss_preset;
+}
+
+const std::filesystem::path& GetFsrFolder() {
+	return g_config->fsr_folder;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
+}
+
+bool GuestTscEnabled() {
+	return g_config->guest_tsc_enabled;
 }
 
 uint32_t GetVblankFrequency() {
@@ -165,16 +189,16 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+bool PsnEmulationEnabled() {
+	return g_config->psn_emulation_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
 bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
-}
-
-ShaderOptimizationType GetShaderOptimizationType() {
-	return g_config->shader_optimization_type;
 }
 
 LogDirection GetShaderLogDirection() {
@@ -229,8 +253,16 @@ bool ReadbackTiledImagesEnabled() {
 	return g_config->readback_tiled_images;
 }
 
+bool ReadbackStorageImagesEnabled() {
+	return g_config->readback_storage_images;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
+}
+
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
 }
 
 bool TessellationEnabled() {
@@ -239,6 +271,18 @@ bool TessellationEnabled() {
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
+}
+
+bool RelaxedShaderFloatEnabled() {
+	return g_config->relaxed_shader_float;
+}
+
+bool NativeRtEnabled() {
+	return g_config->native_rt;
+}
+
+bool LodStatsEnabled() {
+	return g_config->lod_stats_enabled;
 }
 
 bool TrophyEnabled() {

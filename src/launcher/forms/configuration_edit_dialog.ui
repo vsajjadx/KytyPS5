@@ -151,18 +151,6 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <!--
-            <item row="3" column="0">
-             <widget class="QLabel" name="label_shader_optimization">
-              <property name="text"><string>Shader optimization:</string></property>
-             </widget>
-            </item>
-            <item row="3" column="1">
-             <widget class="QComboBox" name="comboBox_shader_optimization_type">
-              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
-             </widget>
-            </item>
-            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
@@ -186,65 +174,77 @@
              </widget>
             </item>
             <item row="7" column="1">
+             <widget class="QCheckBox" name="checkBox_readback_storage">
+              <property name="toolTip"><string>Read back shader-written images when the game flushes the GPU cache for the CPU. Images from linear and tiled readback are read back then too.</string></property>
+              <property name="text"><string>Enable storage readback</string></property>
+             </widget>
+            </item>
+            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="8" column="1">
+            <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_occlusion_queries">
               <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
               <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>
-            <item row="9" column="1">
+            <item row="10" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
-            <item row="10" column="1">
+            <item row="11" column="1">
              <widget class="QCheckBox" name="checkBox_output_1080p">
               <property name="toolTip"><string>Report a 1080p display instead of 4K, as a PS5 connected to a 1080p TV does. Games then render at 1080p, which is much lighter on the GPU.</string></property>
               <property name="text"><string>Use a 1080p display</string></property>
              </widget>
             </item>
-            <item row="11" column="1">
+            <item row="12" column="1">
              <widget class="QCheckBox" name="checkBox_frame_generation">
               <property name="toolTip"><string>Show an AMD FSR 3.1 generated frame between game frames when the game runs below the display rate. Toggle in game with F3.</string></property>
               <property name="text"><string>Enable frame generation</string></property>
              </widget>
             </item>
-            <item row="12" column="1">
+            <item row="13" column="1">
              <widget class="QCheckBox" name="checkBox_shader_cache">
               <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
               <property name="text"><string>Cache shaders</string></property>
              </widget>
             </item>
-            <item row="13" column="1">
+            <item row="14" column="1">
+             <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
+              <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
+              <property name="text"><string>Relaxed shader float math</string></property>
+             </widget>
+            </item>
+            <item row="15" column="1">
              <widget class="QCheckBox" name="checkBox_async_shaders">
               <property name="toolTip"><string>Compile new shaders in the background instead of freezing the game. Whatever needs a shader that is still compiling is left out for a few frames.</string></property>
               <property name="text"><string>Skip stutters: compile shaders in the background</string></property>
              </widget>
             </item>
-            <item row="14" column="1">
+            <item row="16" column="1">
              <widget class="QCheckBox" name="checkBox_async_compute">
               <property name="toolTip"><string>Also compile compute shaders in the background. Turn off if a game crashes or loses effects with it on.</string></property>
               <property name="text"><string>Include compute shaders</string></property>
              </widget>
             </item>
-            <item row="15" column="1">
+            <item row="17" column="1">
              <widget class="QCheckBox" name="checkBox_async_pipelines">
               <property name="toolTip"><string>Create new pipelines (where the graphics driver compiles shaders) in the background too, waiting only a few milliseconds for each. Turn off if a screen stays white or incomplete.</string></property>
               <property name="text"><string>Create pipelines in the background</string></property>
              </widget>
             </item>
-            <item row="16" column="0">
+            <item row="18" column="0">
              <widget class="QLabel" name="label_gpu_timestamp_scale">
               <property name="text"><string>GPU timestamp scale:</string></property>
              </widget>
             </item>
-            <item row="16" column="1">
+            <item row="18" column="1">
              <widget class="QSpinBox" name="spinBox_gpu_timestamp_scale">
               <property name="toolTip"><string>How fast GPU time runs as the game measures it. Above 100%, games with dynamic resolution render smaller and faster; below, larger.</string></property>
               <property name="suffix"><string>%</string></property>
@@ -254,12 +254,12 @@
               <property name="value"><number>100</number></property>
              </widget>
             </item>
-            <item row="17" column="0">
+            <item row="19" column="0">
              <widget class="QLabel" name="label_vram_budget">
               <property name="text"><string>VRAM budget:</string></property>
              </widget>
             </item>
-            <item row="17" column="1">
+            <item row="19" column="1">
              <widget class="QSpinBox" name="spinBox_vram_budget">
               <property name="toolTip"><string>Video memory the emulator's caches stay under. Automatic leaves 1.3 GB of the card for Windows and the driver.</string></property>
               <property name="specialValueText"><string>Automatic</string></property>
@@ -270,18 +270,18 @@
               <property name="value"><number>0</number></property>
              </widget>
             </item>
-            <item row="18" column="0">
+            <item row="20" column="0">
              <widget class="QLabel" name="label_skip_shaders">
               <property name="text"><string>Skip shaders:</string></property>
              </widget>
             </item>
-            <item row="18" column="1">
+            <item row="20" column="1">
              <widget class="QLineEdit" name="lineEdit_skip_shaders">
               <property name="toolTip"><string>Guest shader hashes, as the log's "Compiled vs ..." lines show them, separated by commas, or a text file of them. Whatever draws with them is not drawn.</string></property>
               <property name="placeholderText"><string>none</string></property>
              </widget>
             </item>
-            <item row="19" column="1">
+            <item row="21" column="1">
              <widget class="QCheckBox" name="checkBox_game_tuning">
               <property name="toolTip"><string>Start known games (UFC 5 and UFC 6) with the settings they were tuned with: a 1080p display, Immediate presentation and the shader cache.</string></property>
               <property name="text"><string>Recommended settings for known games</string></property>
@@ -333,6 +333,48 @@
            <property name="title"><string>General</string></property>
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
+             <widget class="QCheckBox" name="checkBox_pro">
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. Disabled by default.</string></property>
+              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QFormLayout" name="pssrLayout">
+              <item row="0" column="0">
+               <widget class="QLabel" name="label_pssr_upscaler">
+                <property name="text"><string>PSSR upscaler:</string></property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QComboBox" name="comboBox_pssr_upscaler">
+                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QLabel" name="label_dlss_folder">
+                <property name="text"><string>DLSS model folder:</string></property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_dlss_folder">
+                <property name="toolTip"><string>Folder with nvngx_dlss.dll (Windows) or libnvidia-ngx-dlss.so.* (Linux)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+              <item row="2" column="0">
+               <widget class="QLabel" name="label_fsr_folder">
+                <property name="text"><string>FSR folder:</string></property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_fsr_folder">
+                <property name="toolTip"><string>Folder with amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (AMD FidelityFX SDK 2.4 or later)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
               <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
               <property name="text"><string>Run in fullscreen</string></property>
@@ -374,7 +416,13 @@
             <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-              <property name="text"><string>AMD CPU patch (experimental)</string></property>
+              <property name="text"><string>Intel CPU compatibility (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_guest_tsc">
+              <property name="toolTip"><string>Run the CPU time stamp counter (TSC) at the PS5's 1.6 GHz instead of the host rate. Fixes games that run too fast.</string></property>
+              <property name="text"><string>PS5 TSC rate (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -482,6 +530,11 @@
         <widget class="QCheckBox" name="checkBox_network_connected">
          <property name="toolTip"><string>Let games use your computer's local network connection.</string></property>
          <property name="text"><string>Enable network connection</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_psn_emulation">
+         <property name="text"><string>Emulate PSN (compatibility)</string></property>
         </widget>
        </item>
        <item>
@@ -606,6 +659,40 @@
             <property name="toolTip"><string>Can fix missing textures and incorrect transparency (Resident Evil 2).</string></property>
             <property name="text"><string>Accurate texture synchronization</string></property>
            </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="performance_tweaks_group">
+         <property name="title"><string>Performance tweaks</string></property>
+         <layout class="QVBoxLayout" name="performanceTweaksLayout">
+          <item>
+           <widget class="QLabel" name="label_performance_tweaks">
+            <property name="styleSheet"><string>color: red;</string></property>
+            <property name="text"><string>Game-specific tweaks: they may or may not improve performance. Use with caution and prefer setting them per game rather than globally.</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="flushDrawsLayout">
+            <item>
+             <widget class="QLabel" name="label_flush_draws">
+              <property name="text"><string>Submit GPU work every N draws (0 = off):</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QSpinBox" name="spinBox_flush_draws">
+              <property name="toolTip"><string>Can lower frame time in games that send a whole frame as one command buffer, at some submit overhead.</string></property>
+              <property name="maximum"><number>99999</number></property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="flushDrawsSpacer">
+              <property name="orientation"><enum>Qt::Horizontal</enum></property>
+             </spacer>
+            </item>
+           </layout>
           </item>
          </layout>
         </widget>

@@ -162,6 +162,17 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
 		            log == Configuration::LogDirection::File);
 	        });
+	// Pro mode shows the upscaler and its folder.
+	const auto show_pssr = [this] {
+		const bool pro = m_ui->checkBox_pro->isChecked();
+		const auto upscaler =
+		    TextToEnum<Configuration::PssrUpscaler>(m_ui->comboBox_pssr_upscaler->currentText());
+		m_ui->pssrLayout->setRowVisible(0, pro);
+		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
+		m_ui->pssrLayout->setRowVisible(2, pro && upscaler == Configuration::PssrUpscaler::FSR);
+	};
+	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
+	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
 	connect(m_ui->comboBox_printf_direction, &QComboBox::currentTextChanged, this,
@@ -294,9 +305,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_stretch->setChecked(info.stretch_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
+	m_ui->checkBox_readback_storage->setChecked(info.readback_storage_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
+	m_ui->spinBox_flush_draws->setValue(info.flush_draws);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
+	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_async_shaders->setChecked(info.async_shaders_enabled);
 	m_ui->checkBox_async_compute->setChecked(info.async_compute_enabled);
@@ -307,6 +321,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_game_tuning->setChecked(info.game_tuning_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
+	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
@@ -320,7 +335,21 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
+	m_ui->checkBox_pro->setChecked(info.pro_enabled);
+	ListInit(m_ui->comboBox_pssr_upscaler, info.pssr_upscaler);
+	m_ui->lineEdit_dlss_folder->setText(info.dlss_folder);
+	m_ui->lineEdit_fsr_folder->setText(info.fsr_folder);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
+#if !defined(_WIN32)
+	// Unsupported upscalers are hidden; their saved choice falls back to Linear.
+	auto* upscaler = m_ui->comboBox_pssr_upscaler;
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::FSR)));
+#if defined(__APPLE__)
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::DLSS)));
+#endif
+	upscaler->setCurrentIndex(qMax(0, upscaler->findText(EnumToText(info.pssr_upscaler))));
+#endif
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -329,7 +358,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
-	// ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -538,9 +566,12 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.stretch_enabled           = ui.checkBox_stretch->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
+	info.readback_storage_images   = ui.checkBox_readback_storage->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
+	info.flush_draws               = ui.spinBox_flush_draws->value();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
+	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.async_shaders_enabled     = ui.checkBox_async_shaders->isChecked();
 	info.async_compute_enabled     = ui.checkBox_async_compute->isChecked();
@@ -551,6 +582,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.game_tuning_enabled       = ui.checkBox_game_tuning->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
+	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
@@ -559,12 +591,16 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
+	info.pro_enabled               = ui.checkBox_pro->isChecked();
+	info.pssr_upscaler =
+	    TextToEnum<Configuration::PssrUpscaler>(ui.comboBox_pssr_upscaler->currentText());
+	info.dlss_folder               = ui.lineEdit_dlss_folder->text();
+	info.fsr_folder                = ui.lineEdit_fsr_folder->text();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
-	// info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
-	//     ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
@@ -577,10 +613,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
-	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
-	                   m_ui->lineEdit_cmd_dump_folder}) {
-		if (field->isEnabled() && field->text().isEmpty()) {
-			ShowTab(m_ui->debug_tab);
+	for (auto* field:
+	     {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_fsr_folder, m_ui->lineEdit_shader_log_folder,
+	      m_ui->lineEdit_printf_file, m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && !field->isHidden() && field->text().isEmpty()) {
+			ShowTab(field);
 			field->setFocus();
 			break;
 		}

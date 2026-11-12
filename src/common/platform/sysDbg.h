@@ -5,32 +5,14 @@
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_dbg_stack_info_t {
+	uintptr_t reserved_addr; // lowest address of the calling thread's stack reservation
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t addr;
-
-	uintptr_t reserved_addr;
-	size_t    reserved_size;
-	uintptr_t guard_addr;
+	uintptr_t guard_addr; // guard page just below the committed stack
 	size_t    guard_size;
-	uintptr_t commited_addr;
-	size_t    commited_size;
-
-	size_t total_size;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	uintptr_t code_addr;
-	uintptr_t addr;
-	uintptr_t commited_addr;
-	size_t    commited_size;
-	size_t    total_size;
-	size_t    code_size;
-
-	// Full stack reservation reported by pthread.
-	uintptr_t reserved_addr;
-	size_t    reserved_size;
 #endif
 };
 
-void SysStackUsage(sys_dbg_stack_info_t& s); // NOLINT(google-runtime-references)
+sys_dbg_stack_info_t SysStackUsage();
 
 // Above-normal priority, never power throttled, so the emulator's threads keep their clocks.
 // Windows only; elsewhere it does nothing.

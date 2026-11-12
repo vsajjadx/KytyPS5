@@ -101,6 +101,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -1020,6 +1021,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UMax32:
 			c.cmp(c.eax, c.ecx);
 			c.cmovb(c.eax, c.ecx);
+			break;
+		case ValueOpcode::SMax32:
+			c.cmp(c.eax, c.ecx);
+			c.cmovl(c.eax, c.ecx);
 			break;
 		case ValueOpcode::ConvertF32U32:
 			c.cvtsi2ss(c.xmm0, c.rax);

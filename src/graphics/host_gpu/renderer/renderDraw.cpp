@@ -573,6 +573,7 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
 	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+		if (!render_target_bound(ctx.GetRenderTarget(0))) return true;
 		// FCE can precede any ordinary draw. Discover the target to materialize its native
 		// clear metadata before the expanded image is sampled.
 		RenderColorInfo target {};
@@ -851,7 +852,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	auto& targets       = m_targets;
 	targets.color_count = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((state.mrt_mask & (1u << slot)) != 0) {
+		if ((state.mrt_mask & (1u << slot)) != 0 &&
+		    render_target_bound(buffer.GetRegisters().GetRenderTarget(slot))) {
 			ResolveRenderColorTarget(buffer, targets.colors[targets.color_count], slot);
 			if (targets.colors[targets.color_count].image_id) {
 				targets.color_count++;
@@ -1234,6 +1236,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	m_context.GetCommandScheduler().NoteRecordedWork();
+	m_context.GetCommandScheduler().NoteWorkTiming(
+	    (1ull << 63u) | ((state.ps_active ? state.ps_input_info.stage.module->info.shader_hash
+	                                      : state.vertex_info[0].stage.module->info.shader_hash) &
+	                     ~(1ull << 63u)));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
@@ -1453,7 +1459,7 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {
 
 	const auto& src_rt = hw.GetRenderTarget(0);
 	const auto& dst_rt = hw.GetRenderTarget(1);
-	if (src_rt.base.addr == 0 || dst_rt.base.addr == 0) {
+	if (!render_target_bound(src_rt) || !render_target_bound(dst_rt)) {
 		return false;
 	}
 

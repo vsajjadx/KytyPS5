@@ -1,4 +1,12 @@
+#include <vector>
+#include <unordered_map>
+#include <cstdlib>
+#include <array>
+#include <chrono>
+#include <deque>
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
@@ -263,7 +271,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_operations.pop();
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		{
+			Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::AsyncPublishWorker);
+			m_master.Wait(operation.tick);
+		}
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -301,6 +312,44 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	g_deferred_callback_scheduler = previous;
 }
 
+// TEMP DIAG (KYTY_GPU_TIME): GPU execution time of every command buffer.
+namespace {
+struct GpuTimer {
+	bool                                      enabled = std::getenv("KYTY_GPU_TIME") != nullptr;
+	vk::QueryPool                             pool    = nullptr;
+	uint32_t                                  next    = 0;
+	uint32_t                                  current = UINT32_MAX;
+	std::deque<std::pair<uint64_t, uint32_t>> pending;
+	uint64_t                                  busy_ns = 0, submits = 0;
+	uint64_t                                  first_start = 0, last_end = 0;
+	std::chrono::steady_clock::time_point     window = std::chrono::steady_clock::now();
+	static constexpr uint32_t                 Slots  = 8192;
+	// Per-item stamps: each command buffer owns a 1024-slot range of a 64-range ring.
+	static constexpr uint32_t                 ItemRange = 1024, ItemRanges = 64;
+	vk::QueryPool                             items = nullptr;
+	uint32_t                                  item_range = 0, item_count = 0;
+	std::vector<uint64_t>                     item_keys;
+	struct Pending { uint32_t range; std::vector<uint64_t> keys; };
+	std::deque<Pending>                       item_pending;
+	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> per_key; // ns, count
+};
+GpuTimer& Timer() {
+	static GpuTimer timer;
+	return timer;
+}
+} // namespace
+
+void CommandScheduler::NoteWorkTiming(uint64_t key) {
+	auto& timer = Timer();
+	if (!timer.enabled || timer.current == UINT32_MAX || timer.item_count >= GpuTimer::ItemRange) {
+		return;
+	}
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.items,
+	                                  timer.item_range * GpuTimer::ItemRange + timer.item_count);
+	timer.item_count++;
+	timer.item_keys.push_back(key);
+}
+
 bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
@@ -322,6 +371,31 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (auto& timer = Timer(); timer.enabled) {
+		if (!timer.pool) {
+			vk::QueryPoolCreateInfo info {};
+			info.queryType  = vk::QueryType::eTimestamp;
+			info.queryCount = GpuTimer::Slots * 2u;
+			timer.pool      = m_graphics.device.createQueryPool(info).value;
+			m_graphics.device.resetQueryPool(timer.pool, 0, GpuTimer::Slots * 2u);
+		}
+		if (!timer.items) {
+			vk::QueryPoolCreateInfo info {};
+			info.queryType  = vk::QueryType::eTimestamp;
+			info.queryCount = GpuTimer::ItemRange * GpuTimer::ItemRanges;
+			timer.items     = m_graphics.device.createQueryPool(info).value;
+		}
+		timer.item_range = (timer.item_range + 1u) % GpuTimer::ItemRanges;
+		timer.item_count = 0;
+		timer.item_keys.clear();
+		m_command.m_buffer.resetQueryPool(timer.items, timer.item_range * GpuTimer::ItemRange,
+		                                  GpuTimer::ItemRange);
+		timer.current = timer.next;
+		timer.next    = (timer.next + 1u) % GpuTimer::Slots;
+		m_command.m_buffer.resetQueryPool(timer.pool, timer.current * 2u, 2u);
+		m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer.pool,
+		                                  timer.current * 2u);
+	}
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -329,6 +403,13 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
+	m_context.GetBufferCache().FlushReadChecks();
+	auto& timer = Timer();
+	if (timer.enabled && timer.current != UINT32_MAX) {
+		m_command.EndRendering();
+		m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.pool,
+		                                  timer.current * 2u + 1u);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -359,10 +440,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 		if (result == vk::Result::eSuccess) {
-			RecordSubmitHistory(tick, 0, 0,
-			                    0, 0,
-			                    0, 0,
-			                    0);
+			// CommandBuffer no longer records which operation produced the work, so the history
+			// and counters mark the submit Unknown (10) instead of claiming a dispatch.
+			RecordSubmitHistory(tick, 10, 0, 0, 0, 0, 0, 0);
 		}
 	}
 
@@ -394,6 +474,78 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
+	if (timer.enabled && timer.current != UINT32_MAX) {
+		timer.pending.emplace_back(tick, timer.current);
+		timer.item_pending.push_back({timer.item_range, timer.item_keys});
+		timer.current = UINT32_MAX;
+		const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
+		while (!timer.pending.empty() && IsFree(timer.pending.front().first)) {
+			{
+				auto& item = timer.item_pending.front();
+				std::array<uint64_t, 2> cb {};
+				(void)m_graphics.device.getQueryPoolResults(
+				    timer.pool, timer.pending.front().second * 2u, 2u, sizeof(cb), cb.data(),
+				    sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+				if (!item.keys.empty()) {
+					std::vector<uint64_t> stamps(item.keys.size());
+					if (m_graphics.device.getQueryPoolResults(
+					        timer.items, item.range * GpuTimer::ItemRange,
+					        static_cast<uint32_t>(stamps.size()), stamps.size() * sizeof(uint64_t),
+					        stamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
+					    vk::Result::eSuccess) {
+						uint64_t prev = cb[0];
+						for (size_t i = 0; i < stamps.size(); i++) {
+							if (stamps[i] >= prev) {
+								auto& k = timer.per_key[item.keys[i]];
+								k.first += static_cast<uint64_t>((stamps[i] - prev) * period);
+								k.second++;
+								prev = stamps[i];
+							}
+						}
+					}
+				}
+				timer.item_pending.pop_front();
+			}
+			std::array<uint64_t, 2> stamps {};
+			if (m_graphics.device.getQueryPoolResults(timer.pool, timer.pending.front().second * 2u, 2u,
+			                                          sizeof(stamps), stamps.data(), sizeof(uint64_t),
+			                                          vk::QueryResultFlagBits::e64) ==
+			        vk::Result::eSuccess &&
+			    stamps[1] >= stamps[0]) {
+				const auto start = static_cast<uint64_t>(stamps[0] * period);
+				const auto end   = static_cast<uint64_t>(stamps[1] * period);
+				// Count overlapping command buffers once.
+				const auto from = std::max(start, timer.last_end);
+				if (end > from) timer.busy_ns += end - from;
+				if (timer.first_start == 0) timer.first_start = start;
+				timer.last_end = std::max(timer.last_end, end);
+				timer.submits++;
+			}
+			timer.pending.pop_front();
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - timer.window >= std::chrono::seconds(2)) {
+			const double wall_ms = std::chrono::duration<double, std::milli>(now - timer.window).count();
+			std::printf("GPUTIME: GPU busy %.0f ms of %.0f ms (%.0f%%), %llu command buffers\n",
+			            timer.busy_ns / 1e6, wall_ms, 100.0 * timer.busy_ns / 1e6 / wall_ms,
+			            static_cast<unsigned long long>(timer.submits));
+			std::fflush(stdout);
+			std::vector<std::pair<uint64_t, uint64_t>> top;
+			for (auto& [k, v]: timer.per_key) top.emplace_back(v.first, k);
+			std::sort(top.rbegin(), top.rend());
+			for (size_t i = 0; i < top.size() && i < 20; i++) {
+				const auto& v = timer.per_key[top[i].second];
+				std::printf("GPUTIME:   %7.2f ms  %5llu x  %s %016llx\n", v.first / 1e6,
+				            static_cast<unsigned long long>(v.second),
+				            (top[i].second >> 63u) ? "draw(ps/vs)" : "dispatch   ",
+				            static_cast<unsigned long long>(top[i].second & ~(1ull << 63u)));
+			}
+			timer.per_key.clear();
+			timer.window  = now;
+			timer.busy_ns = 0;
+			timer.submits = 0;
+		}
+	}
 	m_command.m_buffer = nullptr;
 	return tick;
 }

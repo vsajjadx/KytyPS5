@@ -1,13 +1,15 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#if defined(TRACY_ENABLE)
+#include "common/profiler.h"
+#endif
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
-#include <atomic>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1137,23 +1139,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			     !unfiltered_coordinates && !prefix_coordinates) ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
-				// Tolerate mixed candidates instead of aborting: the shader is specialised for the
-				// first typed candidate, and the others are treated as that same class. Some
-				// guests index tables holding images of differing format/dimension, and aborting
-				// makes those titles unplayable. Rendering of the mismatching images may be wrong.
-				static std::atomic<uint32_t> warned {0};
-				if (warned.fetch_add(1, std::memory_order_relaxed) < 8u) {
-					std::printf("Warning: indirect image table at pc 0x%08x has incompatible "
-					            "candidates; using the first typed candidate for all\n",
-					            program.info.images[root_index].first_use_pc);
-					std::fflush(stdout);
-				}
-				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc {:#010x} has incompatible candidate {}",
+				    base.first_use_pc, candidate));
 			}
 		}
 	}
@@ -1611,6 +1599,9 @@ static bool MaterializeFail(int line, const ResourcePlan& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("MaterializeResources");
+#endif
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return MaterializeFail(__LINE__, program);
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1794,6 +1785,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];
 				if (!evaluate(source, snapshot.samplers[i])) return false;
+			}
+		}
+		if (program.info.samplers[base_index].gather_lod) {
+			const auto control = snapshot.samplers[i].dwords[2];
+			const auto filter = (control >> 26u) & 3u;
+			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 0xfu;
+			// GatherMip selects the mip view before Vulkan sampling. It implements primary
+			// None/Point/Linear filtering, but not guest LOD biases or Linear PERF_MIP.
+			// NativeSampler's normalization only configures the resulting host gather.
+			if (filter != 0u &&
+			    (filter > 2u || (control & 0xfffffu) != 0u ||
+			     (filter == 2u && perf_mip != 0u))) {
+				return SpecializationFail(
+				    "explicit-LOD gather requires mip filtering None, or Point/Linear with "
+				    "zero LOD biases and zero Linear PERF_MIP");
 			}
 		}
 	}

@@ -7,6 +7,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <utility>
@@ -359,6 +360,13 @@ std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& pat
 	}
 
 	return ret;
+}
+
+int File::RenameReplacing(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	if (IsArchivePath(src) || IsArchivePath(dst)) {
+		return EROFS;
+	}
+	return SysFileReplaceFile(src, dst);
 }
 
 bool File::RenameFile(const std::filesystem::path& src,

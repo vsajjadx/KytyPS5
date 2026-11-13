@@ -9,6 +9,10 @@
 #include <pthread.h>
 void SysRaiseProcessPriority() {}
 
+void SysFaultDiag(void* /*native_context*/, uint64_t /*fault_vaddr*/) {}
+int  SysCaptureStackRva(uint64_t* /*frames*/, int /*max_frames*/) { return 0; }
+void SysStartSamplingCurrentThread(const char* /*name*/) {}
+
 sys_dbg_stack_info_t SysStackUsage() {
 	sys_dbg_stack_info_t s {};
 #if defined(__APPLE__)

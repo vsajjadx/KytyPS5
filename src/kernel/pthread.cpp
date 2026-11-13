@@ -556,6 +556,8 @@ public:
 	void  DeleteObjects(Loader::Program* program);
 
 private:
+	[[gnu::noinline]] void* CreateObjectSlow(void* addr, PthreadStaticObject::Type type);
+
 	std::vector<PthreadStaticObject*> m_objects;
 	Common::Mutex                     m_mutex;
 };
@@ -1414,7 +1416,7 @@ static bool NativeCondDeadlineFromAbs(KernelClockid clock_id, const KernelTimesp
 	return true;
 }
 
-void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type type) {
+inline void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type type) {
 	if (addr == nullptr) {
 		return addr;
 	}
@@ -1430,9 +1432,15 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 		return addr;
 	}
 
+	return CreateObjectSlow(addr, type);
+}
+
+void* PthreadStaticObjects::CreateObjectSlow(void* addr, PthreadStaticObject::Type type) {
+	auto* current = static_cast<void**>(addr);
+	auto current_ref = std::atomic_ref<void*>(*current);
 	Common::LockGuard lock(m_mutex);
 
-	current_value = current_ref.load(std::memory_order_acquire);
+	auto* current_value = current_ref.load(std::memory_order_acquire);
 	const bool adaptive_static_mutex_after_lock =
 	    (type == PthreadStaticObject::Type::Mutex &&
 	     current_value == reinterpret_cast<void*>(static_cast<uintptr_t>(1)));
@@ -3176,8 +3184,26 @@ int PthreadGetCurrentPriorityForKernel() {
 	return PthreadGetPriorityForKernel(g_pthread_self);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+static void __attribute__((noinline)) CleanupThreadImpl(void* arg) {
+#else
 static void CleanupThread(void* arg) {
+#endif
 	auto* thread = static_cast<Pthread>(arg);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	if (g_guest_entry_return_rsp != 0 && thread == g_pthread_self &&
+	    thread->guest_host_rsp != 0) {
+		// winpthread calls cleanup handlers before longjmp to its native thread frame.
+		// That unwind cannot cross our foreign guest stack. Resume the saved host
+		// continuation instead; RunThread's cleanup_pop removes this record and calls
+		// us again on the host stack, where guest destructors run exactly once.
+		// Async cancellation inside HLE critical sections remains unsupported: this
+		// exit bridge cannot unwind abandoned host locks or C++ cleanup frames.
+		PthreadExit(reinterpret_cast<void*>(GuestPthreadCanceledValue));
+		__builtin_unreachable();
+	}
+#endif
 
 	LibcInternalExt::RunThreadAtexitDestructors();
 
@@ -3194,6 +3220,33 @@ static void CleanupThread(void* arg) {
 
 	thread->almost_done = true;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+// winpthread's async injector redirects RIP without aligning the interrupted RSP.
+// Keep this entry native-only: a SysV call would require aligned XMM saves before
+// clang-cl's force_align_arg_pointer alignment. The native callee preserves XMMs.
+static void __attribute__((force_align_arg_pointer, noinline)) CleanupThread(void* arg) {
+	CleanupThreadImpl(arg);
+	// Preserve the aligning call frame instead of tail-calling the implementation.
+	asm volatile("" ::: "memory");
+}
+
+struct CancellableGuestEntry {
+	Pthread thread;
+	int     previous_cancel_state;
+};
+
+static void* KYTY_SYSV_ABI RunCancellableGuestEntry(void* arg) {
+	const auto& entry = *static_cast<CancellableGuestEntry*>(arg);
+	// The guest return address and saved host frame are now valid. Pending native
+	// asynchronous cancellation can safely enter CleanupThread from this point.
+	EXIT_IF(pthread_setcancelstate(entry.previous_cancel_state, nullptr) != 0);
+	auto* result = entry.thread->entry(entry.thread->arg);
+	// Keep cancellation masked through the stack switch, marker clear, and cleanup.
+	EXIT_IF(pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr) != 0);
+	return result;
+}
+#endif
 
 static void* RunThread(void* arg) {
 	Common::WriteFpEnv(Common::GuestFpEnv);
@@ -3242,7 +3295,13 @@ static void* RunThread(void* arg) {
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
 	PthreadInitGuestFloatingPoint();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	CancellableGuestEntry entry {thread, PTHREAD_CANCEL_ENABLE};
+	EXIT_IF(pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &entry.previous_cancel_state) != 0);
+	ret = RunOnGuestStack(&entry, RunCancellableGuestEntry, stack_top);
+#else
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
+#endif
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_pop(1);
@@ -3550,6 +3609,11 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_guest_entry_return_rsp != 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// A pending asynchronous request must not interrupt the return trampoline
+		// while its guest marker and native TEB limits are being restored.
+		EXIT_IF(pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr) != 0);
+#endif
 		const auto return_rsp    = g_guest_entry_return_rsp;
 		g_guest_entry_return_rsp = 0;
 

@@ -4476,6 +4476,44 @@ void TestProgramMemoryAllocationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestProtectionRejectsWrappedRanges() {
+	const char* test = "GuestProtectionRejectsWrappedRanges";
+	using namespace Libs::LibKernel::Memory;
+	using Common::VirtualMemory::Mode;
+	const auto base = AllocateRuntimeMemory(0, SceKernelPageSize * 2, Mode::ReadWrite,
+	                                        "protection_overflow_test");
+	Check(test, base != 0, "runtime allocation failed");
+	const auto reject = [&](uint64_t address, uint64_t size) {
+		auto previous = Mode::ExecuteReadWrite;
+		Check(test, !ProtectGuestMemory(address, size, Mode::Read, &previous),
+		      "overflowing protection span was accepted");
+		Check(test, previous == Mode::ExecuteReadWrite,
+		      "rejected span changed the previous-protection output");
+	};
+	// The old rounding expression wrapped to zero for this otherwise valid base.
+	reject(base, UINT64_MAX);
+	reject(base + 1, UINT64_MAX - 1);
+	// The length itself rounds safely, but the caller's end address wraps.
+	reject(base, UINT64_MAX - base + 1);
+	// The unrounded span fits; rounding its final page would wrap the end.
+	reject(UINT64_MAX - (SceKernelPageSize - 1), 1);
+	Check(test, !ProtectGuestMemory(base, 0, Mode::Read), "zero length behavior changed");
+	Check(test, !ProtectGuestMemory(0, 1, Mode::Read), "null address behavior changed");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize * 2,
+	            SceKernelProtCpuRead | SceKernelProtCpuRw, 0, 0, 0, 1,
+	            "protection_overflow_test");
+	// Valid unaligned spans must still protect both touched pages.
+	Check(test, ProtectGuestMemory(base + SceKernelPageSize - 4, 8, Mode::Read),
+	      "valid unaligned protection failed");
+	Check(test, Query(test, base).protection == SceKernelProtCpuRead &&
+	            Query(test, base + SceKernelPageSize).protection == SceKernelProtCpuRead,
+	      "valid unaligned span did not protect both pages");
+	Check(test, ProtectGuestMemory(base, SceKernelPageSize * 2, Mode::ReadWrite),
+	      "protection restore failed");
+	Check(test, FreeGuestMemory(base, SceKernelPageSize * 2), "runtime cleanup failed");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
@@ -5866,6 +5904,15 @@ int main(int argc, char** argv) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--guest-protection-overflow-only") == 0) {
+		RunTest(TestGuestProtectionRejectsWrappedRanges);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--pool-decommit-fragments-only") == 0) {
+		RunTest(TestMemoryPoolMultiRangeDecommit);
+		RunTest(TestFragmentedPoolDecommitOnSmallStack);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -5907,6 +5954,7 @@ int main(int argc, char** argv) {
 		RunTest(TestFixedReserveReplacesPartialDirectMapping);
 		RunTest(TestMemoryPoolMultiRangeDecommit);
 		RunTest(TestProgramMemoryAllocationAndProtection);
+		RunTest(TestGuestProtectionRejectsWrappedRanges);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
@@ -6053,6 +6101,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFragmentedPoolDecommitOnSmallStack);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+	RunTest(TestGuestProtectionRejectsWrappedRanges);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

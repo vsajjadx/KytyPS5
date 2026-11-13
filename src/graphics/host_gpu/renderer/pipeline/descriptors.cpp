@@ -133,6 +133,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+static bool kDisableNarrowWrites() {
+	static const bool disabled = std::getenv("KYTY_NO_NARROW_WRITES") != nullptr;
+	return disabled;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
@@ -148,9 +153,36 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	// Swizzled or ADD_TID buffers move fixed-offset writes by lane; only plain ones keep them.
+	const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+	const bool narrow = resource.written && linear && resource.fixed_write_end != 0u &&
+	                    resource.fixed_write_end != UINT32_MAX &&
+	                    resource.fixed_write_end < size && !kDisableNarrowWrites();
+	if (resource.written && std::getenv("KYTY_NARROW_DIAG") != nullptr) {
+		static uint64_t n = 0, n_narrow = 0, n_dynamic = 0, n_swz = 0, n_full = 0;
+		n++;
+		if (narrow) n_narrow++;
+		else if (resource.fixed_write_end == UINT32_MAX) n_dynamic++;
+		else if (!linear) n_swz++;
+		else n_full++;
+		if (n % 5000 == 0) {
+			std::printf("NARROWDIAG: written bindings=%llu narrowed=%llu dynamic=%llu swizzled=%llu covers_all=%llu%c",
+			            (unsigned long long)n, (unsigned long long)n_narrow, (unsigned long long)n_dynamic,
+			            (unsigned long long)n_swz, (unsigned long long)n_full, 10);
+			std::fflush(stdout);
+		}
+	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    address, size, resource.written && !narrow,
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
+	    !resource.written);
+	if (narrow && resource.fixed_write_end != 0u) {
+		// The full range above must retain its persistent owner: a streaming upload is
+		// read-only guest data and cannot receive writes that later readbacks must see.
+		// Upload the full CPU-owned contents first, then mark only the written prefix.
+		(void)context.GetBufferCache().ObtainBuffer(address, resource.fixed_write_end, true, false,
+		                                            id);
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -160,7 +192,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		context.GetTextureCache().InvalidateMemoryFromGPU(
+		    address, narrow ? std::max<uint64_t>(resource.fixed_write_end, 1u) : size);
 	}
 	return result;
 }

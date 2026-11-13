@@ -5,6 +5,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -90,6 +91,32 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool GameOrderedBarriers() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_GAME_BARRIERS");
+		return text == nullptr || text[0] != '0';
+	}();
+	return enabled;
+}
+
+void GameFlushBarrier(vk::CommandBuffer vk_buffer) {
+	const vk::MemoryBarrier barrier {
+	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
+	                          &barrier, 0, nullptr, 0, nullptr);
+}
+
+void UploadToShaderBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags destination_stages) {
+	const vk::MemoryBarrier barrier {
+	    .srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+	                          destination_stages, vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0,
+	                          nullptr);
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

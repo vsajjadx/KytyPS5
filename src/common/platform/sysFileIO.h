@@ -46,5 +46,8 @@ void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a, Sy
 // NOLINTNEXTLINE(google-runtime-references)
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out);
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+// Renames src to dst, atomically replacing an existing dst file (POSIX rename semantics).
+// Returns 0 or a POSIX errno.
+int  SysFileReplaceFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

@@ -7,6 +7,8 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
+#include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -68,7 +70,9 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	const char* ring_option = std::getenv("KYTY_GPU_RING_RUNTIME");
+	const bool gpu_ring_runtime = ring_option != nullptr && ring_option[0] != '\0' && ring_option[0] != '0';
+	IoAll(header, stamp, gpu_ring_runtime, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
@@ -244,6 +248,23 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
+			if (std::getenv("KYTY_DUMP_HASH") != nullptr) {
+				std::printf("CACHEMOD prog=%016llx info=%016llx id=%016llx words=%zu\n", static_cast<unsigned long long>(program->first.hash), static_cast<unsigned long long>(module.info.shader_hash), static_cast<unsigned long long>(module.id), spirv.size());
+			}
+			// TEMP DIAG: KYTY_DUMP_HASH=<hex> writes a cached shader's SPIR-V.
+			if (const char* want = std::getenv("KYTY_DUMP_HASH");
+			    want != nullptr && (std::strtoull(want, nullptr, 16) == program->first.hash ||
+			                        std::strtoull(want, nullptr, 16) == module.info.shader_hash)) {
+				char path[256];
+				std::snprintf(path, sizeof(path), "K:/KytyPS5/runs/dump/cached_%016llx_%016llx.spv",
+				              static_cast<unsigned long long>(program->first.hash),
+				              static_cast<unsigned long long>(module.id));
+				if (FILE* f = std::fopen(path, "wb")) {
+					std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+					std::fclose(f);
+					std::printf("DUMPHASH: wrote %s\n", path);
+				}
+			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

@@ -47,14 +47,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
-	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
+	if (ignore_target_mask && render_target_bound(rt) && mask == 0) {
 		mask = 0x0f;
 	}
 
 	r             = {};
 	r.target_slot = rt_slot;
 
-	if (rt.base.addr == 0 || mask == 0) {
+	if (!render_target_bound(rt) || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
 			static std::atomic_uint log_count = 0;
 			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);

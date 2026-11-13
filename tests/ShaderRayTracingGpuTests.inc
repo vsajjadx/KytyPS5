@@ -617,6 +617,14 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
                         barycentrics ? bits(-2) : 0};
     } else if (lane == 29) {
       data[input] = (255 << 3) | 5;
+    } else if (lane == 23 || lane == 30 || lane == 31) {
+      // Missing first page (with a present next page), missing same-page node,
+      // and present first page with missing next page. Neither half of an FP32
+      // box may be loaded unless both pointers are present. The last case's
+      // unused first pointer lies beyond the small physical backing on purpose.
+      const u32 node = lane == 23 ? 767 : lane == 30 ? 512 : 511;
+      data[input] = (node << 3) | 5;
+      expected[lane] = {Invalid, Invalid, Invalid, Invalid};
     }
     if (wide) {
       // Keep the same small backing while placing nodes beyond the 32-bit pointer range.
@@ -646,7 +654,7 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   // The resource is a GPU value, not a materialized host image descriptor.
   AppendSMovLiteral(&code, 8, GuestBase >> 8);
   AppendSMovLiteral(&code, 9, (sorted ? 0x80000000 : 0) | (grow << 23));
-  AppendSMovLiteral(&code, 10, node_base + 256);
+  AppendSMovLiteral(&code, 10, node_base + 768);
   AppendSMovLiteral(&code, 11, barycentrics ? 0x81000000 : 0x80000000);
   code.push_back(EncodeVop2(0x1a, 1, InlineU32(6), 0));
   for (u32 offset : {0u, 4u, 8u}) {
@@ -670,13 +678,14 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   AppendEnd(&code);
   const auto nodes_address = GuestBase + (uint64_t{node_base} << 6);
   test.bda_mappings = {{nodes_address, NodeStart * sizeof(u32)},
-                       {nodes_address + 0x4000, (NodeStart + 257 * 16) * sizeof(u32)}};
+                       {nodes_address + 0x4000, (NodeStart + 257 * 16) * sizeof(u32)},
+                       {nodes_address + 0xc000, (NodeStart + 257 * 16) * sizeof(u32)}};
   test.compute_info.wave_size = LaneCount;
   test.compute_info.threads_num[0] = LaneCount;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"get_bda_pointer"};
-  test.max_spirv_words = 6350;
+  test.max_spirv_words = 6480;
   return test;
 }

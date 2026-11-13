@@ -25,8 +25,10 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -765,10 +767,37 @@ void WindowContext::Run() {
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+	// Test-only in-process pad input. Each new sequence number requests one pulse;
+	// there is no timed repetition that could accidentally select a menu item.
+	const char* menu_test_dir = std::getenv("KYTY_MENU_TEST");
+	uint64_t cross_sequence = 0;
+	uint64_t cross_release = 0;
+	uint64_t command_poll = 0;
 
 	while (!loop.need_exit) {
 		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
+		if (menu_test_dir != nullptr && menu_test_dir[0] != '\0') {
+			if (cross_release != 0 && now >= cross_release) {
+				HostInputKey(SDLK_J, false);
+				cross_release = 0;
+				std::printf("MENU_TEST: cross released\n");
+				std::fflush(stdout);
+			}
+			if (now >= command_poll) {
+				command_poll = now + 100;
+				std::ifstream request(std::filesystem::path(menu_test_dir) / "cross.txt");
+				uint64_t sequence = 0;
+				if ((request >> sequence) && sequence > cross_sequence && cross_release == 0) {
+					cross_sequence = sequence;
+					HostInputKey(SDLK_J, true);
+					cross_release = now + 300;
+					std::printf("MENU_TEST: cross pressed sequence=%llu\n",
+					            static_cast<unsigned long long>(sequence));
+					std::fflush(stdout);
+				}
+			}
+		}
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
@@ -779,12 +808,14 @@ void WindowContext::Run() {
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		const auto wait_ms = static_cast<int>(menu_test_dir != nullptr ? 20 :
+		                                     title_interval_ms - (now - title_time));
 		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
 	}
+	if (cross_release != 0) HostInputKey(SDLK_J, false);
 }
 
 static void WindowCreate(WindowContext& context) {

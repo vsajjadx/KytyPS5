@@ -37,6 +37,11 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
+#include <mutex>
+#include <map>
+
+namespace Libs::Graphics { void DiagWalkerSlowRead(uint64_t vaddr); }
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
@@ -693,7 +698,111 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// The SRT walker reads descriptor tables while recording a dispatch. Pages holding them
+		// often also hold GPU-written data (UFC 6 menus: ~2000 such faults a second, each a full
+		// GPU sync). When the 4 bytes read are not GPU-written, read them from guest backing.
+		if (access == GpuAccess::Read) {
+			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+			        info->exception_address);
+			    length != 0) {
+				uint32_t value = 0;
+				if (Libs::LibKernel::Memory::TryReadGpuCpuCurrent(info->access_violation_vaddr,
+				                                                  &value, sizeof(value)) ||
+				    Libs::LibKernel::Memory::TryPredictGpuRead(info->access_violation_vaddr,
+				                                               value)) {
+					Loader::X64InstructionEmulator::CompleteLoad32(info->native_context, length,
+					                                               value);
+					Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+					return true;
+				}
+			}
+		}
+		static const bool walker_diag = std::getenv("KYTY_WALKER_DIAG") != nullptr;
+		const bool        walker_read = walker_diag && access == GpuAccess::Read &&
+		                         Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		                             info->exception_address) != 0;
+		uint32_t before = 0;
+		const bool have_before = walker_read && Libs::LibKernel::Memory::TryReadBacking(
+		                                            info->access_violation_vaddr, &before, 4);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			if (access == GpuAccess::Read) SysFaultDiag(info->native_context, info->access_violation_vaddr);
+			if (access == GpuAccess::Read &&
+			    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0) {
+				Libs::LibKernel::Memory::NoteGpuRead(info->access_violation_vaddr);
+			}
+			if (walker_read) {
+				static std::mutex                          m;
+				static std::map<std::string, uint64_t>     ops;
+				static uint64_t                            total = 0;
+				std::scoped_lock                           lock {m};
+				ops[::Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadInfoAt(info->exception_address)]++;
+				if (++total % 3000 == 0) {
+					std::vector<std::pair<uint64_t, std::string>> v;
+					for (auto& [k, c]: ops) v.emplace_back(c, k);
+					std::sort(v.rbegin(), v.rend());
+					for (size_t i = 0; i < v.size() && i < 12; i++)
+						std::printf("WALKOP: %llu %s%c", (unsigned long long)v[i].first, v[i].second.c_str(), 10);
+					std::fflush(stdout);
+					ops.clear();
+				}
+			}
+			if (walker_diag) {
+				static std::atomic<uint64_t> n_walker {0}, n_other_read {0}, n_write {0}, n_fast {0};
+				if (access != GpuAccess::Read) n_write++;
+				else if (walker_read) n_walker++;
+				else n_other_read++;
+				if (((n_walker + n_other_read + n_write) % 2000) == 0) {
+					std::printf("FAULTMIX: walker_slow=%llu other_read=%llu write=%llu\n",
+					            (unsigned long long)n_walker.load(),
+					            (unsigned long long)n_other_read.load(),
+					            (unsigned long long)n_write.load());
+					std::fflush(stdout);
+				}
+			}
+			{
+				static const bool other = [] { const char* t = std::getenv("KYTY_WRITER_DIAG"); return t != nullptr && t[0] == '2'; }();
+				if (walker_diag && access == GpuAccess::Read && walker_read != other)
+					::Libs::Graphics::DiagWalkerSlowRead(info->access_violation_vaddr);
+			}
+			if (have_before) {
+				static std::atomic<uint64_t> same {0}, changed {0};
+				uint32_t after = 0;
+				(void)Libs::LibKernel::Memory::TryReadBacking(info->access_violation_vaddr, &after, 4);
+				(after == before ? same : changed)++;
+				{
+					struct Stat { uint64_t n = 0, changes = 0; uint32_t last = 0; };
+					static std::mutex                   m;
+					static std::map<uint64_t, Stat>     per;
+					static uint64_t                     total = 0;
+					std::scoped_lock                    lock {m};
+					auto& st = per[info->access_violation_vaddr];
+					if (st.n != 0 && after != st.last) st.changes++;
+					if (after != before) st.changes += 0;
+					st.n++;
+					st.last = after;
+					if (++total % 4000 == 0) {
+						std::vector<std::pair<uint64_t, uint64_t>> v;
+						for (auto& [a, x]: per) v.emplace_back(x.n, a);
+						std::sort(v.rbegin(), v.rend());
+						uint64_t never = 0, never_n = 0;
+						for (auto& [a, x]: per) if (x.changes == 0) { never++; never_n += x.n; }
+						std::printf("ADDRDIAG: %zu addresses, %llu never changed (%llu reads)\n", per.size(),
+						            (unsigned long long)never, (unsigned long long)never_n);
+						for (size_t i = 0; i < v.size() && i < 16; i++) {
+							auto& x = per[v[i].second];
+							std::printf("ADDRDIAG:   0x%llx reads=%llu value_changes=%llu last=0x%x\n",
+							            (unsigned long long)v[i].second, (unsigned long long)x.n,
+							            (unsigned long long)x.changes, x.last);
+						}
+						std::fflush(stdout);
+					}
+				}
+				if (((same + changed) % 1000) == 0) {
+					std::printf("WALKDIAG: slow walker reads: %llu value unchanged, %llu changed\n",
+					            (unsigned long long)same.load(), (unsigned long long)changed.load());
+					std::fflush(stdout);
+				}
+			}
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}

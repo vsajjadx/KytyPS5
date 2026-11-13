@@ -602,8 +602,14 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, slot);
+                                       RenderColorInfo &color, uint32_t slot,
+                                       bool ignore_target_mask = false) {
+    executor.ResolveRenderColorTarget(buffer, color, slot, ignore_target_mask);
+  }
+
+  static bool ConsumeMetadataColorOperation(RenderExecutor &executor,
+                                             CommandBuffer &buffer) {
+    return executor.ConsumeMetadataColorOperation(buffer);
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -1484,6 +1490,7 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  std::optional<u32> expected_fault_mask;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -6919,6 +6926,104 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckCpuDirtyBcAlias() {
+    constexpr const char* name = "CpuDirtyBcAlias";
+    constexpr uint64_t allocation_size = 4 * 1024 * 1024;
+    constexpr uint64_t alignment = 64 * 1024;
+    constexpr uint8_t heap_value = 0x6b;
+    constexpr uint32_t gpu_value = 0x13579bdf;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void* mapped = nullptr;
+    Require(name, "allocation",
+        LibKernel::Memory::KernelAllocateDirectMemory(
+            0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+            alignment, 0, &direct) == 0 &&
+        LibKernel::Memory::KernelMapDirectMemory(
+            &mapped, allocation_size, 0x3, 0, direct, alignment) == 0,
+        "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      auto& cache = context.GetTextureCache();
+      auto bc = MakeLinearDesc(base, 0, vk::Format::eBc5UnormBlock,
+          Prospero::BufferFormat::kBc5UNorm, Prospero::ImageType::kColor2D,
+          {1024, 1024, 1}, 1, 16, 1);
+      bc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+      bc.info.resources.levels = 11;
+      bc.info.UpdateSize();
+      bc.view_info.level_count = 11;
+      std::memset(mapped, 0x11, bc.info.data.size);
+      const auto old_bc = cache.FindImage(bc);
+      (void)cache.FindTexture(old_bc, bc);
+      scheduler.Finish();
+
+      // The allocation is reused: only mip 0 remains texture data; the former mip tail now
+      // holds CPU heap records. Its uploaded BC image still contains the old 0x11 bytes.
+      Require(name, "CPU ownership",
+          context.InvalidateMemory(base, bc.info.data.size),
+          "CPU reuse could not invalidate the old BC allocation");
+      std::memset(mapped, heap_value, bc.info.data.size);
+      Require(name, "definitely dirty BC image",
+          cache.GetImage(old_bc).IsDefinitelyCpuDirty() &&
+              !cache.GetImage(old_bc).IsMaybeCpuDirty(),
+          "the source did not retain the CPU write state");
+      auto raw = MakeLinearDesc(base, 0, vk::Format::eR32G32B32A32Uint,
+          Prospero::BufferFormat::k32_32_32_32UInt, Prospero::ImageType::kColor2D,
+          {256, 256, 1}, 1, 16, 1);
+      raw.type = BindingType::Storage;
+      raw.info.tile_mode = bc.info.tile_mode;
+      raw.info.UpdateSize();
+      raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      Require(name, "reused heap tail", bc.info.data.size > raw.info.data.size,
+          "the raw writer did not leave a former mip tail outside its bounds");
+      const auto writer = cache.FindImage(raw);
+      // Without retiring the dirty BC image, a mip-0 binding selects its whole old mip chain,
+      // so its GPU ownership/readback includes the unrelated heap. Check before submitting an
+      // illegal raw write to a compressed VkImage, then round-trip the actual bounded write.
+      Require(name, "writer excludes the reused heap",
+          writer != old_bc && cache.GetImage(writer).info.data == raw.info.data &&
+              cache.GetImage(writer).info.resources.levels == 1,
+          "the raw mip-0 writer retained GPU ownership of the former BC mip tail");
+      (void)cache.FindTexture(writer, raw);
+      vk::ClearValue clear{};
+      std::fill_n(clear.color.uint32.data(), 4, gpu_value);
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), writer,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      Require(name, "readback", TextureCacheTestAccess::TryDownload(cache, writer),
+          "the bounded raw image could not be read back");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint32_t> observed(bc.info.data.size / sizeof(uint32_t));
+      Require(name, "guest contents",
+          LibKernel::Memory::TryReadBacking(base, observed.data(), bc.info.data.size),
+          "could not inspect the reused texture allocation");
+      const auto written_words = raw.info.data.size / sizeof(uint32_t);
+      Require(name, "raw write and untouched heap",
+          std::all_of(observed.begin(), observed.begin() + written_words,
+                      [](uint32_t word) { return word == gpu_value; }) &&
+              std::all_of(observed.begin() + written_words, observed.end(),
+                      [](uint32_t word) { return word == 0x6b6b6b6b; }),
+          "raw image readback lost GPU writes or overwrote CPU heap records in the old mip tail");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, allocation_size) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -11425,6 +11530,99 @@ public:
     Require(name, "release",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "sRGB allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckInvalidColorTarget() {
+    constexpr const char *name = "InvalidColorTarget";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                size, size, 0, &direct_offset) == 0,
+            "invalid-target control allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "invalid-target control mapping failed");
+    std::memset(mapped, 0x5a, size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      auto &cache = context.GetTextureCache();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::kInvalid});
+      registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear,
+                                   .dimension = 1, .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      Require(name, "COLOR_INVALID with address and mask",
+              !color.image_id && color.target_slot == 0 &&
+                  color.desc.info.data.address == 0 && !cache.IsRegionRegistered(base, 1),
+              "COLOR_INVALID created an attachment from stale slot registers");
+      registers.SetRenderTargetMask(0);
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0, true);
+      Require(name, "metadata mask override",
+              !color.image_id && !cache.IsRegionRegistered(base, 1),
+              "ignoring the write mask revived a COLOR_INVALID slot");
+      registers.SetColorControl({.mode = 2});
+      Require(name, "invalid fast-clear elimination",
+              RenderExecutorTestAccess::ConsumeMetadataColorOperation(
+                  executor, scheduler.Current()) && !cache.IsRegionRegistered(base, 1),
+              "fast-clear elimination allocated an invalid color target");
+      registers.SetColorBase(1, {.addr = base + 0x8000});
+      registers.SetColorControl({.mode = 3});
+      Require(name, "invalid resolve pair",
+              !RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),
+              "a resolve accepted invalid source and destination formats");
+
+      // The same address and dimensions resolve normally when FORMAT is valid.
+      registers.SetColorControl({.mode = 1});
+      registers.SetRenderTargetMask(0x0f);
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                 .channel_type = Prospero::ChannelType::kUNorm,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      Require(name, "valid format control",
+              color.image_id && color.desc.info.data.address == base &&
+                  color.desc.info.extent == vk::Extent3D{32, 32, 1} &&
+                  color.desc.view_info.format == vk::Format::eR8G8B8A8Unorm,
+              "the invalid-format guard disabled or changed a valid color attachment");
+      const auto image = color.image_id;
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::kInvalid});
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      Require(name, "disabled cached target",
+              !color.image_id && color.desc.info.data.address == 0 &&
+                  cache.GetImage(image).backing.format == vk::Format::eR8G8B8A8Unorm,
+              "disabling a cached target retained its binding or changed its image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "invalid-target control mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "invalid-target control allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -15961,6 +16159,264 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckReadbackWindow() {
+    constexpr const char *name = "ReadbackWindow";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t owner_size = 0x180000;
+    constexpr uint64_t first = 0x20000, second = 0xa0000;
+    constexpr uint64_t hole = 0x40000, tail = owner_size - sizeof(u32);
+    constexpr uint64_t neighbor = owner_size + 0x100;
+    constexpr u32 stale = 0x13579bdfu, first_value = 0x11223344u;
+    constexpr u32 second_value = 0x55667788u, rewrite_value = 0x99aabbccu;
+    constexpr u32 hole_value = 0xcafef00du, tail_value = 0xabcd1234u;
+    constexpr u32 neighbor_value = 0x87654321u;
+    const char *request = std::getenv("KYTY_DOWNLOAD_WINDOW_KIB");
+    const bool wide = request != nullptr && std::strcmp(request, "2048") == 0;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "guest allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(
+                    &mapped, allocation_size, 0x3, 0x10, direct, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "readback-window direct allocation/mapping failed");
+    std::fill_n(static_cast<u32 *>(mapped), allocation_size / sizeof(u32), stale);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &gpu = context.GetGpu();
+      auto &cache = context.GetBufferCache();
+      auto &scheduler = context.GetCommandScheduler();
+      BufferId owner{}, other{};
+      const auto backing = [&](uint64_t offset) {
+        u32 value = 0;
+        Require(name, "backing access",
+                LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value)),
+                "readback fixture backing is inaccessible");
+        return value;
+      };
+      const auto canaries = [&] {
+        Require(name, "CPU holes and tails",
+                backing(first + sizeof(u32)) == stale && backing(hole) == hole_value &&
+                    backing(tail) == tail_value && cache.IsRegionCpuModified(base + hole, 4) &&
+                    cache.IsRegionCpuModified(base + tail, 4),
+                "readback overwrote CPU-owned holes/tails or consumed their ownership");
+      };
+      const auto write_gpu = [&](uint64_t offset, u32 value, BufferId id) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false, id);
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      gpu.SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        context.MapMemory(base, allocation_size);
+        owner = cache.FindBuffer(base, owner_size);
+        other = cache.FindBuffer(base + owner_size, 0x40000);
+        Require(name, "distinct owners", owner != other &&
+                    cache.GetBuffer(owner).CpuAddress() == base &&
+                    cache.GetBuffer(owner).Size() == owner_size,
+                "fixture owners merged or primary bounds changed");
+        // Upload stale contents, then leave newer CPU bytes outside the GPU writes.
+        (void)cache.ObtainBuffer(base, owner_size, false, false, owner, false);
+        for (const auto [offset, value] : {std::pair{hole, hole_value},
+                                           std::pair{tail, tail_value}}) {
+          cache.InvalidateMemory(base + offset, sizeof(value));
+          LibKernel::Memory::WriteBacking(base + offset, &value, sizeof(value));
+        }
+        write_gpu(first, first_value, owner);
+        write_gpu(second, second_value, owner);
+        write_gpu(neighbor, neighbor_value, other);
+        Require(name, "unpublished setup", backing(first) == stale && backing(second) == stale &&
+                    cache.HasGpuDirtyBytes(base + first, 4) &&
+                    cache.HasGpuDirtyBytes(base + second, 4),
+                "fixture drained before the first protected read");
+        canaries();
+      });
+      // Native CPU loads fault through the installed GPU resources. A completed
+      // coalesced second read must neither record another copy batch nor drain a tick.
+      const auto read = [&](uint64_t offset, u32 expected, bool download) {
+        uint64_t before_tick = 0, after_tick = 0;
+        gpu.SendCommandSync([&] { before_tick = scheduler.CurrentTick(); });
+        {
+          const RecordedCommandCounter counter;
+          const u32 observed = *reinterpret_cast<volatile const u32 *>(base + offset);
+          gpu.SendCommandSync([&] { after_tick = scheduler.CurrentTick(); });
+          Require(name, "protected read and drain", observed == expected &&
+                      RecordedCommandCounter::copies == (download ? 1u : 0u) &&
+                      (download ? after_tick > before_tick : after_tick == before_tick),
+                  fmt::format("offset={:x} actual={:08x} expected={:08x} copies={} "
+                              "download={} ticks={}->{}", offset, observed, expected,
+                              RecordedCommandCounter::copies, download, before_tick, after_tick));
+        }
+      };
+      read(first, first_value, true);
+      gpu.SendCommandSync([&] {
+        Require(name, "two-window publication", backing(second) == (wide ? second_value : stale) &&
+                    cache.HasGpuDirtyBytes(base + second, 4) == !wide &&
+                    cache.IsRegionGpuModified(base + second, 4) == !wide,
+                "first read published the wrong window or cleared unpublished ownership");
+        Require(name, "adjacent newer owner", backing(neighbor) == stale &&
+                    cache.HasGpuDirtyBytes(base + neighbor, 4) &&
+                    cache.IsRegionGpuModified(base + neighbor, 4) &&
+                    BufferCacheTestAccess::PageOwner(cache, base + first) == owner &&
+                    BufferCacheTestAccess::PageOwner(cache, base + neighbor) == other,
+                "coalescing crossed its owner or consumed an independent newer GPU value");
+        canaries();
+      });
+      read(second, second_value, !wide);
+      gpu.SendCommandSync([&] {
+        Require(name, "published generation", !cache.HasGpuDirtyBytes(base + first, 4) &&
+                    !cache.HasGpuDirtyBytes(base + second, 4),
+                "completed reads retained stale GPU byte ownership");
+        write_gpu(second, rewrite_value, owner);
+        Require(name, "fresh GPU generation", backing(second) == second_value &&
+                    cache.HasGpuDirtyBytes(base + second, 4),
+                "GPU rewrite was cached as an already published value");
+        canaries();
+      });
+      read(second, rewrite_value, true);
+      read(neighbor, neighbor_value, true);
+      gpu.SendCommandSync([&] {
+        canaries();
+        Require(name, "rewrite publication", backing(second) == rewrite_value &&
+                    !cache.HasGpuDirtyBytes(base + second, 4),
+                "new GPU generation was not published before returning to CPU");
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "guest release",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, allocation_size) == 0,
+            "readback-window fixture release failed");
+    std::printf("[gpu]     %-32s ok (%s KiB)\n", name, wide ? "2048" : "512");
+  }
+
+  void CheckNarrowBufferWrite() {
+    constexpr const char *name = "NarrowBufferWrite";
+    constexpr uintptr_t base = 0x0000000205b00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr std::array<u32, 3> initial{0x11112222u, 0x33334444u, 0x55556666u};
+    constexpr u32 written_value = initial[1] ^ initial[2];
+    EnsureRuntimeContext();
+
+    // Read both untouched tail words on the GPU, then write just the first word.
+    // This also proves that selecting a persistent owner uploaded the entire input.
+    std::vector<u32> code{EncodeMubuf0(0x0c, 4, false, false), EncodeMubuf1(2, 0, 0),
+                          EncodeMubuf0(0x0c, 8, false, false), EncodeMubuf1(3, 0, 0),
+                          EncodeSopp(0x0c, 0), EncodeVop2(0x1d, 1, Vgpr(2), 3)};
+    code.insert(code.end(), {EncodeMubuf0(0x1c, 0, false, false), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "guest allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(
+                    &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                    allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "narrow buffer guest allocation or mapping failed");
+    std::memcpy(mapped, initial.data(), sizeof(initial));
+
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        auto &shaders = processor.GetShCtx();
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4});
+        const ShaderBufferResource descriptor{{
+            static_cast<u32>(base), static_cast<u32>(base >> 32u),
+            static_cast<u32>(sizeof(initial)),
+            DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
+                (2u << 28u)}}; // OOB_SELECT 2: raw access, rejected only when NumRecords is 0; mode 0 rejects every zero-stride read.
+        for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(i, descriptor.fields[i]);
+        context.MapMemory(base, allocation_size);
+
+        ShaderComputeInputInfo input{};
+        input.workgroup_counts[0] = input.workgroup_counts[1] = input.workgroup_counts[2] = 1;
+        Require(name, "compiled program",
+                context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input),
+                "narrow store program was not compiled");
+        const auto &metadata = input.stage.module->info.info.buffers;
+        Require(name, "positive fixed write extent",
+                metadata.size() == 1 && metadata[0].read && metadata[0].written &&
+                    metadata[0].fixed_write_end == sizeof(u32),
+                "fixture did not compile a proven four-byte write to a larger buffer: count=" +
+                    std::to_string(metadata.size()) +
+                    (metadata.empty() ? "" : " read=" + std::to_string(metadata[0].read) +
+                        " written=" + std::to_string(metadata[0].written) +
+                        " fixed_end=" + std::to_string(metadata[0].fixed_write_end)));
+
+        auto &cache = context.GetBufferCache();
+        Require(name, "CPU-owned input", cache.IsRegionCpuModified(base, sizeof(initial)),
+                "fixture no longer exercises the CPU-dirty small-buffer streaming path");
+        auto &executor = context.GetRenderExecutor();
+        PreparedBindings bindings;
+        executor.PrepareBindings(input.stage, bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
+        executor.RebindBuffers(bindings);
+        const auto &owner = cache.GetBuffer(bindings.buffer_sources[0].id);
+        Require(name, "persistent writable binding",
+                bindings.buffers[0].buffer == owner.Handle() &&
+                    bindings.buffers[0].offset == owner.Offset(base) &&
+                    bindings.buffers[0].range == sizeof(initial),
+                "a narrowed writable descriptor points at a disposable streaming upload");
+        Require(name, "precise write ownership",
+                cache.IsRangeGpuWritten(base, sizeof(u32)) &&
+                    !cache.IsRangeGpuWritten(base + sizeof(u32), sizeof(initial) - sizeof(u32)),
+                "narrowing lost its written prefix or marked the untouched tail GPU-owned");
+
+        // Execute through the production command processor, then recover guest bytes.
+        // A raw 12-byte descriptor cannot be consumed as a whole-buffer fill.
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(base, sizeof(initial));
+        std::array<u32, 3> observed{};
+        const bool readable =
+            LibKernel::Memory::TryReadBacking(base, observed.data(), sizeof(observed));
+        Require(name, "GPU write and untouched tail",
+                readable &&
+                    observed == std::array<u32, 3>{written_value, initial[1], initial[2]},
+                fmt::format("narrow GPU write was lost or full-range upload failed to preserve "
+                            "CPU-owned tail bytes: readable={} actual=[{:08x},{:08x},{:08x}] "
+                            "expected=[{:08x},{:08x},{:08x}] binding_offset={} range={} "
+                            "fixed_end={} formatted={}", readable,
+                            observed[0], observed[1], observed[2], written_value,
+                            initial[1], initial[2], bindings.buffers[0].offset,
+                            bindings.buffers[0].range, metadata[0].fixed_write_end,
+                            metadata[0].formatted));
+        context.UnmapMemory(base, allocation_size);
+        context.GetCommandScheduler().Finish();
+      });
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "release mapping", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "narrow buffer mapping cleanup failed");
+    Require(name, "release allocation",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "narrow buffer allocation cleanup failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -20133,6 +20589,7 @@ public:
         expected_fault = 1u << (BufferCache::PageIndex(mapping.guest_base) & 31u);
       }
     }
+    if (test.expected_fault_mask) expected_fault = *test.expected_fault_mask;
     if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
       fault_result = CreateHostBuffer(test.name, sizeof(u32),
@@ -39168,6 +39625,77 @@ TestCase GlobalLoadRecordsUnaccessedPage() {
   return test;
 }
 
+// All 32 lanes fault on different pages in the same shared bitmap word. A
+// non-atomic read/modify/write loses pages even though each data read succeeds.
+TestCase GlobalLoadsAtomicallyRecordNeighborPages() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Lanes = 32;
+  constexpr u32 PageDwords = BufferCache::CACHING_PAGESIZE / sizeof(u32);
+  static_assert((BufferCache::PageIndex(GuestBase) & 31u) == 0u);
+  TestCase test;
+  test.name = "GlobalLoadsAtomicallyRecordNeighborPages";
+  test.code.push_back(EncodeVop2(0x1a, 20, InlineU32(BufferCache::CACHING_PAGEBITS), 0));
+  test.code.push_back(EncodeVop2(0x25, 20, 255, 20));
+  test.code.push_back(static_cast<u32>(GuestBase));
+  AppendVMovLiteral(&test.code, 21, static_cast<u32>(GuestBase >> 32u));
+  test.code.push_back(EncodeFlat0(0x0c, 0, 0));
+  test.code.push_back(EncodeFlat1(10, 0x7d, 0, 20));
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 10, 0, 0);
+  AppendEnd(&test.code);
+  test.initial.resize(Lanes + Lanes * PageDwords);
+  for (u32 lane = 0; lane < Lanes; ++lane) {
+    const auto value = 0x5a000000u + lane;
+    test.initial[Lanes + lane * PageDwords] = value;
+    test.expected.push_back(value);
+  }
+  test.bda_mappings = {{GuestBase, Lanes * sizeof(u32), false}};
+  test.expected_fault_mask = UINT32_MAX;
+  test.required_spirv = {"OpAtomicOr"};
+  test.compute_info.wave_size = Lanes;
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::V_MOV_B32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// An invalid address 64 TiB above extended memory used to wrap its 64-bit page
+// index to U32 and read the first valid extended page. The lower address-space
+// endpoint also aliases that page unless the address is checked before lookup.
+TestCase FlatVirtualAddressRejectsAliasedInvalidRanges() {
+  using O = ShaderOpcode;
+  constexpr uint64_t LowerEnd = Libs::Graphics::LOWER_ADDRESS_SIZE;
+  constexpr uint64_t Extended = Libs::LibKernel::Memory::kExtendedMemoryBase;
+  constexpr uint64_t ExtendedEnd = Extended + Libs::LibKernel::Memory::kExtendedMemorySize;
+  constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+  const std::array<uint64_t, 6> addresses {
+      0u, LowerEnd - 4u, Extended, ExtendedEnd - 4u,
+      LowerEnd, Extended + (1ull << 46u)};
+  TestCase test;
+  test.name = "FlatVirtualAddressRejectsAliasedInvalidRanges";
+  for (u32 index = 0; index < addresses.size(); ++index) {
+    AppendVMovLiteral(&test.code, 20, static_cast<u32>(addresses[index]));
+    AppendVMovLiteral(&test.code, 21, static_cast<u32>(addresses[index] >> 32u));
+    test.code.push_back(EncodeFlat0(0x0c, 0, 0));
+    test.code.push_back(EncodeFlat1(index + 8u, 0x7d, 0, 20));
+  }
+  for (u32 index = 0; index < addresses.size(); ++index)
+    AppendStoreVgpr(&test.code, index + 8u, index);
+  AppendEnd(&test.code);
+  test.initial.resize(Page / sizeof(u32));
+  test.initial.front() = 0xfeedfaceu;
+  test.initial.back() = 0xcafebabeu;
+  test.expected = {0xfeedfaceu, 0xcafebabeu, 0xfeedfaceu, 0xcafebabeu, 0u, 0u};
+  test.bda_mappings = {{0u, 0u}, {LowerEnd - Page, 0u},
+                       {Extended, 0u}, {ExtendedEnd - Page, 0u}};
+  test.fault_free_address = Extended;
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -49163,6 +49691,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnaccessedPage);
+  AddCase(GlobalLoadsAtomicallyRecordNeighborPages);
+  AddCase(FlatVirtualAddressRejectsAliasedInvalidRanges);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -56400,6 +56930,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
     RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
+    RunCase(&vulkan, GlobalLoadsAtomicallyRecordNeighborPages());
+    RunCase(&vulkan, FlatVirtualAddressRejectsAliasedInvalidRanges());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
@@ -56926,6 +57458,26 @@ int main(int argc, char **argv) {
     vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--readback-window-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckReadbackWindow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--narrow-buffer-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNarrowBufferWrite();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--invalid-color-target-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckInvalidColorTarget();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bc-dirty-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckCpuDirtyBcAlias();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -56938,8 +57490,10 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+    vulkan.CheckNarrowBufferWrite();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
+    vulkan.CheckCpuDirtyBcAlias();
     vulkan.CheckBgra16Readback();
     return 0;
   }
@@ -56979,6 +57533,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckNarrowBufferWrite();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -57015,6 +57570,24 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
     CheckDepthTargetFootprints();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-fault-atomic-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, GlobalLoadsAtomicallyRecordNeighborPages());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-address-guard-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FlatVirtualAddressRejectsAliasedInvalidRanges());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-shader-safety-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
+    RunCase(&vulkan, GlobalLoadsAtomicallyRecordNeighborPages());
+    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    RunCase(&vulkan, FlatVirtualAddressRejectsAliasedInvalidRanges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
@@ -57291,6 +57864,9 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckCpuDirtyBcAlias();
+  vulkan.CheckInvalidColorTarget();
+  vulkan.CheckNarrowBufferWrite();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

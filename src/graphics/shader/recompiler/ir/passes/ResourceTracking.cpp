@@ -395,6 +395,7 @@ public:
 		}
 		ForwardPrivateLds();
 		FoldBoundedLoopSelectors();
+		PlanGpuRingRuntime();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectDescriptors();
@@ -826,6 +827,39 @@ private:
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
 	}
 
+	void PlanGpuRingRuntime() {
+		// Opt in only the measured ring-buffer shader. Its descriptor base and record
+		// count come from GPU-written words in the allocation addressed by s0:s1.
+		// Keeping these scalar loads on the GPU makes the existing IndirectBuffer
+		// lowering evaluate the exact descriptor at execution time, without readback.
+		const char* enabled = std::getenv("KYTY_GPU_RING_RUNTIME");
+		if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0' ||
+		    m_program.shader_hash != 0x0f28200e45df66dbull) return;
+		uint32_t converted = 0;
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				uint32_t index = 0;
+				if (inst.GetOpcode() != ValueOpcode::LoadAddressU32 ||
+				    ScalarReadMemory(inst, index) == nullptr) continue;
+				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+				    handle->NumArgs() != 2u) continue;
+				bool ring_base = true;
+				for (uint32_t word = 0; word < 2u; ++word) {
+					const auto* base = handle->Arg(word).Resolve().TryInstruction();
+					ring_base &= base != nullptr && base->GetOpcode() == ValueOpcode::GetUserData &&
+					    base->NumArgs() == 1u && base->Arg(0).GetType() == Type::ScalarReg &&
+					    RegIndex(base->Arg(0).ScalarRegister()) == word;
+				}
+				if (!ring_base) continue;
+				m_program.memory_info[index].gpu_runtime_only = true;
+				++converted;
+			}
+		}
+		std::fprintf(stderr, "GPU ring runtime: shader=0x%016llx scalar_reads=%u\n",
+		             static_cast<unsigned long long>(m_program.shader_hash), converted);
+	}
+
 	uint32_t ScalarReadBase(const Inst& read) const {
 		const auto flags = read.Flags<MemoryFlags>();
 		if (m_program.memory_info[flags.index].kind == ResourceKind::ScalarBuffer)
@@ -922,7 +956,14 @@ private:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				uint32_t index = 0;
-				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				// KYTY_NO_HOIST_SCALAR=1 leaves plain scalar address loads in the shader (BDA at run
+				// time) instead of evaluating them on the CPU, which syncs when the GPU wrote them.
+				static const uint64_t no_hoist_hash = [] {
+					const char* text = std::getenv("KYTY_NO_HOIST_SCALAR");
+					return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+				}();
+				const bool no_hoist = no_hoist_hash != 0 && no_hoist_hash == m_program.shader_hash;
+				if (!no_hoist && inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
 				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
 				    ValidateRuntimeValue(m_program, Value(&inst)))
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
@@ -1106,7 +1147,8 @@ private:
 			return nullptr;
 		}
 		const auto& memory = m_program.memory_info[index];
-		return memory.kind == (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
+		return !memory.gpu_runtime_only &&
+		               memory.kind == (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
 		               memory.data_bits == 32u && memory.data_dwords == 1u
 		           ? &memory
 		           : nullptr;
@@ -4263,6 +4305,23 @@ private:
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
+			}
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic) {
+				// Fixed-address writes (no lane index or per-lane offset) touch a known range.
+				auto&    target = m_info.buffers[resource].fixed_write_end;
+				uint64_t end    = UINT32_MAX;
+				if (inst.NumArgs() >= 4u && !memory.idxen && !memory.offen) {
+					const auto index   = inst.Arg(1).Resolve();
+					const auto offset  = inst.Arg(2).Resolve();
+					const auto soffset = inst.Arg(3).Resolve();
+					if (index.IsImmediate() && offset.IsImmediate() && soffset.IsImmediate() &&
+					    index.GetType() == Type::U32 && offset.GetType() == Type::U32 &&
+					    soffset.GetType() == Type::U32 && index.U32() == 0u) {
+						end = uint64_t {offset.U32()} + soffset.U32() + ByteExtent(memory);
+					}
+				}
+				target = end >= UINT32_MAX ? UINT32_MAX
+				                           : std::max(target, static_cast<uint32_t>(end));
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);

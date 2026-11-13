@@ -1,4 +1,5 @@
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -7,12 +8,16 @@
 #include "libs/agc.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
+#include "loader/elf.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase*);
@@ -114,6 +119,153 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 	EXPECT_EQ(*static_cast<volatile uint64_t*>(mapped), 0x123456789abcdef0ull);
 	EXPECT_EQ(KernelMunmap(reinterpret_cast<uint64_t>(mapped), 0x4000), 0);
 	EXPECT_EQ(KernelCheckedReleaseDirectMemory(physical, 0x4000), 0);
+}
+
+} // namespace
+
+namespace {
+
+struct ElfFixtureFile {
+	std::filesystem::path path = std::filesystem::temp_directory_path() /
+	    ("kyty-elf-loader-" + std::to_string(
+	        std::chrono::steady_clock::now().time_since_epoch().count()) + ".elf");
+
+	~ElfFixtureFile() {
+		std::error_code ignored;
+		std::filesystem::remove(path, ignored);
+	}
+	void Write(const Loader::Elf64_Ehdr& header, const Loader::Elf64_Phdr& segment,
+	           bool invalid_self_index = false) const {
+		constexpr size_t PayloadOffset = 0x100;
+		constexpr size_t PayloadSize = 16;
+		std::vector<uint8_t> bytes(PayloadOffset + PayloadSize, 0x5a);
+		size_t elf_offset = 0;
+		if (invalid_self_index) {
+			Loader::SelfHeader self {};
+			const uint8_t ident[] = {0x4f, 0x15, 0x3d, 0x1d, 0, 1, 1, 0x12, 1, 1, 0, 0};
+			std::memcpy(self.ident, ident, sizeof(ident));
+			self.file_size = bytes.size();
+			self.segments_num = 1;
+			self.unknown = 0x22;
+			const Loader::SelfSegment encoded {0x800ull | (4095ull << 20u), PayloadOffset,
+			                                   PayloadSize, PayloadSize};
+			std::memcpy(bytes.data(), &self, sizeof(self));
+			std::memcpy(bytes.data() + sizeof(self), &encoded, sizeof(encoded));
+			elf_offset = sizeof(self) + sizeof(encoded);
+		}
+		std::memcpy(bytes.data() + elf_offset, &header, sizeof(header));
+		std::memcpy(bytes.data() + elf_offset + sizeof(header), &segment, sizeof(segment));
+		std::ofstream output(path, std::ios::binary | std::ios::trunc);
+		output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+		ASSERT_TRUE(output.good());
+	}
+};
+
+Loader::Elf64_Ehdr TestElfHeader() {
+	Loader::Elf64_Ehdr header {};
+	header.e_ident[Loader::EI_MAG0] = 0x7f;
+	header.e_ident[Loader::EI_MAG1] = 'E';
+	header.e_ident[Loader::EI_MAG2] = 'L';
+	header.e_ident[Loader::EI_MAG3] = 'F';
+	header.e_ident[Loader::EI_CLASS] = Loader::ELFCLASS64;
+	header.e_ident[Loader::EI_DATA] = Loader::ELFDATA2LSB;
+	header.e_ident[Loader::EI_VERSION] = Loader::EV_CURRENT;
+	header.e_ident[Loader::EI_OSABI] = Loader::ELFOSABI_FREEBSD;
+	header.e_type = Loader::ET_DYNAMIC;
+	header.e_machine = Loader::EM_X86_64;
+	header.e_version = Loader::EV_CURRENT;
+	header.e_ehsize = sizeof(header);
+	header.e_phoff = sizeof(header);
+	header.e_phentsize = sizeof(Loader::Elf64_Phdr);
+	header.e_phnum = 1;
+	return header;
+}
+
+Loader::Elf64_Phdr TestElfSegment() {
+	return {.p_type = Loader::PT_LOAD, .p_flags = Loader::PF_R, .p_offset = 0x100,
+	        .p_vaddr = 0, .p_paddr = 0, .p_filesz = 16, .p_memsz = 0x4000, .p_align = 0x4000};
+}
+
+TEST(ElfLoader, RejectsSegmentArithmeticAndCopyOverflows) {
+	const auto header = TestElfHeader();
+	const auto normal = TestElfSegment();
+	std::vector<Loader::Elf64_Phdr> invalid;
+	auto segment = normal;
+	segment.p_memsz = 8;
+	invalid.push_back(segment); // File bytes exceed the segment's declared memory.
+	segment = normal;
+	segment.p_align = 3;
+	invalid.push_back(segment);
+	segment = normal;
+	segment.p_memsz = UINT64_MAX;
+	invalid.push_back(segment); // Aligned-size rounding wraps to zero.
+	segment = normal;
+	segment.p_vaddr = UINT64_MAX - 0x3fff;
+	segment.p_memsz = 0x8000;
+	invalid.push_back(segment); // Base-size calculation wraps and loading writes before the base.
+	segment = normal;
+	segment.p_offset = UINT64_MAX - 7;
+	invalid.push_back(segment);
+	segment = normal;
+	segment.p_offset = 0x108;
+	invalid.push_back(segment); // The read would extend past the physical ELF file.
+	for (size_t index = 0; index < invalid.size(); ++index) {
+		SCOPED_TRACE(index);
+		ElfFixtureFile fixture;
+		fixture.Write(header, invalid[index]);
+		Loader::Elf64 elf;
+		elf.Open(fixture.path);
+		EXPECT_FALSE(elf.IsValid());
+	}
+}
+
+TEST(ElfLoader, RejectsTruncatedOrWrappedProgramHeaderTables) {
+	for (const uint64_t offset: {UINT64_MAX, uint64_t {0x100}}) {
+		SCOPED_TRACE(offset);
+		auto header = TestElfHeader();
+		header.e_phoff = offset;
+		ElfFixtureFile fixture;
+		fixture.Write(header, TestElfSegment());
+		Loader::Elf64 elf;
+		elf.Open(fixture.path);
+		EXPECT_FALSE(elf.IsValid());
+	}
+}
+
+TEST(ElfLoader, RejectsSelfProgramHeaderIndexBeforeSegmentLoading) {
+	ElfFixtureFile fixture;
+	fixture.Write(TestElfHeader(), TestElfSegment(), true);
+	Loader::Elf64 elf;
+	elf.Open(fixture.path);
+	EXPECT_FALSE(elf.IsValid());
+}
+
+TEST(ElfLoader, PreservesValidAlignmentAndExactEndReads) {
+	for (const uint64_t alignment: {uint64_t {0}, uint64_t {1}, uint64_t {0x4000}}) {
+		SCOPED_TRACE(alignment);
+		auto segment = TestElfSegment();
+		segment.p_align = alignment;
+		ElfFixtureFile fixture;
+		fixture.Write(TestElfHeader(), segment);
+		Loader::Elf64 elf;
+		elf.Open(fixture.path);
+		ASSERT_TRUE(elf.IsValid());
+		std::array<uint8_t, 18> destination;
+		destination.fill(0xa5);
+		elf.LoadSegment(reinterpret_cast<uint64_t>(destination.data() + 1), 0x100, 16);
+		EXPECT_EQ(destination.front(), 0xa5);
+		EXPECT_EQ(destination.back(), 0xa5);
+		for (size_t index = 1; index < 17; ++index) EXPECT_EQ(destination[index], 0x5a);
+	}
+	// A pure BSS segment has no file extent to read, even when its offset is past EOF.
+	auto bss = TestElfSegment();
+	bss.p_filesz = 0;
+	bss.p_offset = UINT64_MAX;
+	ElfFixtureFile fixture;
+	fixture.Write(TestElfHeader(), bss);
+	Loader::Elf64 elf;
+	elf.Open(fixture.path);
+	EXPECT_TRUE(elf.IsValid());
 }
 
 } // namespace

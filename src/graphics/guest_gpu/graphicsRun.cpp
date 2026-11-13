@@ -11,8 +11,10 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/frameStats.h"
+#include "common/platform/sysDbg.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
@@ -312,6 +314,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// Stores over GPU-written bytes update the cached buffer instead of faulting into a sync.
+	if (!write_one_address) {
+		const auto vaddr   = reinterpret_cast<uint64_t>(dst);
+		const auto size    = uint64_t {dw_num} * sizeof(uint32_t);
+		auto&      buffers = m_renderer.GetBufferCache();
+		if (GuestRange {vaddr, size}.Valid() && buffers.IsRegionGpuModified(vaddr, size) &&
+		    buffers.HasGpuDirtyBytes(vaddr, size) && buffers.StoreOverGpuDirty(vaddr, src, size)) {
+			return;
+		}
+	}
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -420,6 +432,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	SysStartSamplingCurrentThread("gpu");
 
 	for (;;) {
 		Submission                   submission;
@@ -436,6 +449,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				KYTY_PROFILER_BLOCK("GuestGpu::EmptyQueueWait");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (flush_deferred) {
@@ -464,7 +478,10 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = true;
 				} else if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						KYTY_PROFILER_BLOCK("GuestGpu::BlockedSubmissionWait");
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -496,6 +513,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			{
+				KYTY_PROFILER_BLOCK("GuestGpu::CommandCallback");
 				Common::DebugCounters::ScopedTimer busy(
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
 				command();
@@ -510,6 +528,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		const bool complete = [&] {
+			KYTY_PROFILER_BLOCK("GuestGpu::ProcessSubmission");
 			Common::DebugCounters::ScopedTimer busy(
 			    Common::DebugCounters::Counter::GpuThreadBusyNs);
 			return gpu->Process(submission);
@@ -914,6 +933,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	CountDraw();
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue());
@@ -925,6 +945,7 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	CountDraw();
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		vk::DispatchIndirectCommand args {};
@@ -993,9 +1014,20 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size)) {
+			std::memcpy(address, value, size);
+			return;
+		}
+		if (!buffers.HasGpuDirtyBytes(vaddr, size)) {
+			if (!LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+				std::memcpy(address, value, size);
+			}
+			return;
+		}
+		// The label overwrites GPU-written bytes: update the cached buffer in command order
+		// instead of faulting into a download and a full GPU sync (UFC 6 menus: ~27% of the
+		// GPU thread).
+		if (!buffers.StoreOverGpuDirty(vaddr, value, size)) {
 			std::memcpy(address, value, size);
 		}
 	};
@@ -1036,6 +1068,11 @@ void CommandProcessor::WriteBackImages() {
 	}
 }
 
+void CommandProcessor::GameFlush() {
+	GetScheduler().EndRendering();
+	GameFlushBarrier(GetScheduler().Current().Handle());
+}
+
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
 	if (graphics_debug_dump_enabled()) {
@@ -1053,7 +1090,12 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010:
+			if (GameOrderedBarriers()) {
+				GetScheduler().EndRendering();
+				GameFlushBarrier(GetScheduler().Current().Handle());
+			}
+			break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:

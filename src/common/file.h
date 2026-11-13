@@ -88,6 +88,9 @@ public:
 
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+	// POSIX rename: atomically replaces an existing destination file, never deletes it first.
+	// Returns 0 or a POSIX errno; archive paths give EROFS.
+	static int  RenameReplacing(const std::filesystem::path& src, const std::filesystem::path& dst);
 
 	KYTY_CLASS_NO_COPY(File);
 

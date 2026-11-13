@@ -2,6 +2,9 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#if defined(TRACY_ENABLE)
+#include "common/profiler.h"
+#endif
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -13,7 +16,11 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -47,6 +54,7 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 		return false;
 	}
 	const auto& memory = values.memory_info[index];
+	if (memory.gpu_runtime_only) return false;
 	if (op != ValueOpcode::LoadBufferU32) {
 		return (op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarAddress) ||
 		       (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarBuffer);
@@ -169,6 +177,29 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+
+// TEMP DIAG: what each guest load of a compiled walker reads and feeds, by code address.
+std::mutex&                                       WalkerLoadInfoMutex() { static std::mutex m; return m; }
+std::unordered_map<const void*, std::string>&     WalkerLoadInfo() {
+	static std::unordered_map<const void*, std::string> info;
+	return info;
+}
+
+std::string DescribeUses(const Inst& inst, int depth) {
+	std::string out;
+	for (const auto& use: inst.Uses()) {
+		if (use.user == nullptr) continue;
+		if (!out.empty()) out += ",";
+		out += ValueOpcodeName(use.user->GetOpcode());
+		out += "#" + std::to_string(use.operand);
+		if (depth > 0) {
+			const auto inner = DescribeUses(*use.user, depth - 1);
+			if (!inner.empty()) out += "{" + inner + "}";
+		}
+		if (out.size() > 900) { out += "..."; break; }
+	}
+	return out;
+}
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
@@ -434,6 +465,19 @@ private:
 	void Store(const Node& node);
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
+	void NoteLoadSite(const Node& node) {
+		if (std::getenv("KYTY_WALKER_DIAG") == nullptr) return;
+		const auto& inst = *node.inst;
+		const auto& mem  = m_plan.memory_info[inst.Flags<MemoryFlags>().index];
+		std::string desc = std::string(ValueOpcodeName(inst.GetOpcode())) + " kind=" +
+		                   std::to_string(static_cast<int>(mem.kind)) + " off=" +
+		                   std::to_string(mem.offset) + " shader=" + std::to_string(m_plan.shader_hash) +
+		                   " uses=" + DescribeUses(inst, 7);
+		// The mov is the last 3 bytes emitted; keep the offset, the code buffer is final.
+		const auto offset = m_code.getSize() - 3u;
+		m_load_sites.emplace_back(offset, std::move(desc));
+	}
+	std::vector<std::pair<size_t, std::string>> m_load_sites;
 	void EmitStrict(const Node& node);
 
 	ResourcePlan&                                     m_plan;
@@ -936,6 +980,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
 			LoadGuest(c, c.rax);
+			NoteLoadSite(node);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -966,6 +1011,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			NoteLoadSite(node);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1363,6 +1409,12 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
+	if (!m_load_sites.empty()) {
+		std::scoped_lock lock {WalkerLoadInfoMutex()};
+		for (auto& [offset, desc]: m_load_sites) {
+			WalkerLoadInfo()[c.getCode() + offset] = std::move(desc);
+		}
+	}
 }
 
 } // namespace
@@ -1374,6 +1426,9 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("WalkSrt");
+#endif
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
@@ -1430,6 +1485,12 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+}
+
+std::string SrtWalkerLoadInfoAt(uint64_t rip) {
+	std::scoped_lock lock {WalkerLoadInfoMutex()};
+	const auto it = WalkerLoadInfo().find(reinterpret_cast<const void*>(rip));
+	return it == WalkerLoadInfo().end() ? std::string("?") : it->second;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

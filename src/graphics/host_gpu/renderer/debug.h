@@ -14,6 +14,7 @@ namespace HW {
 class UserConfig;
 struct ScanModeControl;
 struct ScreenViewport;
+struct RenderTarget;
 } // namespace HW
 
 struct ScissorRect {
@@ -31,6 +32,9 @@ inline bool graphics_debug_dump_enabled() {
 inline uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
 }
+
+// COLOR_INVALID disables the slot even when its address and write mask remain set.
+[[nodiscard]] bool render_target_bound(const HW::RenderTarget& rt);
 
 void        uc_print(const char* func, const HW::UserConfig& uc);
 void        uc_check(const HW::UserConfig& uc);

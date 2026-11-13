@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -188,19 +190,19 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 		forward[axis] = Binary(s, spv::OpFOrdGreaterThanEqual, b, inverse[axis], zero);
 	for (uint32_t child = 0; child < 4; ++child) {
 		const auto box = Box(s, first, second, half, child);
-		Vec3 near, far;
+		Vec3 near_distance, far_distance;
 		for (uint32_t axis = 0; axis < 3; ++axis) {
 			const auto lo = Binary(s, spv::OpFMul, f,
 			    Binary(s, spv::OpFSub, f, box[axis], origin[axis]), inverse[axis]);
 			const auto hi = Binary(s, spv::OpFMul, f,
 			    Binary(s, spv::OpFSub, f, box[axis + 3], origin[axis]), inverse[axis]);
-			near[axis] = Select(s, f, forward[axis], lo, hi);
-			far[axis] = Select(s, f, forward[axis], hi, lo);
+			near_distance[axis] = Select(s, f, forward[axis], lo, hi);
+			far_distance[axis] = Select(s, f, forward[axis], hi, lo);
 		}
 		const auto entry = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(s,
-		    EmitGlsl<GLSLstd450FMax, IR::Type::F32>(s, near[0], near[1]), near[2]);
+		    EmitGlsl<GLSLstd450FMax, IR::Type::F32>(s, near_distance[0], near_distance[1]), near_distance[2]);
 		const auto exit = EmitGlsl<GLSLstd450FMin, IR::Type::F32>(s,
-		    EmitGlsl<GLSLstd450FMin, IR::Type::F32>(s, far[0], far[1]), far[2]);
+		    EmitGlsl<GLSLstd450FMin, IR::Type::F32>(s, far_distance[0], far_distance[1]), far_distance[2]);
 		// Valid hits have nonnegative exit distance. Saturate ULP growth at +infinity.
 		const auto bits = Unary(s, spv::OpBitcast, u, Select(s, f,
 		    Binary(s, spv::OpFOrdEqual, b, exit, zero), zero, exit));
@@ -313,7 +315,29 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
 		const auto first = GetBdaPointer(s, address);
 		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64)));
+			// The two 64-byte blocks of an FP32 box normally share one guest page. Its BDA
+			// entry guarantees contiguous backing within that page, but not across pages.
+			const auto offset = and_bits(Unary(s, spv::OpUConvert, u, address),
+			                             BufferCache::CACHING_PAGESIZE - 1);
+			const auto same_page = Binary(s, spv::OpULessThanEqual, b, offset,
+			                              ConstantU32(s, BufferCache::CACHING_PAGESIZE - 128));
+			const auto local_label = s.builder.AllocateId(), next_label = s.builder.AllocateId();
+			const auto merge = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+			s.builder.AddFunction(spv::OpBranchConditional, same_page, local_label, next_label);
+			EmitLabel(s, local_label);
+			const auto local = Binary(s, spv::OpIAdd, wide, first, ConstantU64(s, 64));
+			s.builder.AddFunction(spv::OpBranch, merge);
+			EmitLabel(s, next_label);
+			const auto next = GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address,
+			                                         ConstantU64(s, 64)));
+			s.builder.AddFunction(spv::OpBranch, merge);
+			EmitLabel(s, merge);
+			const auto result = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpPhi, wide, result, local, local_label, next, next_label);
+			// If the first page is absent, local may be 64. The existing `present` check
+			// below still requires first != 0 before either block can be dereferenced.
+			return result;
 		});
 		const auto present = Binary(
 		    s, spv::OpLogicalAnd, b, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)),

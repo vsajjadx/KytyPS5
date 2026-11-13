@@ -806,6 +806,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_readback_window_512
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=512
+		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
+	add_test(NAME buffer_readback_window_2048
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=2048
+		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
+	add_test(NAME buffer_readback_window_invalid
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=2048junk
+		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -817,6 +826,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -876,6 +886,9 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+if(BUILD_TESTING)
+	add_dependencies(kyty_tests kyty_emulator)
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")

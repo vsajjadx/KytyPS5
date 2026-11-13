@@ -8,6 +8,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <cerrno>
 
 #include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
@@ -196,6 +197,24 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 	} while (FindNextFileW(h, &data) != 0);
 
 	FindClose(h);
+}
+
+int SysFileReplaceFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto src_wide = src.wstring();
+	auto dst_wide = dst.wstring();
+	if (MoveFileExW(src_wide.c_str(), dst_wide.c_str(), MOVEFILE_REPLACE_EXISTING) != 0) {
+		return 0;
+	}
+	switch (GetLastError()) {
+		case ERROR_FILE_NOT_FOUND:
+		case ERROR_PATH_NOT_FOUND: return ENOENT;
+		case ERROR_ACCESS_DENIED:
+		case ERROR_SHARING_VIOLATION: return EACCES;
+		case ERROR_DIR_NOT_EMPTY: return ENOTEMPTY;
+		case ERROR_NOT_SAME_DEVICE: return EXDEV;
+		case ERROR_DISK_FULL: return ENOSPC;
+		default: return EIO;
+	}
 }
 
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {

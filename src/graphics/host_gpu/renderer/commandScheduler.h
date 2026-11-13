@@ -48,6 +48,8 @@ public:
 	// Draws and dispatches recorded into the command buffer that has not been submitted yet.
 	[[nodiscard]] uint32_t         CurrentSubmitWorkCount() const noexcept { return m_submit_work_count; }
 	void                           NoteRecordedWork() noexcept { m_submit_work_count++; }
+	// TEMP DIAG (KYTY_GPU_TIME): attribute GPU time since the previous item to `key`.
+	void                           NoteWorkTiming(uint64_t key);
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }

@@ -228,6 +228,44 @@ static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& s
 	}
 }
 
+// Experimental exact GPU descriptor evaluation. The CPU must make the ring's
+// complete committed mapping resident before the shader follows GPU-produced offsets.
+static bool GpuRingRuntime(const ShaderStageRuntime& stage) {
+	const char* option = std::getenv("KYTY_GPU_RING_RUNTIME");
+	return option != nullptr && option[0] != '\0' && option[0] != '0' &&
+	       stage.module->info.shader_hash == 0x0f28200e45df66dbull;
+}
+
+static void BackGpuRing(RenderContext& context, const ShaderStageRuntime& stage,
+                        const HW::ComputeShaderInfo& regs) {
+	if (!GpuRingRuntime(stage)) return;
+	EXIT_IF(regs.cs_regs.user_sgpr < 2);
+	const uint64_t base = regs.cs_user_sgpr.value[0] |
+	                      uint64_t {regs.cs_user_sgpr.value[1]} << 32u;
+	static std::unordered_map<uint64_t, GuestRange> known;
+	auto found = known.find(base);
+	if (found == known.end() || !context.IsMapped(found->second.address, found->second.size)) {
+		LibKernel::Memory::VirtualQueryInfo query {};
+		const auto status = LibKernel::Memory::KernelVirtualQuery(
+		    reinterpret_cast<const void*>(base), 0, &query, sizeof(query));
+		// Fail closed for this opt-in experiment; never dispatch with incomplete residency.
+		if (status != 0 || !query.is_committed || query.start > base || base >= query.end ||
+		    query.end - query.start > 512ull * 1024 * 1024 ||
+		    !context.IsMapped(query.start, query.end - query.start)) {
+			EXIT("GPU ring runtime: unsupported mapping base=0x%016" PRIx64
+			     " status=%d start=0x%016" PRIx64 " end=0x%016" PRIx64
+			     " committed=%u mapped=%u\n", base, status, uint64_t {query.start},
+			     uint64_t {query.end}, query.is_committed,
+			     query.end > query.start && context.IsMapped(query.start, query.end - query.start));
+		}
+		found = known.insert_or_assign(base, GuestRange {query.start, query.end - query.start}).first;
+		std::fprintf(stderr, "GPU ring resident: base=0x%016" PRIx64
+		             " start=0x%016" PRIx64 " bytes=%" PRIu64 "\n",
+		             base, found->second.address, found->second.size);
+	}
+	context.GetBufferCache().PrepareBdaRange(found->second.address, found->second.size);
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.module->info.bindings.descriptor_counts[
@@ -369,6 +407,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	BackAddressBases(m_context, input_info.stage);
+	BackGpuRing(m_context, input_info.stage, cs_regs);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -383,10 +422,16 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
-	if (HasStorageWrites(input_info, bindings)) {
+	if (GpuRingRuntime(input_info.stage)) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	} else if (HasStorageWrites(input_info, bindings)) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (GameOrderedBarriers()) {
+			UploadToShaderBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		} else {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -472,11 +517,37 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	if (const char* want = std::getenv("KYTY_DUMP_HASH");
+	    want != nullptr && std::strtoull(want, nullptr, 16) == program.shader_hash) {
+		static int logged = 0;
+		if (logged++ < 40) {
+			std::printf("DUMPHASH: dispatch groups=%ux%ux%u threads=%ux%ux%u buffers=%zu images=%zu\n",
+			            thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+			            input_info.threads_num[1], input_info.threads_num[2],
+			            program.info.buffers.size(), program.info.images.size());
+			std::fflush(stdout);
+		}
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
+	m_context.GetCommandScheduler().NoteWorkTiming(input_info.stage.module->info.shader_hash &
+	                                               ~(1ull << 63u));
+	if (const char* want = std::getenv("KYTY_DUMP_HASH");
+	    want != nullptr && std::strtoull(want, nullptr, 16) == input_info.stage.module->info.shader_hash) {
+		static int logged = 0;
+		if (logged++ < 20) {
+			std::printf("DISPMOD hash=%016llx id=%016llx threads=%ux%ux%u\n",
+			            static_cast<unsigned long long>(input_info.stage.module->info.shader_hash),
+			            static_cast<unsigned long long>(input_info.stage.module->id),
+			            input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2]);
+			std::fflush(stdout);
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!GameOrderedBarriers()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 
@@ -511,6 +582,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	BackAddressBases(m_context, input_info.stage);
+	BackGpuRing(m_context, input_info.stage, cs_regs);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
@@ -529,8 +601,14 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
+	if (GpuRingRuntime(input_info.stage)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	} else if (HasStorageWrites(input_info, bindings)) {
+		if (GameOrderedBarriers()) {
+			UploadToShaderBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		} else {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
@@ -544,7 +622,22 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	m_context.GetCommandScheduler().NoteWorkTiming(input_info.stage.module->info.shader_hash &
+	                                               ~(1ull << 63u));
+	if (const char* want = std::getenv("KYTY_DUMP_HASH");
+	    want != nullptr && std::strtoull(want, nullptr, 16) == input_info.stage.module->info.shader_hash) {
+		static int logged = 0;
+		if (logged++ < 20) {
+			std::printf("DISPMOD hash=%016llx id=%016llx threads=%ux%ux%u\n",
+			            static_cast<unsigned long long>(input_info.stage.module->info.shader_hash),
+			            static_cast<unsigned long long>(input_info.stage.module->id),
+			            input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2]);
+			std::fflush(stdout);
+		}
+	}
+	if (!GameOrderedBarriers()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 

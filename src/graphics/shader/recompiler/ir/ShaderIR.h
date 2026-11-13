@@ -78,6 +78,8 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// This read must execute in the shader, including when it feeds a descriptor.
+	bool                    gpu_runtime_only                                      = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
 		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
@@ -132,6 +134,9 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	// End of the bytes the shader can write when every write uses a constant index, offset and
+	// soffset: 0 without writes, UINT32_MAX when a write address depends on run-time values.
+	uint32_t               fixed_write_end = 0;
 
 	bool operator==(const BufferResource& other) const = default;
 };

@@ -5806,7 +5806,7 @@ void TestGatherLodSamplerValidation() {
           (1u << 26u) | (1u << 14u), 2u << 26u, (2u << 26u) | 256u,
           (2u << 26u) | (1u << 14u), 0x0a500000u, 0x1a500000u, 3u << 26u};
       for (const auto control : sampler_controls) {
-        for (const uint32_t perf_mip : {0u, 1u}) {
+        for (const uint32_t perf_mip : {0u, 1u, 15u}) {
           user_data[9] = 0xfff000u | (perf_mip << 24u);
           user_data[10] = control;
           ResourceSnapshot snapshot;
@@ -5818,6 +5818,12 @@ void TestGatherLodSamplerValidation() {
           Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                      specialization) == supported,
                 "explicit gather accepted an unsupported sampler or rejected a valid one");
+          if (supported) {
+            Check(snapshot.samplers.size() == 1u &&
+                      snapshot.samplers[0].dwords[1] == user_data[9] &&
+                      snapshot.samplers[0].dwords[2] == control,
+                  "gather validation rewrote guest controls used by mip selection");
+          }
         }
       }
     }
@@ -9125,7 +9131,7 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9134,6 +9140,14 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    if (argc == 2 && std::strcmp(argv[1], "--materialization-validation-only") == 0) {
+      Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
+      Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+      Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
+      std::cout << "resource materialization validation tests passed\n";
+      return 0;
+    }
+    Check(argc == 1, "unknown resource tracking test option");
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

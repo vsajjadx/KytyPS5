@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/archive.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "ArchiveTestFixture.h"
 #include "FileTimeTestUtil.h"
 #include "common/logging/log.h"
@@ -12,8 +13,11 @@
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -30,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <future>
 #include <limits>
@@ -39,6 +44,12 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && !defined(_TIMESPEC_DEFINED)
+// UCRT already supplies timespec; the bundled legacy winpthread header uses its own guard.
+#define _TIMESPEC_DEFINED
+#endif
+#include <pthread.h>
 
 #if defined(__linux__)
 #include <arpa/inet.h>
@@ -107,6 +118,77 @@ void WaitForMutexTest(Predicate ready) {
   }
 }
 
+struct StaticPthreadRace {
+  Libs::LibKernel::PthreadMutex mutex = nullptr;
+  std::atomic<unsigned> ready{0};
+  std::atomic<bool> start{false};
+  unsigned count = 0;
+};
+
+void* KYTY_SYSV_ABI RunStaticPthreadRace(void* arg) {
+  using namespace Libs::LibKernel;
+  auto& state = *static_cast<StaticPthreadRace*>(arg);
+  state.ready.fetch_add(1);
+  WaitForMutexTest([&] { return state.start.load(); });
+  PthreadMutex identity = nullptr;
+  for (unsigned i = 0; i < 64; ++i) {
+    Check(PthreadMutexLock(&state.mutex) == OK, "race initializes and locks one static mutex");
+    if (identity == nullptr) identity = state.mutex;
+    Check(state.mutex == identity, "initialized static mutex identity remains stable");
+    const auto previous = state.count;
+    std::this_thread::yield();
+    state.count = previous + 1;
+    Check(PthreadMutexUnlock(&state.mutex) == OK, "race unlocks the shared static mutex");
+  }
+  return identity;
+}
+
+void TestStaticPthreadInitialization() {
+  using namespace Libs::LibKernel;
+  Check(PthreadMutexLock(nullptr) == KERNEL_ERROR_EINVAL &&
+            PthreadCondSignal(nullptr) == KERNEL_ERROR_EINVAL &&
+            PthreadRwlockRdlock(nullptr) == KERNEL_ERROR_EINVAL,
+        "lazy pthread frontend preserves null-address errors");
+  constexpr unsigned threads = 4;
+  for (const uintptr_t sentinel : {uintptr_t{0}, uintptr_t{1}}) {
+    // Heap-backed objects have no ELF owner; all first callers race the same slot.
+    auto state = std::make_unique<StaticPthreadRace>();
+    state->mutex = reinterpret_cast<PthreadMutex>(sentinel);
+    std::array<Pthread, threads> workers{};
+    std::array<std::vector<uint8_t>, threads> stacks;
+    for (unsigned i = 0; i < threads; ++i) {
+      stacks[i].resize(1024 * 1024);
+      PthreadAttr attr = nullptr;
+      Check(PthreadAttrInit(&attr) == OK &&
+                PthreadAttrSetstack(&attr, stacks[i].data(), stacks[i].size()) == OK &&
+                PthreadCreate(&workers[i], &attr, RunStaticPthreadRace, state.get(),
+                              "StaticInitRace") == OK && PthreadAttrDestroy(&attr) == OK,
+            "create simultaneous static-initializer callers");
+    }
+    WaitForMutexTest([&] { return state->ready.load() == threads; });
+    state->start = true;
+    std::array<void*, threads> identities{};
+    for (unsigned i = 0; i < threads; ++i)
+      Check(PthreadJoin(workers[i], &identities[i]) == OK, "join static-initializer caller");
+    Check(state->mutex != nullptr && reinterpret_cast<uintptr_t>(state->mutex) != 1 &&
+              state->count == threads * 64 &&
+              std::all_of(identities.begin(), identities.end(),
+                          [&](void* value) { return value == state->mutex; }),
+          "null/adaptive initialization publishes one mutually exclusive object to all callers");
+    Check(PthreadMutexDestroy(&state->mutex) == OK && state->mutex == nullptr,
+          "destroy the single heap-backed initialized mutex");
+  }
+  PthreadCond condition = nullptr;
+  Check(PthreadCondSignal(&condition) == OK && condition != nullptr,
+        "initialize a heap-backed static condition");
+  const auto identity = condition;
+  for (unsigned i = 0; i < 64; ++i)
+    Check(PthreadCondSignal(&condition) == OK && condition == identity,
+          "initialized condition fast path preserves object identity");
+  Check(PthreadCondDestroy(&condition) == OK && condition == nullptr,
+        "destroy the heap-backed static condition");
+}
+
 void TestStaticRwlockDestroy() {
   using namespace Libs::LibKernel;
   PthreadRwlock rwlock = nullptr;
@@ -170,11 +252,174 @@ void QueueMutexWaiter(MutexWaiter &waiter) {
   WaitForMutexTest([&] { return waiter.parked.load() == 1; });
 }
 
-void TestMutexHandoff() {
+void InitializeKernelThreading() {
   using namespace Libs::LibKernel;
   Common::Singleton<Loader::RuntimeLinker>::Instance();
   Initialize();
   PthreadInitSelfForMainThread();
+}
+
+enum class GuestCancellationMode {
+  Deferred, PendingAsync, RunningAsync, DisabledReturn, NormalReturn, AsyncJoin, DestructorExit
+};
+
+struct GuestCancellationState {
+  Libs::LibKernel::PthreadKey key{};
+  GuestCancellationMode mode = GuestCancellationMode::Deferred;
+  Libs::LibKernel::Pthread join_target = nullptr;
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+  std::atomic<unsigned> stage{0};
+  std::atomic<bool> resume{false};
+  std::atomic<unsigned> destructed{0};
+  std::atomic<unsigned> native_cleanup{0};
+};
+
+void KYTY_SYSV_ABI DestructGuestCancellationState(void* arg) {
+  auto& state = *static_cast<GuestCancellationState*>(arg);
+  Check(state.native_cleanup == 1, "nested native cleanup runs before guest TLS destruction");
+  state.destructed++;
+  if (state.mode == GuestCancellationMode::DestructorExit)
+    Libs::LibKernel::PthreadExit(reinterpret_cast<void*>(uintptr_t{0x2468}));
+}
+
+void NativeGuestCancellationCleanup(void* arg) {
+  static_cast<GuestCancellationState*>(arg)->native_cleanup++;
+}
+
+void* KYTY_SYSV_ABI RunGuestCancellationBody(void* arg) {
+  using namespace Libs::LibKernel;
+  auto& state = *static_cast<GuestCancellationState*>(arg);
+  int previous = -1;
+  const bool asynchronous = state.mode == GuestCancellationMode::PendingAsync ||
+                            state.mode == GuestCancellationMode::RunningAsync ||
+                            state.mode == GuestCancellationMode::AsyncJoin;
+  Check(PthreadSetcanceltype(asynchronous ? 2 : 0, &previous) == OK && previous == 0 &&
+            PthreadSetcancelstate(1, &previous) == OK && previous == 0 &&
+            PthreadSetspecific(state.key, &state) == OK,
+        "disable deferred cancellation on the guest stack and install its destructor");
+  if (state.mode == GuestCancellationMode::RunningAsync ||
+      state.mode == GuestCancellationMode::AsyncJoin) {
+    Check(PthreadSetcancelstate(0, nullptr) == OK, "enable asynchronous cancellation");
+    state.stage = 1;
+    if (state.mode == GuestCancellationMode::AsyncJoin) {
+      PthreadJoin(state.join_target, nullptr);
+      Check(false, "a canceled native join never returns to guest code");
+    }
+    while (!state.resume.load()) {}
+    Check(false, "asynchronous cancellation never resumes guest execution");
+  }
+  state.stage = 1;
+  WaitForMutexTest([&] { return state.resume.load(); });
+  PthreadTestcancel();
+  state.stage = 2;
+  if (state.mode == GuestCancellationMode::DisabledReturn) {
+    state.stage = 3;
+    return reinterpret_cast<void*>(uintptr_t{0xdeadbeef});
+  }
+  Check(PthreadSetcancelstate(0, &previous) == OK && previous == 1,
+        "restore enabled cancellation without discarding the pending request");
+  state.stage = 3;
+  if (state.mode == GuestCancellationMode::NormalReturn ||
+      state.mode == GuestCancellationMode::DestructorExit)
+    return reinterpret_cast<void*>(uintptr_t{0xdeadbeef});
+  PthreadTestcancel();
+  Check(false, "a pending enabled cancellation never returns to guest code");
+  return nullptr;
+}
+
+void* KYTY_SYSV_ABI RunGuestCancellation(void* arg) {
+  void* value = nullptr;
+  pthread_cleanup_push(NativeGuestCancellationCleanup, arg);
+  value = RunGuestCancellationBody(arg);
+  pthread_cleanup_pop(1);
+  return value;
+}
+
+struct GuestCancellationJoinTarget {
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+  std::atomic<bool> ready{false}, release{false};
+};
+
+void* KYTY_SYSV_ABI RunGuestCancellationJoinTarget(void* arg) {
+  auto& target = *static_cast<GuestCancellationJoinTarget*>(arg);
+  target.ready = true;
+  WaitForMutexTest([&] { return target.release.load(); });
+  return reinterpret_cast<void*>(uintptr_t{0x5a5a});
+}
+
+void TestGuestCancellation(GuestCancellationMode mode) {
+  using namespace Libs::LibKernel;
+  std::fprintf(stderr, "KernelFileSystemTests: BEGIN guest cancellation mode %u\n",
+               static_cast<unsigned>(mode));
+  GuestCancellationState state;
+  state.mode = mode;
+  PthreadAttr attr = nullptr;
+  Pthread thread = nullptr;
+  GuestCancellationJoinTarget join_target;
+  if (mode == GuestCancellationMode::AsyncJoin) {
+    Check(PthreadAttrInit(&attr) == OK &&
+              PthreadAttrSetstack(&attr, join_target.stack.data(), join_target.stack.size()) == OK &&
+              PthreadCreate(&state.join_target, &attr, RunGuestCancellationJoinTarget,
+                            &join_target, "CancelJoinTarget") == OK &&
+              PthreadAttrDestroy(&attr) == OK,
+          "create a live target for the canceled native join");
+    WaitForMutexTest([&] { return join_target.ready.load(); });
+  }
+  Check(PthreadKeyCreate(&state.key, DestructGuestCancellationState) == OK &&
+            PthreadAttrInit(&attr) == OK &&
+            PthreadAttrSetstack(&attr, state.stack.data(), state.stack.size()) == OK &&
+            PthreadCreate(&thread, &attr, RunGuestCancellation, &state, "GuestCancel") == OK &&
+            PthreadAttrDestroy(&attr) == OK,
+        "create a cancellation fixture with a caller-provided guest stack");
+  WaitForMutexTest([&] { return state.stage.load() == 1; });
+  if (mode == GuestCancellationMode::AsyncJoin)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  if (mode != GuestCancellationMode::NormalReturn && mode != GuestCancellationMode::DestructorExit)
+    Check(PthreadCancel(thread) == OK, "queue a guest cancellation request");
+  std::fprintf(stderr, "KernelFileSystemTests: guest cancellation mode %u; joining waiter\n",
+               static_cast<unsigned>(mode));
+  if (mode == GuestCancellationMode::AsyncJoin) join_target.release = true;
+  if (mode != GuestCancellationMode::RunningAsync && mode != GuestCancellationMode::AsyncJoin)
+    state.resume = true;
+  else WaitForMutexTest([&] { return state.destructed.load() == 1; });
+  void* value = nullptr;
+  const bool normal_return = mode == GuestCancellationMode::NormalReturn ||
+                             mode == GuestCancellationMode::DisabledReturn;
+  const unsigned stage = mode == GuestCancellationMode::RunningAsync ||
+                         mode == GuestCancellationMode::AsyncJoin ? 1u :
+                         mode == GuestCancellationMode::PendingAsync ? 2u : 3u;
+  const auto expected = mode == GuestCancellationMode::DestructorExit ? uintptr_t{0x2468} :
+                        normal_return ? uintptr_t{0xdeadbeef} : GuestPthreadCanceledValue;
+  const auto joined = PthreadJoin(thread, &value);
+  std::fprintf(stderr,
+               "KernelFileSystemTests: END mode %u join=%d value=%p stage=%u native=%u tls=%u\n",
+               static_cast<unsigned>(mode), joined, value, state.stage.load(),
+               state.native_cleanup.load(), state.destructed.load());
+  Check(joined == OK &&
+            value == reinterpret_cast<void*>(expected) &&
+            state.stage == stage && state.destructed == 1 && state.native_cleanup == 1 &&
+            PthreadKeyDelete(state.key) == OK,
+        "guest cancellation preserves state, return values and exactly-once cleanup");
+  if (mode == GuestCancellationMode::AsyncJoin) {
+    Check(PthreadJoin(state.join_target, &value) == OK &&
+              value == reinterpret_cast<void*>(uintptr_t{0x5a5a}),
+          "canceling a native join leaves its target joinable with its original result");
+  }
+}
+
+void TestGuestCancellations() {
+  for (const auto mode : {GuestCancellationMode::Deferred, GuestCancellationMode::PendingAsync,
+                          GuestCancellationMode::RunningAsync,
+                          GuestCancellationMode::DisabledReturn,
+                          GuestCancellationMode::NormalReturn,
+                          GuestCancellationMode::AsyncJoin,
+                          GuestCancellationMode::DestructorExit})
+    TestGuestCancellation(mode);
+}
+
+void TestMutexHandoff() {
+  using namespace Libs::LibKernel;
+  InitializeKernelThreading();
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
@@ -244,7 +489,8 @@ void TestMutexHandoff() {
   waiter.resume = 2;
   void *result = nullptr;
   Check(PthreadJoin(waiter.thread, &result) == OK &&
-            result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
+            result == reinterpret_cast<void *>(GuestPthreadCanceledValue) &&
+            waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
@@ -771,6 +1017,178 @@ void TestFsync() {
   }
 }
 
+void TestPathPrefixErrors() {
+  namespace Kernel = Libs::LibKernel;
+  constexpr char File[] = "/savedata0/prefix-file.dat";
+  constexpr char Payload[] = "keep";
+  const int fd = FileSystem::KernelOpen(File, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+                       sizeof(Payload) - 1,
+        "populate prefix-error fixture");
+  FileSystem::FileStat stat {};
+  for (const char* path : {"/savedata0/prefix-file.dat/child",
+                           "/savedata0/prefix-file.dat/child/grandchild"}) {
+    Check(FileSystem::KernelOpen(path, 0, 0) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelOpen(path, 0x601, 0777) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelStat(path, &stat) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelUnlink(path) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelMkdir(path, 0777) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelRmdir(path) == Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelRename(path, "/savedata0/prefix-out.dat") ==
+                  Kernel::KERNEL_ERROR_ENOTDIR &&
+              FileSystem::KernelRename(File, path) == Kernel::KERNEL_ERROR_ENOTDIR,
+          "a regular file used as a directory prefix reports ENOTDIR");
+  }
+  Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == sizeof(Payload) - 1 &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "prefix errors leave the file's size and descriptor position unchanged");
+  for (const char* path : {"/savedata0/prefix-missing.dat",
+                           "/savedata0/prefix-missing/child"}) {
+    Check(FileSystem::KernelOpen(path, 0, 0) == Kernel::KERNEL_ERROR_ENOENT &&
+              FileSystem::KernelStat(path, &stat) == Kernel::KERNEL_ERROR_ENOENT &&
+              FileSystem::KernelUnlink(path) == Kernel::KERNEL_ERROR_ENOENT &&
+              FileSystem::KernelRmdir(path) == Kernel::KERNEL_ERROR_ENOENT,
+          "a missing path below a directory stays ENOENT");
+  }
+  Check(FileSystem::KernelOpen("/savedata0/prefix-missing/new.dat", 0x601, 0777) ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelMkdir("/savedata0/prefix-missing/child", 0777) ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelStat("/savedata0/prefix-missing", &stat) ==
+                Kernel::KERNEL_ERROR_ENOENT,
+        "O_CREAT and mkdir create only the last component (no missing parents)");
+  Check(FileSystem::KernelClose(fd) == OK && FileSystem::KernelUnlink(File) == OK,
+        "remove prefix-error fixture");
+}
+
+void TestRenameSemantics() {
+  namespace Kernel = Libs::LibKernel;
+  constexpr char A[] = "/savedata0/rename-a.dat";
+  constexpr char B[] = "/savedata0/rename-b.dat";
+  constexpr char D[] = "/savedata0/rename-dir";
+  constexpr char E[] = "/savedata0/rename-dir2";
+  const auto write_file = [](const char* path, std::string_view text) {
+    const int fd = FileSystem::KernelOpen(path, 0x602, 0777);
+    const bool ok = fd >= 3 &&
+                    FileSystem::KernelWrite(fd, text.data(), text.size()) ==
+                        static_cast<int64_t>(text.size()) &&
+                    FileSystem::KernelClose(fd) == OK;
+    return ok;
+  };
+  const auto read_file = [](const char* path) {
+    std::string text(64, '\0');
+    const int fd = FileSystem::KernelOpen(path, 0, 0);
+    if (fd < 3) return std::string("<open failed>");
+    const auto n = FileSystem::KernelRead(fd, text.data(), text.size());
+    FileSystem::KernelClose(fd);
+    text.resize(n < 0 ? 0 : static_cast<size_t>(n));
+    return text;
+  };
+  FileSystem::FileStat stat {};
+
+  Check(write_file(A, "alpha") && write_file(B, "bravo-old"), "populate rename fixtures");
+  Check(FileSystem::KernelRename(A, B) == OK && read_file(B) == "alpha" &&
+            FileSystem::KernelStat(A, &stat) == Kernel::KERNEL_ERROR_ENOENT,
+        "rename atomically replaces an existing destination file");
+
+  // A failing rename must not destroy the destination (no delete-before-rename).
+  Check(FileSystem::KernelRename("/savedata0/rename-missing.dat", B) ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            read_file(B) == "alpha",
+        "a failed rename leaves the destination intact");
+  Check(FileSystem::KernelRename(B, "/savedata0/rename-nodir/b.dat") ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            read_file(B) == "alpha" &&
+            FileSystem::KernelStat("/savedata0/rename-nodir", &stat) ==
+                Kernel::KERNEL_ERROR_ENOENT,
+        "rename does not create a missing destination directory");
+  Check(FileSystem::KernelRename(B, B) == OK && read_file(B) == "alpha",
+        "renaming a file onto itself is a no-op");
+
+  Check(FileSystem::KernelMkdir(D, 0777) == OK && write_file("/savedata0/rename-dir/in.dat", "x"),
+        "populate directory fixture");
+  Check(FileSystem::KernelRename(D, E) == OK &&
+            FileSystem::KernelStat(D, &stat) == Kernel::KERNEL_ERROR_ENOENT &&
+            read_file("/savedata0/rename-dir2/in.dat") == "x",
+        "rename moves a directory with its contents");
+  Check(FileSystem::KernelRename(E, B) == Kernel::KERNEL_ERROR_ENOTDIR &&
+            FileSystem::KernelRename(B, E) == Kernel::KERNEL_ERROR_EISDIR &&
+            read_file(B) == "alpha" && read_file("/savedata0/rename-dir2/in.dat") == "x",
+        "directory/file type mismatches fail without changing either side");
+  // Directory onto an EMPTY directory: POSIX replaces it atomically; Windows has no atomic
+  // directory replace, so it must fail and leave BOTH directories exactly as they were.
+  Check(FileSystem::KernelMkdir(D, 0777) == OK, "create empty destination directory");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Check(FileSystem::KernelRename(E, D) == Kernel::KERNEL_ERROR_EACCES &&
+            FileSystem::KernelStat(D, &stat) == OK && (stat.st_mode & 0170000u) == 0040000u &&
+            read_file("/savedata0/rename-dir2/in.dat") == "x",
+        "an unsupported directory replace fails without deleting the empty destination");
+  Check(FileSystem::KernelRmdir(D) == OK && FileSystem::KernelRename(E, D) == OK,
+        "move the directory once the destination is gone");
+#else
+  Check(FileSystem::KernelRename(E, D) == OK &&
+            read_file("/savedata0/rename-dir/in.dat") == "x" &&
+            FileSystem::KernelStat(E, &stat) == Kernel::KERNEL_ERROR_ENOENT,
+        "a directory atomically replaces an empty directory");
+#endif
+  Check(FileSystem::KernelMkdir(E, 0777) == OK &&
+            FileSystem::KernelRename(E, D) == Kernel::KERNEL_ERROR_ENOTEMPTY &&
+            read_file("/savedata0/rename-dir/in.dat") == "x" &&
+            FileSystem::KernelStat(E, &stat) == OK,
+        "a non-empty destination directory is never replaced");
+
+  // A directory cannot move below itself; the existing descendant must survive.
+  constexpr char P[] = "/savedata0/rename-parent";
+  constexpr char PEmpty[] = "/savedata0/rename-parent/empty";
+  Check(FileSystem::KernelMkdir(P, 0777) == OK && FileSystem::KernelMkdir(PEmpty, 0777) == OK,
+        "create parent/descendant fixture");
+  Check(FileSystem::KernelRename(P, PEmpty) == Kernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelStat(PEmpty, &stat) == OK &&
+            (stat.st_mode & 0170000u) == 0040000u && FileSystem::KernelStat(P, &stat) == OK,
+        "moving a directory onto its existing descendant fails and keeps the descendant");
+  Check(FileSystem::KernelRename(P, "/savedata0/rename-parent/new") ==
+                Kernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelStat("/savedata0/rename-parent/new", &stat) ==
+                Kernel::KERNEL_ERROR_ENOENT,
+        "moving a directory below itself fails and creates nothing");
+  // Mount roots cannot be renamed or replaced, in either direction, with any spelling.
+  const auto mount_dir = std::filesystem::temp_directory_path() / "kyty-rename-mount";
+  std::error_code mount_error;
+  std::filesystem::remove_all(mount_dir, mount_error);
+  Check(std::filesystem::create_directories(mount_dir, mount_error) && !mount_error,
+        "create a second writable mount on the same volume");
+  FileSystem::Mount(mount_dir, "/renamemnt0");
+  Check(FileSystem::KernelRename("/savedata0", "/renamemnt0") == Kernel::KERNEL_ERROR_EBUSY &&
+            FileSystem::KernelRename("/savedata0/", "/savedata0-moved") ==
+                Kernel::KERNEL_ERROR_EBUSY &&
+            FileSystem::KernelRename("/renamemnt0", "/savedata0/inside") ==
+                Kernel::KERNEL_ERROR_EBUSY &&
+            FileSystem::KernelRename(B, "/renamemnt0") == Kernel::KERNEL_ERROR_EBUSY &&
+            FileSystem::KernelRename(B, "/savedata0") == Kernel::KERNEL_ERROR_EBUSY,
+        "rename rejects a mount root as source or destination");
+  Check(FileSystem::KernelRename("/savedata0/.", "/renamemnt0/moved") ==
+                Kernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelRename("/renamemnt0/..", "/savedata0/moved") ==
+                Kernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelRename(B, "/savedata0/.") == Kernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelRename(B, "/renamemnt0/x/..") == Kernel::KERNEL_ERROR_EINVAL,
+        "terminal dot and dot-dot aliases are rejected like in rmdir");
+  Check(FileSystem::KernelStat("/savedata0", &stat) == OK &&
+            (stat.st_mode & 0170000u) == 0040000u &&
+            FileSystem::KernelStat("/renamemnt0", &stat) == OK && read_file(B) == "alpha" &&
+            std::filesystem::is_directory(mount_dir) &&
+            FileSystem::KernelStat("/savedata0/inside", &stat) == Kernel::KERNEL_ERROR_ENOENT,
+        "mount roots, their mappings and the rename source stay intact");
+  FileSystem::Umount("/renamemnt0");
+  std::filesystem::remove_all(mount_dir, mount_error);
+
+  Check(FileSystem::KernelRmdir(PEmpty) == OK && FileSystem::KernelRmdir(P) == OK &&
+            FileSystem::KernelRmdir(E) == OK &&
+            FileSystem::KernelUnlink("/savedata0/rename-dir/in.dat") == OK &&
+            FileSystem::KernelRmdir(D) == OK && FileSystem::KernelUnlink(B) == OK,
+        "remove rename fixtures");
+}
+
 void TestSaveTruncate() {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -811,6 +1229,22 @@ void TestSaveTruncate() {
             FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
             FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
         "path truncate errors preserve file size and descriptor position");
+  // Each missing prefix must be classified even when several children remain.
+  for (const auto& [path, expected] : {
+           std::pair{"/savedata0/truncate-save.dat/child", Kernel::KERNEL_ERROR_ENOTDIR},
+           std::pair{"/savedata0/truncate-save.dat/child/grandchild", Kernel::KERNEL_ERROR_ENOTDIR},
+           std::pair{"/savedata0/missing-directory/grandchild", Kernel::KERNEL_ERROR_ENOENT},
+           std::pair{"/savedata0/missing-directory/child/grandchild", Kernel::KERNEL_ERROR_ENOENT}}) {
+    Check(truncate(path, 0) == expected,
+          (std::string("path truncate classifies missing ancestors: ") + path).c_str());
+    bytes.fill('x');
+    Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+              FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1 &&
+              FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+              std::memcmp(bytes.data(), Payload, 3) == 0 &&
+              std::all_of(bytes.begin() + 3, bytes.end(), [](char byte) { return byte == 0; }),
+          "ancestor errors preserve file contents, size and descriptor position");
+  }
   Check(truncate("/dev/urandom", 0) == OK,
         "path truncate is a no-op for a nonregular nondirectory file");
   std::string long_path = "/savedata0";
@@ -899,6 +1333,138 @@ void TestSaveWritev() {
         "append writes retain the original contents and ordered segments");
   Check(FileSystem::KernelClose(append) == OK && FileSystem::KernelClose(fd) == OK,
         "close vectored write fixtures");
+}
+
+void TestProtectedGuestWrites(Libs::Graphics::RenderContext& context,
+                              const std::filesystem::path& root) {
+  std::fprintf(stderr, "KernelFileSystemTests: entered protected-write fixture\n");
+  namespace Kernel = Libs::LibKernel;
+  namespace Memory = Kernel::Memory;
+  namespace Exception = Common::HostException;
+  constexpr uint64_t Page = Libs::Graphics::BufferCache::CACHING_PAGESIZE;
+  constexpr uint64_t Allocation = 3 * Page;
+  Check(Exception::InstallHandler([](const Exception::ExceptionInfo& info) {
+    if (info.type != Exception::ExceptionType::AccessViolation ||
+        (info.access_violation_type != Exception::AccessViolationType::Read &&
+         info.access_violation_type != Exception::AccessViolationType::Write)) return false;
+    return Memory::HandleGpuFault(
+        info.access_violation_type == Exception::AccessViolationType::Write
+            ? Libs::Graphics::PageFaultAccess::Write : Libs::Graphics::PageFaultAccess::Read,
+        info.access_violation_vaddr);
+  }), "install production GPU memory fault route for file writes");
+  Libs::Graphics::HW::Context registers{};
+  Libs::Graphics::HW::UserConfig user_config{};
+  Libs::Graphics::HW::Shader shaders{};
+  context.GetCommandScheduler().Begin(registers, user_config, shaders);
+  context.InitializeGpu(nullptr);
+  int64_t direct = -1;
+  void* mapped = nullptr;
+  Check(Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), Allocation,
+                                           Page, 0, &direct) == OK &&
+            Memory::KernelMapDirectMemory(&mapped, Allocation, 0x3, 0, direct, Page) == OK,
+        "allocate protected file source");
+  const auto base = reinterpret_cast<uint64_t>(mapped);
+  const auto* source = static_cast<const uint8_t*>(mapped) + Page - 17;
+  constexpr uint32_t Size = Page + 34;
+  std::vector<uint8_t> expected(Size, 0xa5);
+  // Keep both outer pages CPU-owned, with the middle page containing newer GPU data than its
+  // guest backing. A host syscall cannot fault it in; a user-mode copy must download it.
+  const auto prepare = [&](uint32_t value) {
+    std::memset(mapped, 0xa5, Allocation);
+    context.GetGpu().SendCommandSync([&] {
+      auto& scheduler = context.GetCommandScheduler();
+      auto& cache = context.GetBufferCache();
+      auto [buffer, offset] = cache.ObtainBuffer(base + Page, Page, true, true);
+      buffer->Fill(offset, Page, value);
+      scheduler.Finish();
+      Check(cache.HasGpuDirtyBytes(base + Page, Page), "file source remains GPU-owned");
+    });
+    for (size_t offset = 17; offset < 17 + Page; offset += sizeof(value))
+      std::memcpy(expected.data() + offset, &value, sizeof(value));
+  };
+  prepare(0x11223344);
+  {
+    Common::File raw;
+    Check(raw.Create(root / "protected-write-probe.dat"),
+          "create raw host write probe");
+    uint32_t written = 0;
+    raw.Write(source, Size, &written);
+    std::fprintf(stderr, "KernelFileSystemTests: raw protected write returned %u/%u bytes\n",
+                 written, Size);
+    Check(written < Size, "raw host write cannot read the GPU-protected source");
+    raw.Close();
+  }
+  const int fd = FileSystem::KernelOpen("/savedata0/protected-write.dat", 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "_", 1) == 1,
+        "create protected-write fixture with a prefix");
+  const auto first_write = FileSystem::KernelWrite(fd, source, Size);
+  std::fprintf(stderr, "KernelFileSystemTests: guest protected write returned %lld/%u bytes\n",
+               static_cast<long long>(first_write), Size);
+  Check(first_write == Size &&
+            FileSystem::KernelLseek(fd, 0, 1) == Size + 1,
+        "write completes every GPU-protected source byte and advances the cursor");
+  std::vector<uint8_t> actual(Size + 1);
+  Check(FileSystem::KernelPread(fd, actual.data(), actual.size(), 0) == actual.size() &&
+            actual[0] == '_' && std::equal(expected.begin(), expected.end(), actual.begin() + 1),
+        "write preserves the prefix and the latest GPU bytes across page boundaries");
+
+  prepare(0x55667788);
+  Check(FileSystem::KernelLseek(fd, 5, 0) == 5 &&
+            FileSystem::KernelPwrite(fd, source, Size, 1) == Size &&
+            FileSystem::KernelLseek(fd, 0, 1) == 5 &&
+            FileSystem::KernelPread(fd, actual.data(), actual.size(), 0) == actual.size() &&
+            actual[0] == '_' && std::equal(expected.begin(), expected.end(), actual.begin() + 1),
+        "pwrite resolves fresh GPU data while preserving the descriptor cursor");
+
+  prepare(0x90abcdef);
+  const std::array<FileSystem::KernelIovec, 4> vectors{{
+      {const_cast<char*>("A"), 1}, {const_cast<uint8_t*>(source), Size},
+      {nullptr, 0}, {const_cast<char*>("B"), 1}}};
+  Check(FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelWritev(fd, vectors.data(), vectors.size()) == Size + 2 &&
+            FileSystem::KernelLseek(fd, 0, 1) == Size + 2,
+        "writev preserves segment ordering around a GPU-protected segment");
+  actual.resize(Size + 2);
+  Check(FileSystem::KernelPread(fd, actual.data(), actual.size(), 0) == actual.size() &&
+            actual.front() == 'A' && actual.back() == 'B' &&
+            std::equal(expected.begin(), expected.end(), actual.begin() + 1),
+        "writev writes all latest GPU bytes and neither loses nor duplicates surrounding bytes");
+
+  prepare(0x12345678);
+  Check(FileSystem::KernelLseek(fd, 7, 0) == 7 &&
+            FileSystem::KernelPwritev(fd, vectors.data(), vectors.size(), 0) == Size + 2 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 7 &&
+            FileSystem::KernelPread(fd, actual.data(), actual.size(), 0) == actual.size() &&
+            actual.front() == 'A' && actual.back() == 'B' &&
+            std::equal(expected.begin(), expected.end(), actual.begin() + 1),
+        "pwritev resolves protected segments without moving the descriptor cursor");
+
+  const std::array<FileSystem::KernelIovec, 2> invalid{{
+      {const_cast<char*>("X"), 1}, {nullptr, 1}}};
+  Check(FileSystem::KernelWritev(fd, invalid.data(), invalid.size()) == Kernel::KERNEL_ERROR_EFAULT &&
+            FileSystem::KernelLseek(fd, 0, 1) == 7,
+        "invalid write vectors still fail before any segment or cursor changes");
+  Check(FileSystem::KernelWrite(fd, reinterpret_cast<const void*>(UINTPTR_MAX - 3), 8) == 0 &&
+            FileSystem::KernelWrite(fd, reinterpret_cast<const void*>(UINTPTR_MAX), 0) == 0 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 7,
+        "overflowing source ranges fail without wrapping and zero-length writes stay empty");
+  const std::array<FileSystem::KernelIovec, 3> partial{{
+      {const_cast<char*>("Q"), 1}, {reinterpret_cast<void*>(1), 1},
+      {const_cast<char*>("R"), 1}}};
+  Check(FileSystem::KernelFtruncate(fd, 0) == OK && FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelWritev(fd, partial.data(), partial.size()) == 1 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 1,
+        "a genuinely inaccessible source stops writev at the completed prefix");
+  uint8_t prefix = 0;
+  Check(FileSystem::KernelPread(fd, &prefix, 1, 0) == 1 && prefix == 'Q' &&
+            FileSystem::KernelPread(fd, &prefix, 1, 1) == 0,
+        "partial writes never append subsequent vectors or duplicate the prefix");
+  Check(FileSystem::KernelClose(fd) == OK, "close protected write fixture");
+  Check(Memory::KernelMunmap(base, Allocation) == OK &&
+            Memory::KernelReleaseDirectMemory(direct, Allocation) == OK,
+        "release protected file source");
+  context.ShutdownGpu();
+  context.GetCommandScheduler().Finish();
 }
 
 void TestAioBatches() {
@@ -1328,6 +1894,11 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
                 Libs::LibKernel::KERNEL_ERROR_EROFS,
         "archive mount rejects path mutations");
+  Check(FileSystem::KernelRename("/app0", "/app0/renamed") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRename("/app0/", "/savedata0/renamed-archive") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS,
+        "an archive mount root keeps EROFS priority over the mount-root EBUSY rule");
   FileSystem::Umount("/app0");
   Check(FileSystem::GetRealFilename(GuestMember).empty() &&
             FileSystem::KernelOpen(GuestMember, 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
@@ -2189,12 +2760,19 @@ void TestNetCtlHostIpv4() {
 }
 #endif
 
+// Which RecordNpState instantiation ran last. Storing the template argument also makes the
+// four bodies differ, so linker identical-code folding (/OPT:ICF, on by default for this
+// release test link) cannot merge them into one address: NP registration rejects a second
+// registration of the same callback pointer, exactly as it should.
+static int g_np_last_callback_mode = -1;
+
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
   auto& event = *static_cast<std::array<int, 3>*>(arg);
   ++event[0];
   event[1] = user_id;
   event[2] = static_cast<int>(state);
+  g_np_last_callback_mode = Mode;
 }
 
 void TestNpEmulation() {
@@ -2248,6 +2826,10 @@ void TestNpEmulation() {
   static std::array<std::array<int, 3>, 4> events {};
   const std::array<NpStateCallbackA, 4> callbacks {
       RecordNpState<0>, RecordNpState<1>, RecordNpState<2>, RecordNpState<3>};
+  for (size_t i = 0; i < callbacks.size(); ++i)
+    for (size_t j = i + 1; j < callbacks.size(); ++j)
+      Check(callbacks[i] != callbacks[j],
+            "NP fixture callbacks keep distinct addresses (not folded by the linker)");
   int mode = 0;
   for (bool network : {false, true}) {
     int previous_network_state = -1;
@@ -2266,8 +2848,10 @@ void TestNpEmulation() {
       previous_network_state = network_state;
       const bool connected = network_state == 3;
 
+      g_np_last_callback_mode = -1;
       Check(NpRegisterStateCallbackA(callbacks[mode], &events[mode]) > 0 &&
-                NpCheckCallback() == OK && events[mode][0] == 1 &&
+                NpCheckCallback() == OK && g_np_last_callback_mode == mode &&
+                events[mode][0] == 1 &&
                 events[mode][1] == Config::GetUserId() &&
                 events[mode][2] == (emulate ? 2 : 1),
             "initial NP callback matches the selected emulated sign-in state");
@@ -2807,6 +3391,13 @@ void CheckSocketWakeup() {
 } // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
+  const bool protected_writes_only =
+      argc == 2 && std::string_view(argv[1]) == "--protected-writes-only";
+  const bool cancellation_only =
+      argc == 2 && std::string_view(argv[1]) == "--pthread-cancel-only";
+  if (protected_writes_only || cancellation_only)
+    std::fprintf(stderr, "KernelFileSystemTests: entered focused test main\n");
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -2826,16 +3417,36 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  TestMutexHandoff();
-  TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  if (cancellation_only) {
+    InitializeKernelThreading();
+    std::fprintf(stderr, "KernelFileSystemTests: initialized guest cancellation fixture\n");
+    TestGuestCancellations();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: guest cancellation passed\n");
+    return 0;
+  }
+  if (protected_writes_only) {
+    InitializeKernelThreading();
+    std::fprintf(stderr, "KernelFileSystemTests: initialized focused file-write kernel state\n");
+  } else {
+    TestMutexHandoff();
+    TestStaticPthreadInitialization();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    TestGuestCancellations();
+#endif
+    TestStaticRwlockDestroy();
+    TestPendingSignalDispatch();
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
     return 0;
   }
 
+  if (protected_writes_only)
+    std::fprintf(stderr, "KernelFileSystemTests: initializing protected-write Vulkan context\n");
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
+  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
   graphics->graphic_ctx.screen_width = 64;
   graphics->graphic_ctx.screen_height = 64;
@@ -2843,10 +3454,21 @@ int main(int argc, char** argv) {
                                       SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
   Check(graphics->window != nullptr, "create hidden Vulkan test window");
   graphics->CreateVulkan();
+  if (protected_writes_only)
+    std::fprintf(stderr, "KernelFileSystemTests: created protected-write Vulkan context\n");
 
   TempDirectory temporary;
-  CheckOpenFileCoherence(temporary.Path());
+  if (!protected_writes_only) CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
+  if (protected_writes_only) {
+    FileSystem::Mount(temporary.Path(), "/savedata0");
+    TestProtectedGuestWrites(*graphics->render_context, temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: protected file writes passed\n");
+    return 0;
+  }
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
   TestAddContent(temporary.Path());
@@ -2864,7 +3486,10 @@ int main(int argc, char** argv) {
   TestStatTimes();
   TestFsync();
   TestSaveTruncate();
+  TestPathPrefixErrors();
+  TestRenameSemantics();
   TestSaveWritev();
+  TestProtectedGuestWrites(*graphics->render_context, temporary.Path());
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

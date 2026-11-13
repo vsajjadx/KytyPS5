@@ -1107,6 +1107,28 @@ static int ConvertSocketOptionName(int level, int option) {
 		return TCP_NODELAY;
 	}
 #if defined(_WIN32)
+	if (level == 0xffff) {
+		// Winsock shares BSD's SOL_SOCKET numbers only for these options; any other value
+		// would reach Winsock with an unrelated or undefined meaning, so it is ENOPROTOOPT
+		// like on the guest and on Linux.
+		switch (option) {
+			case 0x0001: // SO_DEBUG
+			case 0x0002: // SO_ACCEPTCONN
+			case 0x0008: // SO_KEEPALIVE
+			case 0x0010: // SO_DONTROUTE
+			case 0x0040: // SO_USELOOPBACK (WinSock2.h: same BSD value)
+			case 0x0080: // SO_LINGER
+			case 0x0100: // SO_OOBINLINE
+			case 0x1003: // SO_SNDLOWAT
+			case 0x1004: // SO_RCVLOWAT
+			case 0x1005: // SO_SNDTIMEO (BSD number; kept as before)
+			case 0x1006: // SO_RCVTIMEO (used by the receive-timeout fixtures)
+			case 0x1008: // SO_TYPE
+				return option;
+			default: return -1;
+		}
+	}
+	// Other levels keep the existing pass-through (unchanged by this whitelist).
 	return option;
 #else
 	return -1;

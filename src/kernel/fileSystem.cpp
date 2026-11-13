@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -188,6 +190,10 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	}
 	return bytes;
 }
+
+static int MissingPathError(const std::filesystem::path& real_name);
+static int MissingNodeError(const std::filesystem::path& real_name);
+static int CreationParentError(const std::filesystem::path& real_name);
 
 static int PosixToKernel(int posix_errno) {
 	return KERNEL_ERROR_UNKNOWN + posix_errno;
@@ -531,10 +537,19 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	const bool dir_exist = info && !info->is_file;
 	const bool file_exist = info && info->is_file;
 
-	// A missing path opened without O_CREAT is ENOENT
+	// A missing path opened without O_CREAT is ENOENT, or ENOTDIR below a non-directory.
 	if (!creat && !dir_exist && !file_exist) {
+		// DeleteDescriptor frees `file`; classify the path first.
+		const int error = MissingNodeError(file->real_name);
 		g_files->DeleteDescriptor(descriptor);
-		return KERNEL_ERROR_ENOENT;
+		return error;
+	}
+	// O_CREAT creates only the last component (POSIX); its parent must be a directory.
+	if (creat && !dir_exist && !file_exist) {
+		if (const int error = CreationParentError(file->real_name); error != OK) {
+			g_files->DeleteDescriptor(descriptor);
+			return error;
+		}
 	}
 
 	if (directory || dir_exist) {
@@ -567,7 +582,6 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 
 		if (creat && (!file_exist || trunc)) {
-			Common::File::CreateDirectories(file->real_name.parent_path());
 			result = file->f.Create(file->real_name);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
@@ -719,6 +733,47 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	return bytes_read;
 }
 
+// Adapted from Jetsku/KytyPS5 01d7cd0a38dfc964cfca5cd583c7b8fdc99d8681 (GPL-2.0).
+// Host file I/O cannot enter the user-mode GPU fault handler when it encounters a watched
+// guest page. After a short write, copy a bounded readable guest span through that handler,
+// then resume at the exact unwritten byte. Never bypass the GPU tracker by reading backing.
+static void WriteFromGuest(Common::File& file, const void* data, uint32_t size,
+                           uint32_t* bytes_written) {
+	constexpr uint32_t Chunk = 1u << 20u;
+	thread_local std::vector<uint8_t> bounce;
+	const auto base = reinterpret_cast<uintptr_t>(data);
+	if (size != 0 && size - 1u > UINTPTR_MAX - base) {
+		if (bytes_written != nullptr) *bytes_written = 0;
+		return;
+	}
+	uint32_t total = 0;
+	while (total < size) {
+		const auto* source = reinterpret_cast<const uint8_t*>(base + total);
+		uint32_t written = 0;
+		file.Write(source, size - total, &written);
+		total += written;
+		if (total == size) break;
+
+		const auto address = base + total;
+		source = reinterpret_cast<const uint8_t*>(address);
+		Memory::VirtualQueryInfo mapping {};
+		if (Memory::KernelVirtualQuery(source, 0, &mapping, sizeof(mapping)) != OK ||
+		    !mapping.is_committed || (mapping.protection & 1) == 0 ||
+		    mapping.start > address || mapping.end <= address) {
+			break;
+		}
+		const auto count = static_cast<uint32_t>(
+		    std::min<uint64_t>({size - total, Chunk, mapping.end - address}));
+		bounce.resize(count);
+		std::memcpy(bounce.data(), source, count);
+		written = 0;
+		file.Write(bounce.data(), count, &written);
+		total += written;
+		if (written < count) break;
+	}
+	if (bytes_written != nullptr) *bytes_written = total;
+}
+
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -767,7 +822,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -984,7 +1039,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -1056,7 +1111,7 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 			continue;
 		}
 		uint32_t bytes = 0;
-		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		WriteFromGuest(file->f, buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
 		bytes_written += bytes;
 		if (bytes < buffer.iov_len) {
@@ -1170,7 +1225,7 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
 		LOGF("\t file not found\n");
-		return KERNEL_ERROR_ENOENT;
+		return MissingNodeError(real_file_name);
 	}
 
 	const bool is_dir = !info->is_file;
@@ -1240,6 +1295,75 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	return OK;
 }
 
+static int TruncatePathError(const std::error_code& error) {
+	switch (static_cast<std::errc>(error.default_error_condition().value())) {
+		case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+		case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
+		case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
+		case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
+		case std::errc::read_only_file_system: return KERNEL_ERROR_EROFS;
+		case std::errc::file_too_large: return KERNEL_ERROR_EFBIG;
+		case std::errc::invalid_argument: return KERNEL_ERROR_EINVAL;
+		case std::errc::no_space_on_device: return KERNEL_ERROR_ENOSPC;
+		default: return KERNEL_ERROR_EIO;
+	}
+}
+
+// Windows reports a missing path for "file/child", hiding the guest's ENOTDIR.
+// Missing ancestors may also set error while reporting file_type::not_found.
+static int MissingPathError(const std::filesystem::path& real_name) {
+	for (auto parent = real_name.parent_path(); !parent.empty() && parent != parent.root_path();
+	     parent = parent.parent_path()) {
+		std::error_code error;
+		const auto status = std::filesystem::status(parent, error);
+		if (error) {
+			if (error != std::errc::no_such_file_or_directory && error != std::errc::not_a_directory) {
+				return TruncatePathError(error);
+			}
+		} else if (std::filesystem::exists(status)) {
+			return std::filesystem::is_directory(status) ? KERNEL_ERROR_ENOENT
+			                                             : KERNEL_ERROR_ENOTDIR;
+		}
+		// The walk is lexical; it never expands symlink targets or repeats a root.
+		if (parent == parent.parent_path()) {
+			break;
+		}
+	}
+	return KERNEL_ERROR_ENOENT;
+}
+
+// A guest path that does not exist: ENOENT, or ENOTDIR when a prefix component is a
+// non-directory. Unmounted (empty) and read-only archive paths keep ENOENT.
+static int MissingNodeError(const std::filesystem::path& real_name) {
+	if (real_name.empty() || Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	return MissingPathError(real_name);
+}
+
+// The last component is about to be created: its parent must exist as a directory.
+static int CreationParentError(const std::filesystem::path& real_name) {
+	if (real_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (Common::IsArchivePath(real_name)) {
+		return OK; // Archive mutations are rejected with EROFS by the callers.
+	}
+	const auto parent = real_name.parent_path();
+	if (parent.empty()) {
+		return OK;
+	}
+	std::error_code error;
+	const auto      status = std::filesystem::status(parent, error);
+	if (!error && std::filesystem::is_directory(status)) {
+		return OK;
+	}
+	if (!error && std::filesystem::exists(status)) {
+		return KERNEL_ERROR_ENOTDIR;
+	}
+	return MissingPathError(real_name);
+}
+
 int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	PRINT_NAME();
 	if (path == nullptr) {
@@ -1274,7 +1398,7 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	const auto      status = std::filesystem::status(real_name, error);
 	if (!error) {
 		if (!std::filesystem::exists(status)) {
-			return KERNEL_ERROR_ENOENT;
+			return MissingPathError(real_name);
 		}
 		if (std::filesystem::is_directory(status)) {
 			return KERNEL_ERROR_EISDIR;
@@ -1284,17 +1408,10 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 		}
 	}
 	if (error) {
-		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
-			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
-			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
-			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
-			case std::errc::read_only_file_system: return KERNEL_ERROR_EROFS;
-			case std::errc::file_too_large: return KERNEL_ERROR_EFBIG;
-			case std::errc::invalid_argument: return KERNEL_ERROR_EINVAL;
-			case std::errc::no_space_on_device: return KERNEL_ERROR_ENOSPC;
-			default: return KERNEL_ERROR_EIO;
+		if (error == std::errc::no_such_file_or_directory) {
+			return MissingPathError(real_name);
 		}
+		return TruncatePathError(error);
 	}
 	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(real_name).c_str());
@@ -1382,7 +1499,7 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
-		return KERNEL_ERROR_ENOENT;
+		return MissingNodeError(real_file_name);
 	}
 
 	if (!info->is_file) {
@@ -1417,19 +1534,77 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	if (Common::IsArchivePath(real_from) || Common::IsArchivePath(real_to)) {
 		return KERNEL_ERROR_EROFS;
 	}
+	// After the archive check (EROFS keeps priority) and before any host change: the same
+	// rules as KernelRmdir. Terminal "." / ".." forms are EINVAL (they could alias a mount
+	// root that lexical matching misses); a mount root is never moved or replaced (EBUSY),
+	// so g_mount_points can never point at a moved host directory.
+	for (const auto* guest : {&from_path, &to_path}) {
+		const auto normalized = Common::FixDirectorySlash(NormalizeGuestPath(*guest));
+		if (normalized.ends_with("/./") || normalized.ends_with("/../")) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (g_mount_points->IsMountPoint(normalized)) {
+			return KERNEL_ERROR_EBUSY;
+		}
+	}
 
-	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
+	if (real_from.empty() || real_to.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}
-
-	Common::File::CreateDirectories(real_to.parent_path());
-
-	if (Common::File::IsFileExisting(real_to)) {
-		Common::File::DeleteFile(real_to);
+	const auto from_info = Common::File::GetInfo(real_from);
+	if (!from_info) {
+		return MissingNodeError(real_from);
 	}
-
-	if (!Common::File::RenameFile(real_from, real_to)) {
-		return KERNEL_ERROR_EIO;
+	// POSIX: a directory cannot move below itself (EINVAL), whether or not the target exists.
+	if (!from_info->is_file) {
+		std::error_code from_error;
+		std::error_code to_error;
+		const auto      from_full = std::filesystem::weakly_canonical(real_from, from_error);
+		const auto      to_full   = std::filesystem::weakly_canonical(real_to, to_error);
+		if (!from_error && !to_error) {
+			const auto inside = to_full.lexically_relative(from_full);
+			if (!inside.empty() && inside != "." && *inside.begin() != "..") {
+				return KERNEL_ERROR_EINVAL;
+			}
+		}
+	}
+	// The destination's parent must already be a directory (POSIX; nothing is created).
+	if (const int error = CreationParentError(real_to); error != OK) {
+		return error;
+	}
+	const auto to_info = Common::File::GetInfo(real_to);
+	if (to_info) {
+		std::error_code same_error;
+		if (std::filesystem::equivalent(real_from, real_to, same_error)) {
+			return OK; // POSIX: renaming a file onto itself does nothing.
+		}
+		if (!from_info->is_file && to_info->is_file) {
+			return KERNEL_ERROR_ENOTDIR;
+		}
+		if (from_info->is_file && !to_info->is_file) {
+			return KERNEL_ERROR_EISDIR;
+		}
+		if (!to_info->is_file) {
+			// Directory over directory: a non-empty target is never replaced. An empty one is
+			// left to the native rename, which replaces it atomically on POSIX hosts and fails
+			// (EACCES) on Windows, which has no atomic directory replace. Never delete first.
+			std::error_code error;
+			if (!std::filesystem::is_empty(real_to, error) || error) {
+				return error ? KERNEL_ERROR_EIO : KERNEL_ERROR_ENOTEMPTY;
+			}
+		}
+	}
+	// Files are replaced atomically; an existing destination survives a failed rename.
+	switch (Common::File::RenameReplacing(real_from, real_to)) {
+		case 0: break;
+		case ENOENT: return KERNEL_ERROR_ENOENT;
+		case EACCES: return KERNEL_ERROR_EACCES;
+		case ENOTEMPTY: return KERNEL_ERROR_ENOTEMPTY;
+		case ENOSPC: return KERNEL_ERROR_ENOSPC;
+		case EROFS: return KERNEL_ERROR_EROFS;
+		// Different host volumes: report it; never copy and delete.
+		case EXDEV: return KERNEL_ERROR_EXDEV;
+		default: return KERNEL_ERROR_EIO;
 	}
 
 	LOGF("\tKernelRename: %s -> %s\n", from, to);
@@ -1508,6 +1683,9 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	if (Common::File::GetInfo(real_name)) {
 		return KERNEL_ERROR_EEXIST;
 	}
+	if (const int error = CreationParentError(real_name); error != OK) {
+		return error;
+	}
 
 	return Common::File::CreateDirectory(real_name) ? OK : KERNEL_ERROR_EIO;
 }
@@ -1541,7 +1719,7 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 
 	const auto info = Common::File::GetInfo(real_name);
 	if (!info) {
-		return KERNEL_ERROR_ENOENT;
+		return MissingNodeError(real_name);
 	}
 
 	if (info->is_file) {

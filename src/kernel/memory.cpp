@@ -860,6 +860,18 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
+bool TryReadGpuCpuCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->TryReadCpuCurrent(vaddr, data, size);
+}
+
+bool TryPredictGpuRead(uint64_t vaddr, uint32_t& value) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->TryPredictGpuRead(vaddr, value);
+}
+
+void NoteGpuRead(uint64_t vaddr) noexcept {
+	if (g_gpu_resources != nullptr) g_gpu_resources->NoteGpuRead(vaddr);
+}
+
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
@@ -2836,12 +2848,19 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
                         VirtualMemory::Mode* old_mode) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	constexpr uint64_t                    GuestPageSize = 0x4000;
-	if (vaddr == 0 || size == 0 || size > UINT64_MAX - (vaddr & (GuestPageSize - 1u))) {
+	const auto page_offset = vaddr & (GuestPageSize - 1u);
+	// Validate both the caller's span and the additions used to round it to pages.
+	// A wrapped aligned size must never reach the required-mapping check below.
+	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
+	    size > UINT64_MAX - page_offset - (GuestPageSize - 1u)) {
 		return false;
 	}
 	const auto aligned_addr = vaddr & ~(GuestPageSize - 1u);
 	const auto aligned_size =
-	    (size + (vaddr - aligned_addr) + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
+	    (size + page_offset + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
+	if (aligned_size > UINT64_MAX - aligned_addr) {
+		return false;
+	}
 	const auto ranges = RequireGuestRuntimeMemory(aligned_addr, aligned_size);
 	if (old_mode != nullptr) {
 		*old_mode = static_cast<VirtualMemory::Mode>(

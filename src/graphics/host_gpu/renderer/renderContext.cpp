@@ -3,9 +3,15 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <mutex>
+#include <atomic>
+#include <cstdlib>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -73,6 +79,107 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+bool RenderContext::TryReadCpuCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	if (!GuestGpu::IsGpuThread() || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	static const bool stale_experiment = std::getenv("KYTY_STALE_WALKER") != nullptr;
+	if (!stale_experiment && m_buffer_cache.IsRangeGpuWritten(vaddr, size) ||
+	    m_texture_cache.WriteBackTick(vaddr, size) != 0) {
+		return false;
+	}
+	return LibKernel::Memory::TryReadBacking(vaddr, data, size);
+}
+
+namespace {
+// SRT-walker reads of GPU-written bytes. A dword that read back the same value on several
+// downloads is served from that value; an asynchronous copy of the GPU bytes checks it, and a
+// changed value takes the address off speculation for good.
+struct PredictedRead {
+	uint32_t value    = 0;
+	uint32_t stable   = 0; // consecutive downloads that returned `value`
+	uint32_t changes  = 0;
+	bool     unstable = false;
+};
+constexpr uint32_t PredictStableDownloads = 30;
+bool               PredictEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_PREDICT_GPU_READS");
+		return text != nullptr && text[0] == '1';
+	}();
+	return enabled;
+}
+std::mutex& PredictMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::unordered_map<uint64_t, PredictedRead>& PredictedReads() {
+	static std::unordered_map<uint64_t, PredictedRead> reads;
+	return reads;
+}
+std::atomic<uint64_t> g_predicted {0}, g_mispredicted {0};
+} // namespace
+
+bool RenderContext::TryPredictGpuRead(uint64_t vaddr, uint32_t& value) noexcept {
+	if (!PredictEnabled() || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, sizeof(value)) ||
+	    m_texture_cache.WriteBackTick(vaddr, sizeof(value)) != 0) {
+		return false;
+	}
+	{
+		std::scoped_lock lock {PredictMutex()};
+		const auto it = PredictedReads().find(vaddr);
+		if (it == PredictedReads().end() || it->second.unstable ||
+		    it->second.stable < PredictStableDownloads) {
+			return false;
+		}
+		value = it->second.value;
+	}
+	m_buffer_cache.QueueReadCheck(vaddr, value);
+	const auto n = ++g_predicted;
+	if (std::getenv("KYTY_DL_DIAG") != nullptr && n % 20000 == 0) {
+		std::printf("PREDICT: %llu walker reads served from stable values, %llu mispredicted\n",
+		            static_cast<unsigned long long>(n),
+		            static_cast<unsigned long long>(g_mispredicted.load()));
+		std::fflush(stdout);
+	}
+	return true;
+}
+
+void RenderContext::NoteGpuRead(uint64_t vaddr) noexcept {
+	if (!PredictEnabled() || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	uint32_t backing = 0;
+	if (!LibKernel::Memory::TryReadBacking(vaddr, &backing, sizeof(backing))) {
+		return;
+	}
+	std::scoped_lock lock {PredictMutex()};
+	auto&            reads = PredictedReads();
+	if (reads.size() > 65536) {
+		reads.clear();
+	}
+	auto& read = reads[vaddr];
+	if (read.stable != 0 && read.value == backing) {
+		++read.stable;
+	} else {
+		// Values that keep changing are GPU-produced data, never speculated.
+		if (read.stable != 0 && ++read.changes >= 2) {
+			read.unstable = true;
+		}
+		read.value  = backing;
+		read.stable = 1;
+	}
+}
+
+void RenderContext::NoteReadCheck(uint64_t vaddr, uint32_t expected, uint32_t actual) noexcept {
+	if (expected == actual) {
+		return;
+	}
+	++g_mispredicted;
+	std::scoped_lock lock {PredictMutex()};
+	PredictedReads()[vaddr].unstable = true;
 }
 
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {

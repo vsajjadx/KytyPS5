@@ -753,7 +753,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.BlockExtent() == cached.info.BlockExtent() &&
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
-	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
+	// TheCruZ/KytyPS5-GTA e9812fc123b80e16632bbdf7b0e2e07906128376: a definitely CPU-written
+	// BC allocation may have reused its old mip tail for a heap. Retire that image rather than
+	// letting a raw mip-0 writer claim the whole old chain. Maybe-dirty images can retain GPU
+	// contents, so they still take the existing path.
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsMaybeCpuDirty()) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}

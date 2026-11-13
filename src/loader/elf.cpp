@@ -22,9 +22,13 @@ static std::unique_ptr<SelfHeader> LoadSelf(Common::File& f) {
 }
 
 static std::unique_ptr<SelfSegment[]> LoadSelfSegments(Common::File& f, uint16_t num) {
+	const auto size = sizeof(SelfSegment) * num;
+	if (size > f.Remaining()) return nullptr;
 	auto segs = std::make_unique<SelfSegment[]>(num);
 
-	f.Read(segs.get(), sizeof(SelfSegment) * num);
+	uint32_t read = 0;
+	f.Read(segs.get(), size, &read);
+	if (read != size) return nullptr;
 
 	return segs;
 }
@@ -52,12 +56,46 @@ static void SaveEhdr64(Common::File& f, const Elf64_Ehdr* ehdr) {
 }
 
 static std::unique_ptr<Elf64_Phdr[]> LoadPhdr64(Common::File& f, uint64_t offset, Elf64_Half num) {
+	const auto size = sizeof(Elf64_Phdr) * num;
+	if (offset > f.Size() || size > f.Size() - offset || !f.Seek(offset)) return nullptr;
 	auto phdr = std::make_unique<Elf64_Phdr[]>(num);
 
-	f.Seek(offset);
-	f.Read(phdr.get(), sizeof(Elf64_Phdr) * num);
+	uint32_t read = 0;
+	f.Read(phdr.get(), size, &read);
+	if (read != size) return nullptr;
 
 	return phdr;
+}
+
+// Program memory is reserved from these extents before segments are copied. Reject
+// sizes which would wrap GetAlignedSize/CalcBaseSize or exceed that reservation.
+static bool ValidateProgramHeaders(const Elf64_Phdr* phdr, Elf64_Half count,
+                                   uint64_t file_size, bool self) {
+	for (Elf64_Half index = 0; index < count; ++index) {
+		const auto& segment = phdr[index];
+		if (segment.p_filesz != 0 &&
+		    (segment.p_filesz > UINT32_MAX || segment.p_filesz > UINT64_MAX - segment.p_offset ||
+		     (!self && (segment.p_offset > file_size ||
+		                segment.p_filesz > file_size - segment.p_offset)))) {
+			LOGF("Invalid ELF segment %u: file extent exceeds its backing\n", index);
+			return false;
+		}
+		if (segment.p_type != PT_LOAD && segment.p_type != PT_OS_RELRO && segment.p_type != PT_TLS)
+			continue;
+		const auto padding = segment.p_align == 0 ? 0 : segment.p_align - 1;
+		if (segment.p_filesz > segment.p_memsz ||
+		    (segment.p_align != 0 && (segment.p_align & padding) != 0) ||
+		    segment.p_memsz > UINT64_MAX - padding) {
+			LOGF("Invalid ELF segment %u: memory size or alignment overflows\n", index);
+			return false;
+		}
+		const auto aligned_size = (segment.p_memsz + padding) & ~padding;
+		if (aligned_size > UINT64_MAX - segment.p_vaddr) {
+			LOGF("Invalid ELF segment %u: virtual extent overflows\n", index);
+			return false;
+		}
+	}
+	return true;
 }
 
 static void SavePhdr64(Common::File& f, uint64_t offset, Elf64_Half num, const Elf64_Phdr* phdr) {
@@ -241,6 +279,15 @@ Elf64::~Elf64() {
 
 void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 	EXIT_IF(m_f == nullptr);
+	if (size == 0) return;
+	EXIT_IF(size > UINT32_MAX || size > UINT64_MAX - file_offset);
+	const auto read_exact = [&](uint64_t offset) {
+		EXIT_IF(offset > m_f->Size() || size > m_f->Size() - offset || !m_f->Seek(offset));
+		uint32_t read = 0;
+		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)),
+		          static_cast<uint32_t>(size), &read);
+		EXIT_IF(read != size);
+	};
 
 	if (m_self != nullptr) {
 		EXIT_IF(m_self_segments == nullptr);
@@ -250,36 +297,35 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 			const auto& seg = m_self_segments[i];
 			if ((seg.type & 0x800u) != 0) {
 				auto phdr_id = ((seg.type >> 20u) & 0xFFFu);
+				EXIT_IF(m_ehdr == nullptr || phdr_id >= m_ehdr->e_phnum);
 
 				const auto& phdr = m_phdr[phdr_id];
 
-				if (file_offset >= phdr.p_offset && file_offset < phdr.p_offset + phdr.p_filesz) {
+				if (file_offset >= phdr.p_offset && file_offset - phdr.p_offset < phdr.p_filesz) {
 					EXIT_NOT_IMPLEMENTED(seg.decompressed_size != phdr.p_filesz);
 					EXIT_NOT_IMPLEMENTED(seg.compressed_size != seg.decompressed_size);
 
 					auto offset = file_offset - phdr.p_offset;
 
-					EXIT_NOT_IMPLEMENTED(offset + size > seg.decompressed_size);
-
-					m_f->Seek(offset + seg.offset);
-					m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+					EXIT_NOT_IMPLEMENTED(offset > seg.decompressed_size ||
+					                     size > seg.decompressed_size - offset);
+					EXIT_IF(offset > UINT64_MAX - seg.offset);
+					read_exact(offset + seg.offset);
 
 					return;
 				}
 			}
 		}
 
-		if (m_f->Size() - m_self->file_size == size) {
-			m_f->Seek(m_self->file_size);
-			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		if (m_self->file_size <= m_f->Size() && m_f->Size() - m_self->file_size == size) {
+			read_exact(m_self->file_size);
 
 			return;
 		}
 
 		EXIT("missing self segment\n");
 	} else {
-		m_f->Seek(file_offset);
-		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		read_exact(file_offset);
 	}
 }
 
@@ -546,6 +592,7 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 		m_f->Seek(0);
 	} else {
 		m_self_segments = LoadSelfSegments(*m_f, m_self->segments_num);
+		if (m_self_segments == nullptr) return;
 	}
 
 	auto ehdr_pos = m_f->Tell();
@@ -557,7 +604,27 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	}
 
 	if (m_ehdr != nullptr /*&& m_self == nullptr*/) {
+		if (ehdr_pos > m_f->Size() || m_ehdr->e_phoff > m_f->Size() - ehdr_pos) {
+			m_ehdr.reset();
+			return;
+		}
 		m_phdr = LoadPhdr64(*m_f, ehdr_pos + m_ehdr->e_phoff, m_ehdr->e_phnum);
+		bool valid = m_phdr != nullptr && ValidateProgramHeaders(
+		    m_phdr.get(), m_ehdr->e_phnum, m_f->Size(), m_self != nullptr);
+		for (uint16_t index = 0; valid && m_self != nullptr && index < m_self->segments_num; ++index) {
+			const auto& segment = m_self_segments[index];
+			if ((segment.type & 0x800u) != 0 &&
+			    (((segment.type >> 20u) & 0xfffu) >= m_ehdr->e_phnum ||
+			     segment.offset > m_f->Size() || segment.compressed_size > m_f->Size() - segment.offset)) {
+				LOGF("Invalid SELF segment %u: header index or physical extent is out of range\n", index);
+				valid = false;
+			}
+		}
+		if (!valid) {
+			m_phdr.reset();
+			m_ehdr.reset();
+			return;
+		}
 		if (m_self == nullptr) {
 			m_shdr = LoadShdr64(*m_f, ehdr_pos + m_ehdr->e_shoff, m_ehdr->e_shnum);
 

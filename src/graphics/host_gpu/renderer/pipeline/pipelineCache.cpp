@@ -360,6 +360,26 @@ ShaderModule& PipelineCache::AdoptModule(Program& program, const ProgramKey& key
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(built.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	// TEMP DIAG: KYTY_DUMP_HASH=<hex> writes that shader's SPIR-V to K:/KytyPS5/runs/dump.
+	if (const char* want = std::getenv("KYTY_DUMP_HASH"); want != nullptr) {
+		std::printf("ADOPT key=%016llx info=%016llx id=%016llx\n",
+		            static_cast<unsigned long long>(key.hash),
+		            static_cast<unsigned long long>(built.info.shader_hash),
+		            static_cast<unsigned long long>(id));
+		std::fflush(stdout);
+	}
+	if (const char* want = std::getenv("KYTY_DUMP_HASH");
+	    want != nullptr && (std::strtoull(want, nullptr, 16) == key.hash ||
+	                        std::strtoull(want, nullptr, 16) == id ||
+	                        std::strtoull(want, nullptr, 16) == built.info.shader_hash)) {
+		const auto path = fmt::format("K:/KytyPS5/runs/dump/{}_{:016x}_{:016x}.spv", stage,
+		                              built.info.shader_hash, id);
+		if (FILE* f = std::fopen(path.c_str(), "wb")) {
+			std::fwrite(built.spirv.data(), sizeof(uint32_t), built.spirv.size(), f);
+			std::fclose(f);
+			std::printf("DUMPHASH: wrote %s\n", path.c_str());
+		}
+	}
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
 	    .module         = built.module,
@@ -1010,7 +1030,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    target_export_mapping {};
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			const auto& rt = context.GetRenderTarget(slot);
-			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			if ((color_output_mask & (1u << slot)) != 0 && render_target_bound(rt)) {
 				target_export_mapping[slot] =
 				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 				                                 rt.info.channel_order)
@@ -1024,7 +1044,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
 			const auto& rt = context.GetRenderTarget(slot);
 			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
-			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			if (!render_target_bound(rt) || target_mask == 0u) continue;
 			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
 				pixel_info.target_uint_mask |= 1u << export_index;
 			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {

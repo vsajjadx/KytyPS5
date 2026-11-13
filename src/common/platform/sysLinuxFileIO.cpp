@@ -245,6 +245,12 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 	closedir(dir);
 }
 
+int SysFileReplaceFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+	return rename(real_src.string().c_str(), real_dst.string().c_str()) == 0 ? 0 : errno;
+}
+
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto real_src = get_internal_name(src);
 	auto real_dst = get_internal_name(dst);

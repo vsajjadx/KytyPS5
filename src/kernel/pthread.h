@@ -69,6 +69,11 @@ using PthreadCond       = PthreadCondPrivate*;
 using KernelClockid     = int32_t;
 using PthreadKey        = int;
 
+// Follows the native PS4 libkernel path in shadPS4's public emulation,
+// rather than OpenOrbis/musl's homebrew libc value or the host pthread sentinel.
+// https://github.com/shadps4-emu/shadPS4/blob/b97bafa353d868fe189955491ed38776b3518ed5/src/core/libraries/kernel/threads/pthread.cpp#L599
+inline constexpr uintptr_t GuestPthreadCanceledValue = 1u;
+
 using pthread_entry_func_t          = KYTY_SYSV_ABI void* (*)(void*);
 using thread_dtors_func_t           = KYTY_SYSV_ABI void (*)();
 using pthread_key_destructor_func_t = KYTY_SYSV_ABI void (*)(void*);

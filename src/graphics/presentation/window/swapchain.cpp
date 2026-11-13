@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/frameGeneration.h"
 #include "graphics/presentation/openxrHeadset.h"
@@ -26,8 +27,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -233,6 +237,85 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
+}
+
+// Captures the emulator's own video-out image, without desktop/window automation.
+// A request is one monotonically increasing integer in KYTY_MENU_TEST/capture.txt.
+// The only extra GPU work and synchronization occurs for an explicit new request.
+static void CaptureMenuTestFrame(CommandBuffer& command, Presenter::Frame& frame) {
+	const char* directory = std::getenv("KYTY_MENU_TEST");
+	if (directory == nullptr || directory[0] == '\0') return;
+	static auto next_poll = std::chrono::steady_clock::time_point {};
+	static uint64_t sequence = 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now < next_poll) return;
+	next_poll = now + std::chrono::milliseconds(200);
+	const auto folder = std::filesystem::path(directory);
+	std::ifstream request(folder / "capture.txt");
+	uint64_t requested = 0;
+	if (!(request >> requested) || requested <= sequence) return;
+	sequence = requested;
+	const auto format = frame.image.format;
+	const bool rgba = format == vk::Format::eR8G8B8A8Unorm ||
+	                  format == vk::Format::eR8G8B8A8Srgb;
+	const bool bgra = format == vk::Format::eB8G8R8A8Unorm ||
+	                  format == vk::Format::eB8G8R8A8Srgb;
+	const bool rgb10 = format == vk::Format::eA2B10G10R10UnormPack32;
+	const bool bgr10 = format == vk::Format::eA2R10G10B10UnormPack32;
+	if (!rgba && !bgra && !rgb10 && !bgr10) {
+		std::printf("MENU_TEST: unsupported capture format=%d\n", static_cast<int>(format));
+		std::fflush(stdout);
+		return;
+	}
+	const auto width = frame.image.extent.width;
+	const auto height = frame.image.extent.height;
+	const uint64_t size = uint64_t {width} * height * 4;
+	auto& scheduler = command.GetContext().GetCommandScheduler();
+	auto download = std::make_unique<Buffer>(command.GetGraphics(), scheduler,
+	    MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, size);
+	frame.Transit(command.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+	              vk::AccessFlagBits2::eTransferRead);
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent = {width, height, 1};
+	command.Handle().copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+	                                  download->Handle(), copy);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = download->Handle();
+	barrier.size = size;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	const auto path = folder / ("capture-" + std::to_string(requested) + ".ppm");
+	scheduler.DeferOperation([download = std::move(download), size, width, height, rgba,
+	                         bgra, rgb10, path, requested] {
+		download->Invalidate(0, size);
+		const auto bytes = download->Mapped();
+		std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
+		for (size_t pixel = 0; pixel < rgb.size() / 3; ++pixel) {
+			const auto* in = bytes.data() + pixel * 4;
+			auto* out = rgb.data() + pixel * 3;
+			if (rgba || bgra) {
+				out[0] = in[rgba ? 0 : 2]; out[1] = in[1]; out[2] = in[rgba ? 2 : 0];
+			} else {
+				const auto word = uint32_t {in[0]} | uint32_t {in[1]} << 8u |
+				                  uint32_t {in[2]} << 16u | uint32_t {in[3]} << 24u;
+				out[0] = static_cast<uint8_t>(((word >> (rgb10 ? 0u : 20u)) & 1023u) * 255u / 1023u);
+				out[1] = static_cast<uint8_t>(((word >> 10u) & 1023u) * 255u / 1023u);
+				out[2] = static_cast<uint8_t>(((word >> (rgb10 ? 20u : 0u)) & 1023u) * 255u / 1023u);
+			}
+		}
+		std::ofstream output(path, std::ios::binary);
+		output << "P6\n" << width << " " << height << "\n255\n";
+		output.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+		std::printf("MENU_TEST: capture sequence=%llu size=%ux%u ok=%d\n",
+		            static_cast<unsigned long long>(requested), width, height,
+		            static_cast<int>(output.good()));
+		std::fflush(stdout);
+	});
 }
 
 class Swapchain final {
@@ -1055,6 +1138,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	CaptureMenuTestFrame(buffer, *frame);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,

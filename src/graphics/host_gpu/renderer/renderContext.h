@@ -54,6 +54,14 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// GPU thread only: reads `size` bytes of a protected page straight from guest backing when
+	// no pending GPU write or image write-back covers them, so no download or sync is needed.
+	[[nodiscard]] bool TryReadCpuCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept;
+	// GPU thread only. A dword the GPU keeps rewriting with the same value (buffer headers,
+	// sizes) is served from its last download for a few reads before it is downloaded again.
+	[[nodiscard]] bool TryPredictGpuRead(uint64_t vaddr, uint32_t& value) noexcept;
+	void               NoteGpuRead(uint64_t vaddr) noexcept;
+	void               NoteReadCheck(uint64_t vaddr, uint32_t expected, uint32_t actual) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

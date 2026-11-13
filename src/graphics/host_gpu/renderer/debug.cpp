@@ -14,11 +14,15 @@
 
 namespace Libs::Graphics {
 
+bool render_target_bound(const HW::RenderTarget& rt) {
+	return rt.base.addr != 0 && rt.info.format != Prospero::ChannelLayout::kInvalid;
+}
+
 static uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && render_target_bound(hw.GetRenderTarget(i))) {
 			return i;
 		}
 	}
@@ -148,7 +152,7 @@ static bool RenderIsColorDimension(uint32_t dimension) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void RtCheck(const HW::RenderTarget& rt) {
-	if (rt.base.addr != 0) {
+	if (render_target_bound(rt)) {
 		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
 		// Native MSAA stores expanded samples, independent of FMASK metadata compression.
 		EXIT_NOT_IMPLEMENTED(rt.info.fmask_compression_enable && rt.attrib.num_samples == 0 &&

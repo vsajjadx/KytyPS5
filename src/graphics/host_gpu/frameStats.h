@@ -20,13 +20,16 @@ enum class WaitSite : uint32_t {
 	SwapchainFrame,
 	Finish,
 	FlushAndWait,
+	// The priority-operation worker (async download publishes, deferred interrupts). It waits
+	// on its own thread and never blocks the GPU thread.
+	AsyncPublishWorker,
 	Count
 };
 
 inline const char* WaitSiteName(WaitSite site) {
 	static const char* const names[] = {"other",      "stream_buffer", "buffer_download_sync",
 	                                    "buffer_retire", "fault_manager", "swapchain_frame",
-	                                    "finish",     "flush_and_wait"};
+	                                    "finish",     "flush_and_wait", "async_publish_worker"};
 	const auto index = static_cast<size_t>(site);
 	return index < (sizeof(names) / sizeof(names[0])) ? names[index] : "?";
 }
@@ -57,6 +60,8 @@ struct FrameStats {
 	std::atomic<uint64_t> draws {0};
 	std::atomic<uint64_t> dispatches {0};
 	std::atomic<uint64_t> eops {0};
+	// Every vkQueueSubmit. draws/dispatches/eops count only submits whose operation is known.
+	std::atomic<uint64_t> submits {0};
 
 	struct WaitStat {
 		std::atomic<uint64_t> count {0};
@@ -86,6 +91,7 @@ inline void NotePresentedFrame() {
 	static uint64_t last_draws    = 0;
 	static uint64_t last_disp     = 0;
 	static uint64_t last_eops     = 0;
+	static uint64_t last_submits  = 0;
 	static std::array<uint64_t, static_cast<size_t>(WaitSite::Count)> last_wait_count {};
 	static std::array<uint64_t, static_cast<size_t>(WaitSite::Count)> last_wait_us {};
 
@@ -102,16 +108,31 @@ inline void NotePresentedFrame() {
 	const auto draws    = s.draws.load(std::memory_order_relaxed);
 	const auto disp     = s.dispatches.load(std::memory_order_relaxed);
 	const auto eops     = s.eops.load(std::memory_order_relaxed);
+	const auto submits  = s.submits.load(std::memory_order_relaxed);
+	const auto known    = (draws - last_draws) + (disp - last_disp) + (eops - last_eops);
 
-	std::printf("PERF: %.1f fps | draws %llu, dispatches %llu, eops %llu | compiles %llu (%.0f ms, "
-	            "max %.0f ms) | in last %.1f s\n",
-	            static_cast<double>(window_frames) / elapsed,
-	            static_cast<unsigned long long>(draws - last_draws),
-	            static_cast<unsigned long long>(disp - last_disp),
-	            static_cast<unsigned long long>(eops - last_eops),
-	            static_cast<unsigned long long>(compiles - last_compiles),
-	            static_cast<double>(us - last_us) / 1000.0, static_cast<double>(max_us) / 1000.0,
-	            elapsed);
+	// Submits of unknown operation (CommandBufferDebugOp Unknown) appear only in "submits";
+	// per-kind counts are printed only when some submit carried a real kind.
+	if (known != 0) {
+		std::printf("PERF: %.1f fps | submits %llu (draws %llu, dispatches %llu, eops %llu) | "
+		            "compiles %llu (%.0f ms, max %.0f ms) | in last %.1f s\n",
+		            static_cast<double>(window_frames) / elapsed,
+		            static_cast<unsigned long long>(submits - last_submits),
+		            static_cast<unsigned long long>(draws - last_draws),
+		            static_cast<unsigned long long>(disp - last_disp),
+		            static_cast<unsigned long long>(eops - last_eops),
+		            static_cast<unsigned long long>(compiles - last_compiles),
+		            static_cast<double>(us - last_us) / 1000.0,
+		            static_cast<double>(max_us) / 1000.0, elapsed);
+	} else {
+		std::printf("PERF: %.1f fps | submits %llu (kind unknown) | compiles %llu (%.0f ms, "
+		            "max %.0f ms) | in last %.1f s\n",
+		            static_cast<double>(window_frames) / elapsed,
+		            static_cast<unsigned long long>(submits - last_submits),
+		            static_cast<unsigned long long>(compiles - last_compiles),
+		            static_cast<double>(us - last_us) / 1000.0,
+		            static_cast<double>(max_us) / 1000.0, elapsed);
+	}
 
 	uint64_t total_wait_us = 0;
 	for (size_t i = 0; i < s.waits.size(); i++) {
@@ -129,7 +150,9 @@ inline void NotePresentedFrame() {
 		last_wait_count[i] = count;
 		last_wait_us[i]    = wus;
 	}
-	std::printf("PERF:   total blocked on GPU: %.0f ms of %.0f ms\n",
+	// Sum over every waiting thread (GPU thread, guest threads, presenter, publish worker).
+	// Waits on different threads overlap, so this is NOT the GPU thread's blocked time.
+	std::printf("PERF:   summed GPU-wait time of all waiting threads: %.0f ms in %.0f ms\n",
 	            static_cast<double>(total_wait_us) / 1000.0, elapsed * 1000.0);
 	std::fflush(stdout);
 
@@ -140,6 +163,7 @@ inline void NotePresentedFrame() {
 	last_draws    = draws;
 	last_disp     = disp;
 	last_eops     = eops;
+	last_submits  = submits;
 }
 
 } // namespace Libs::Graphics

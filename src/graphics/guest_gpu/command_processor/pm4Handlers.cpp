@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/agc.h"
 
@@ -441,6 +442,9 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	// visible to the CPU.
 	if (cmd_id == 0xc0065800 && (buffer[6] & 0x9800u) == 0x8000u) {
 		cp.WriteBackImages();
+	}
+	if (GameOrderedBarriers()) {
+		cp.GameFlush();
 	}
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }

@@ -2,10 +2,12 @@
 #include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "common/logging/log.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <immintrin.h>
 #include <array>
 #include <cinttypes>
 #include <chrono>
@@ -46,10 +48,16 @@ const char* DebugOpName(uint32_t op) {
 
 } // namespace
 
+constexpr uint32_t SubmitDebugOpUnknown = 10; // "Unknown" in DebugOpName
+
 void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, uint32_t arg0,
                          uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4) {
-	// Debug op ids: see CommandBufferDebugOp (render.h) / DebugOpName above.
-	if (debug_op == 1 || debug_op == 2) {
+	// Debug op ids: see CommandBufferDebugOp (render.h) / DebugOpName above. Unknown submits
+	// count only as submits, never as a draw, dispatch or EOP.
+	g_frame_stats.submits.fetch_add(1, std::memory_order_relaxed);
+	if (debug_op >= SubmitDebugOpUnknown) {
+		// Kind not recorded.
+	} else if (debug_op == 1 || debug_op == 2) {
 		g_frame_stats.draws.fetch_add(1, std::memory_order_relaxed);
 	} else if (debug_op == 0 || debug_op == 9) {
 		g_frame_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -145,6 +153,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait");
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
@@ -153,7 +162,28 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto wait_begin = std::chrono::steady_clock::now();
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// Waits here are usually short (a GPU round trip). A blocking wait adds the OS thread wake-up
+	// latency to every one of them, so poll the counter for up to 2 ms first.
+	static const uint64_t spin_us = [] {
+		const char* text = std::getenv("KYTY_GPU_SPIN_US");
+		return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+	}();
+	auto result = vk::Result::eTimeout;
+	if (spin_us != 0) {
+		const auto spin_until = wait_begin + std::chrono::microseconds(spin_us);
+		do {
+			uint64_t value = 0;
+			if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &value) == vk::Result::eSuccess &&
+			    value >= tick) {
+				result = vk::Result::eSuccess;
+				break;
+			}
+			_mm_pause();
+		} while (std::chrono::steady_clock::now() < spin_until);
+	}
+	if (result != vk::Result::eSuccess) {
+		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	}
 	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	    std::chrono::steady_clock::now() - wait_begin).count()));
 	if (result != vk::Result::eSuccess) {

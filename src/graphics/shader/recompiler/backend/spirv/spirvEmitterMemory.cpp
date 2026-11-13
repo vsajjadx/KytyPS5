@@ -174,10 +174,12 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	const auto previous = state.builder.AllocateId();
+	// Different invocations can fault on different pages in one bitmap word.
+	// Preserve every page with an atomic OR; no ordering beyond atomicity is needed.
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), previous, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
@@ -1367,6 +1369,23 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
 	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), address,
+	                          ConstantU64(state, LOWER_ADDRESS_SIZE));
+	const auto extended_in_bounds = AndCondition(
+	    state, extended,
+	    Binary(state, spv::OpULessThan, TypeBool(state), address,
+	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase +
+	                                  LibKernel::Memory::kExtendedMemorySize)));
+	const auto valid = Binary(state, spv::OpLogicalOr, TypeBool(state), lower, extended_in_bounds);
+	const auto valid_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	// Validate before narrowing the page index or indexing either bitmap. Otherwise
+	// invalid addresses can wrap onto a valid page, or access beyond the page table.
+	state.builder.AddFunction(spv::OpSelectionMerge, valid_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, valid, valid_label, invalid_label);
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction(spv::OpReturnValue, ConstantU64(state, 0));
+	EmitLabel(state, valid_label);
 	const auto packed   = Select(
 	    state, type, extended,
 	    Binary(state, spv::OpISub, type, address,

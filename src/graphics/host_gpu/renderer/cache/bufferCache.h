@@ -62,7 +62,8 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        BufferId id              = {},
+	                                                        bool     allow_stream    = true);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -82,13 +83,28 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Command-processor store of `size` bytes over GPU-written bytes: updates the cached buffer in
+	// command order and the guest backing, so the store needs no download or GPU sync. False
+	// when the range is not wholly inside one cached buffer or overlaps an image.
+	[[nodiscard]] bool StoreOverGpuDirty(uint64_t vaddr, const void* data, uint64_t size);
+	// Copies the GPU dword at `vaddr` back after the work recorded so far and reports it to
+	// RenderContext::NoteReadCheck; queued checks are recorded together by FlushReadChecks.
+	void QueueReadCheck(uint64_t vaddr, uint32_t expected);
+	void FlushReadChecks();
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Byte-precise: whether GPU writes not yet downloaded cover any of these bytes. Pages are
+	// protected as a whole, so a page can fault while the bytes read hold CPU-current data.
+	[[nodiscard]] bool IsRangeGpuWritten(uint64_t vaddr, uint64_t size) const {
+		return m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// Persistent, read-only residency for exact GPU-side address reads.
+	void PrepareBdaRange(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	// Tags fault-scan pages as DMA-accessed and queues them; creates buffers for unbacked ones.
 	void MarkDmaAccess(const RangeSet& pages);
@@ -156,6 +172,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::vector<std::pair<uint64_t, uint32_t>>        m_read_checks;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;

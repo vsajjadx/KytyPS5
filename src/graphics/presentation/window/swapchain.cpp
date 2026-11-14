@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/frameGeneration.h"
+#include "graphics/presentation/frameGenerationDiag.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
@@ -418,6 +419,7 @@ struct Presenter::Impl {
 		const bool wanted = FrameGeneration::IsEnabled() && !real->blank && !real->hdr &&
 		                    generated_format && layers[1].frame == nullptr &&
 		                    real_interval >= vblank * 9 / 5 && real_interval <= 150ms;
+		if (FrameGenerationDiag::Enabled()) fg_diag.NoteRequest(FrameGeneration::IsEnabled(), wanted);
 		if (!wanted) {
 			if (frame_generator != nullptr) {
 				frame_generator->Reset();
@@ -447,12 +449,13 @@ struct Presenter::Impl {
 		    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
 		    ok ? vk::ImageLayout::eTransferSrcOptimal : generated.image.state.layout};
 		present_scheduler.Submit();
+		if (FrameGenerationDiag::Enabled()) fg_diag.NoteGeneration(ok);
 		if (!ok) {
 			pending_real = false;
 			return false;
 		}
 		layers[0].frame = &generated;
-		Present();
+		Present(FrameGenerationDiag::PresentKind::Generated);
 		layers[0].frame = real;
 		if (++generated_count % 300 == 1) {
 			std::printf("Frame generation: %llu frames generated, game frame every %.1f ms\n",
@@ -470,7 +473,7 @@ struct Presenter::Impl {
 			return false;
 		}
 		pending_real = false;
-		Present();
+		Present(FrameGenerationDiag::PresentKind::DelayedReal);
 		return true;
 	}
 
@@ -478,6 +481,7 @@ struct Presenter::Impl {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
+		if (FrameGenerationDiag::Enabled()) fg_diag.NoteRecreate();
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -502,7 +506,8 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	// `kind` is the calling site's identity, used only by the default-off KYTY_FG_DIAG statistics.
+	void Present(FrameGenerationDiag::PresentKind kind = FrameGenerationDiag::PresentKind::Real);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -519,6 +524,7 @@ struct Presenter::Impl {
 	std::chrono::nanoseconds              real_interval {};
 	bool                                  pending_real    = false;
 	uint64_t                              generated_count = 0;
+	FrameGenerationDiag::Stats            fg_diag;
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1175,7 +1181,7 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present();
+	m_impl->Present(FrameGenerationDiag::PresentKind::Repeat);
 	return true;
 }
 
@@ -1204,6 +1210,9 @@ void Presenter::Present(std::span<const Layer> layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
+			// A delayed real frame still waiting for its vblank is replaced unpresented.
+			if (layer.bus == 0 && m_impl->pending_real && FrameGenerationDiag::Enabled())
+				m_impl->fg_diag.NoteSuperseded();
 			m_impl->frames.Release(previous.frame);
 		}
 		previous = layer;
@@ -1212,7 +1221,8 @@ void Presenter::Present(std::span<const Layer> layers) {
 	if (main_frame != nullptr && m_impl->PresentWithGeneratedFrame(main_frame)) {
 		return;
 	}
-	m_impl->Present();
+	m_impl->Present(main_frame == nullptr || main_frame->blank ? FrameGenerationDiag::PresentKind::Blank
+	                                                           : FrameGenerationDiag::PresentKind::Real);
 }
 
 bool Presenter::PresentPendingFrame() {
@@ -1232,7 +1242,7 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 	KYTY_PROFILER_FUNCTION();
 	using Common::DebugCounters::Counter;
 	using Common::DebugCounters::ScopedTimer;
@@ -1280,10 +1290,20 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		if (FrameGenerationDiag::Enabled()) {
+			// Successful vkQueuePresentKHR only; CPU monotonic time, no GPU query or wait.
+			char       line[1024];
+			const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			    std::chrono::steady_clock::now().time_since_epoch());
+			if (fg_diag.NotePresented(kind, static_cast<uint64_t>(now.count()), line, sizeof(line))) {
+				std::printf("%s\n", line);
+			}
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
+	if (FrameGenerationDiag::Enabled()) fg_diag.NoteFailed(kind);
 }
 
 void Presenter::Discard(Frame& frame) {

@@ -673,6 +673,10 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_executable(frame_generation_diag_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FrameGenerationDiagTests.cpp")
+target_include_directories(frame_generation_diag_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
@@ -704,6 +708,18 @@ if(BUILD_TESTING)
 	add_test(NAME table_leaf_getpc_cfg COMMAND $<TARGET_FILE:shader_cfg_tests> --table-leaf-getpc-only)
 	add_test(NAME table_leaf_getpc_native COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-leaf-getpc-only)
 	add_test(NAME table_tracking_soft_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-tracking-failure-only)
+	# Each child gets an explicit environment; the default-OFF case clears inherited settings.
+	add_test(NAME frame_generation_diag_off
+		COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_FG_DIAG $<TARGET_FILE:frame_generation_diag_tests> off)
+	add_test(NAME frame_generation_diag_on
+		COMMAND ${CMAKE_COMMAND} -E env "KYTY_FG_DIAG=1" $<TARGET_FILE:frame_generation_diag_tests> on)
+	add_test(NAME frame_generation_diag_invalid10
+		COMMAND ${CMAKE_COMMAND} -E env "KYTY_FG_DIAG=10" $<TARGET_FILE:frame_generation_diag_tests> off)
+	add_test(NAME frame_generation_diag_invalid_space
+		COMMAND ${CMAKE_COMMAND} -E env "KYTY_FG_DIAG=1 " $<TARGET_FILE:frame_generation_diag_tests> off)
+	set_tests_properties(frame_generation_diag_off frame_generation_diag_on
+		frame_generation_diag_invalid10 frame_generation_diag_invalid_space
+		PROPERTIES LABELS "cpu;frame_generation_diag")
 	add_test(NAME table_call_resource_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-call-resource-failure-only)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
@@ -891,6 +907,7 @@ set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		frame_generation_diag_tests
 		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests

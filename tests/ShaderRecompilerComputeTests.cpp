@@ -69,6 +69,15 @@
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
+#include "MultiFrameGenerationOracle.h"
+#include "MultiFrameGenerationLocalOracle.h"
+#include "MultiFrameGenerationHudOracle.h"
+#include "MultiFrameGenerationHudDiagnostic.h"
+#include "MultiFrameSceneReference.h"
+#include "MultiFrameGenerationLocalDiagnostic.h"
+#include "MultiFrameGenerationDiagnostic.h"
+#include "graphics/presentation/frameGeneration.h"
+#include <thread>
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -14030,6 +14039,10 @@ public:
 #include "ShaderTableTrackingFailureNativeTests.inc"
 #include "snippets/table-call-resource-failure.inc"
 #include "ShaderPreparedStreamLifetimeTests.inc"
+#include "ShaderMultiFrameGenerationTests.inc"
+#include "ShaderMultiFrameGenerationLocalTests.inc"
+#include "ShaderMultiFrameSceneChangeTests.inc"
+#include "ShaderMultiFrameGenerationHudTests.inc"
 
   #include "ActivityGuardedNativeTests.inc"
   #include "ActivityCmaskNativeTests.inc"
@@ -57418,6 +57431,24 @@ int main(int argc, char **argv) {
   }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--multi-frame-generation-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMultiFrameGeneration();
+    vulkan.CheckMultiFrameGenerationLocal();
+    vulkan.CheckMultiFrameSceneChange();
+    vulkan.CheckMultiFrameGenerationHud();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--multi-frame-scene-change-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMultiFrameSceneChange();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--multi-frame-hud-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMultiFrameGenerationHud();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

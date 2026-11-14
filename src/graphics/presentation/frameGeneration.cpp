@@ -1,4 +1,5 @@
 #include "graphics/presentation/frameGeneration.h"
+#include "graphics/presentation/multiFrameGeneration.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -10,6 +11,8 @@
 
 #if defined(_WIN32)
 #include "ffx_vk_fsr3_3_1_5_bridge.h"
+extern "C" FfxVkFsr3_3_1_6FrameGenerationResult kytyFsrCreateSynchronizedMultiContext(
+    const FfxVkFsr3_3_1_6FrameGenerationCreateInfo*,FfxVkFsr3_3_1_6FrameGenerationContext**);
 #endif
 
 namespace Libs::Graphics {
@@ -17,6 +20,12 @@ namespace Libs::Graphics {
 namespace FrameGeneration {
 
 static std::atomic_bool g_enabled {false};
+static std::atomic<Backend> g_backend {Backend::Fsr};
+static std::atomic<uint32_t> g_multiplier {2};
+void SetBackend(Backend b) { if(b==Backend::Fsr||b==Backend::Multi)g_backend=b; }
+Backend GetBackend() { return g_backend.load(); }
+void SetMultiplier(uint32_t n) { if(n>=2&&n<=6)g_multiplier=n; }
+uint32_t GetMultiplier() { return g_multiplier.load(); }
 #if defined(_WIN32)
 static std::atomic_bool g_available {true};
 #else
@@ -46,6 +55,22 @@ bool IsAvailable() {
 }
 
 } // namespace FrameGeneration
+
+void FrameGenerator::Reset() { m_reset=true;m_multi_prepares=0;if(m_multi)m_multi->Reset(); }
+MultiFrameSceneStatus FrameGenerator::GetMultipleSceneStatus() const {
+    return m_multi ? m_multi->SceneStatus() : MultiFrameSceneStatus{};
+}
+bool FrameGenerator::CopyMultipleSceneForDiagnostics(vk::CommandBuffer command,
+    vk::Buffer destination,uint64_t capacity) {
+    return m_multi&&m_multi->CopySceneForDiagnostics(command,destination,capacity);
+}
+bool FrameGenerator::CopyMultipleFineForDiagnostics(vk::CommandBuffer command,
+    const MultiFrameDiagnosticBuffer& full_motion,const MultiFrameDiagnosticBuffer& static_layer) {
+    return m_multi&&m_multi->CopyFineForDiagnostics(command,full_motion,static_layer);
+}
+bool FrameGenerator::MultipleSceneChanged() const {
+    return GetMultipleSceneStatus().state!=MultiFrameSceneState::Clear;
+}
 
 #if defined(_WIN32)
 
@@ -206,6 +231,8 @@ void FrameGenerator::DestroyTarget(Target& target) {
 }
 
 void FrameGenerator::Destroy() {
+	m_multi.reset();
+	m_multi_prepares=0;
 	if (m_context != nullptr || m_color.image) {
 		const auto tick = m_scheduler.CurrentTick();
 		if (tick > 1) {
@@ -218,6 +245,7 @@ void FrameGenerator::Destroy() {
 		m_context = nullptr;
 	}
 	m_pending.clear();
+    m_context_is_multi = false;
 	DestroySignature();
 	DestroyTarget(m_color);
 	DestroyTarget(m_interpolated);
@@ -398,7 +426,7 @@ bool FrameGenerator::IsSceneCut(uint64_t id) {
 	return cut;
 }
 
-bool FrameGenerator::Recreate(vk::CommandBuffer command, uint32_t width, uint32_t height) {
+bool FrameGenerator::Recreate(vk::CommandBuffer command, uint32_t width, uint32_t height, bool multi) {
 	Destroy();
 	if (!CreateTarget(m_color, ColorFormat, ColorUsage, width, height) ||
 	    !CreateTarget(m_interpolated, ColorFormat, InterpolatedUsage, width, height) ||
@@ -422,7 +450,9 @@ bool FrameGenerator::Recreate(vk::CommandBuffer command, uint32_t width, uint32_
 	create_info.displayWidth    = width;
 	create_info.displayHeight   = height;
 	create_info.colorFormat     = static_cast<VkFormat>(ColorFormat);
-	const auto result = ffxVkFsr3_3_1_6FrameGenerationContextCreate(&create_info, &m_context);
+	const auto result = multi
+        ? kytyFsrCreateSynchronizedMultiContext(&create_info, &m_context)
+        : ffxVkFsr3_3_1_6FrameGenerationContextCreate(&create_info, &m_context);
 	if (result != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
 		m_context = nullptr;
 		Destroy();
@@ -430,6 +460,7 @@ bool FrameGenerator::Recreate(vk::CommandBuffer command, uint32_t width, uint32_
 		Fail("its context could not be created on this GPU");
 		return false;
 	}
+	m_context_is_multi = multi;
 	m_width  = width;
 	m_height = height;
 	m_reset  = true;
@@ -468,6 +499,10 @@ bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Im
                               uint32_t frame_width, uint32_t frame_height) {
 	m_signature_id = 0;
 	m_output_written = false;
+    // Switching back must use the untouched legacy SDK shader, never a Multi context.
+    // Refuse an unsubmitted mode switch rather than submitting the caller's live command.
+    if(m_context_is_multi&&((!m_pending.empty()&&m_pending.back().tick==m_scheduler.CurrentTick())||
+        (m_multi&&m_multi->SceneReadbackPending())))return false;
 	if (frame_width == 0 || frame_height == 0) {
 		return false;
 	}
@@ -489,7 +524,7 @@ bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Im
 		m_pending.pop_front();
 	}
 
-	if (m_context == nullptr || m_width != frame_width || m_height != frame_height) {
+	if (m_context == nullptr || m_context_is_multi || m_width != frame_width || m_height != frame_height) {
 		if (!Recreate(command, frame_width, frame_height)) {
 			return false;
 		}
@@ -594,6 +629,86 @@ bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Im
 	return !was_reset;
 }
 
+MultiFrameResult FrameGenerator::GenerateMultiple(vk::CommandBuffer command,vk::Image frame,
+    std::span<const vk::Image> outputs,uint32_t width,uint32_t height,uint32_t factor,
+    const MultiFrameDiagnostics* diagnostics) {
+    if(!command||!frame||!width||!height||width>m_graphics.physical_device_properties.limits.maxImageDimension2D||height>m_graphics.physical_device_properties.limits.maxImageDimension2D||factor<2||factor>6||outputs.size()!=factor-1)return {};
+    for(size_t i=0;i<outputs.size();++i){if(!outputs[i]||outputs[i]==frame)return {};for(size_t j=0;j<i;++j)if(outputs[i]==outputs[j])return {};}
+    if(diagnostics) {
+        const uint64_t rgba=uint64_t(width)*height*4, flow_bytes=uint64_t((width+7)/8)*((height+7)/8)*4;
+        const MultiFrameDiagnosticBuffer targets[]={diagnostics->optical_flow,diagnostics->scene_change,diagnostics->previous,diagnostics->current};
+        const uint64_t sizes[]={flow_bytes,8,rgba,rgba};
+        for(size_t i=0;i<4;++i){if(!targets[i].buffer||targets[i].capacity<sizes[i])return {};for(size_t j=0;j<i;++j)if(targets[i].buffer==targets[j].buffer)return {};}
+        if(diagnostics->refined_flow.buffer) {
+            if(diagnostics->refined_flow.capacity<flow_bytes*4)return {};
+            for(const auto& target:targets)if(diagnostics->refined_flow.buffer==target.buffer)return {};
+        }
+        // Diagnostics require an already-warmed pair; rejected requests do not advance it.
+        if(!m_multi||m_multi_prepares<6||m_reset)return {};
+    }
+    // A diagnostic read retains the SDK-owned SCD image through its own submission.
+    if(m_multi&&m_multi->SceneReadbackPending())return {};
+    // Invalid validation calls do not alter the timing/history. Reconfiguration cannot submit
+    // the caller's live command buffer; a caller must first submit its preceding batch.
+    if((width!=m_width||height!=m_height||m_failed||(m_context&&!m_context_is_multi))&&!m_pending.empty()&&m_pending.back().tick==m_scheduler.CurrentTick())return {};
+    if(m_failed&&!TryResume())return {};
+    while(m_context&&!m_pending.empty()&&m_scheduler.IsFree(m_pending.front().tick)) {
+        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(m_context,m_pending.front().frame_id);m_pending.pop_front();
+    }
+    if(!m_context||!m_context_is_multi||m_width!=width||m_height!=height)if(!Recreate(command,width,height,true))return {};
+    if(!m_multi){auto candidate=std::make_unique<MultiFrameInterpolator>(m_graphics,m_scheduler);if(!candidate->Initialize(width,height))return {};m_multi=std::move(candidate);}
+    const auto now=std::chrono::steady_clock::now();
+    float frame_ms=std::chrono::duration<float,std::milli>(now-m_last_generate).count();m_last_generate=now;
+    if(!(frame_ms>=1.0f&&frame_ms<=200.0f)){frame_ms=33.3f;Reset();}
+    const bool was_reset=m_reset;
+    using Stage=vk::PipelineStageFlagBits2;using Access=vk::AccessFlagBits2;using Layout=vk::ImageLayout;
+    const std::array before{Barrier(frame,Stage::eAllCommands,Access::eMemoryWrite,Stage::eTransfer,Access::eTransferRead,Layout::eGeneral,Layout::eGeneral),
+        Barrier(m_color.image,Stage::eAllCommands,Access::eMemoryRead|Access::eMemoryWrite,Stage::eTransfer,Access::eTransferWrite,Layout::eUndefined,Layout::eGeneral)};
+    PipelineBarriers(command,before);CopyImage(command,frame,Layout::eGeneral,m_color.image,Layout::eGeneral,width,height);
+    const std::array ready{Barrier(m_color.image,Stage::eTransfer,Access::eTransferWrite,Stage::eAllCommands,Access::eShaderRead,Layout::eGeneral,Layout::eGeneral)};PipelineBarriers(command,ready);
+    const uint64_t id=++m_frame_id;
+	FfxVkFsr3_3_1_6FrameGenerationPrepareInfo prepare {};
+	prepare.commandBuffer = static_cast<VkCommandBuffer>(command);
+	prepare.color         = MakeImage(m_color.image, ColorFormat, m_width, m_height, ColorUsage);
+	prepare.depth         = MakeImage(m_depth.image, DepthFormat, m_width, m_height, InputUsage);
+	prepare.motionVectors = MakeImage(m_motion.image, MotionFormat, m_width, m_height, InputUsage);
+	prepare.renderWidth   = m_width;
+	prepare.renderHeight  = m_height;
+	prepare.motionVectorScaleX       = 1.0f;
+	prepare.motionVectorScaleY       = 1.0f;
+	prepare.frameTimeMilliseconds    = frame_ms;
+	prepare.minLuminance             = 0.0f;
+	prepare.maxLuminance             = 1.0f;
+	prepare.transferFunction         = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+	prepare.cameraNear               = 0.1f;
+	prepare.cameraFar                = 1000.0f;
+	prepare.viewSpaceToMeters        = 1.0f;
+	prepare.cameraVerticalFovRadians = 1.0f;
+	prepare.cameraUp[1]              = 1.0f;
+	prepare.cameraRight[0]           = 1.0f;
+	prepare.cameraForward[2]         = 1.0f;
+	prepare.frameId                  = id;
+	prepare.reset                    = was_reset ? VK_TRUE : VK_FALSE;
+	if (ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(m_context, &prepare) !=
+	    FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+		m_pending.push_back({id, m_scheduler.CurrentTick()});
+		Suspend("its optical flow prepare failed");
+		Reset();
+		return {};
+	}
+
+    KytyFsrOpticalFlow flow{};
+    const bool finished=kytyFsrFinishOpticalFlow(m_context,&flow);
+    m_pending.push_back({id,m_scheduler.CurrentTick()});
+    if(!finished||flow.frame_id!=id){Suspend("its optical flow completion failed");Reset();return {};}
+    m_reset=false;m_consecutive_failures=0;
+    if(was_reset)m_multi_prepares=0;
+    ++m_multi_prepares;
+    auto result=m_multi->Record(command,m_color.image,flow,outputs,m_multi_prepares>=7,diagnostics);
+    if(result.status==MultiFrameStatus::Failed)Reset();
+    return result;
+}
+
 #else
 
 FrameGenerator::FrameGenerator(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -602,6 +717,7 @@ FrameGenerator::~FrameGenerator() = default;
 bool FrameGenerator::Generate(vk::CommandBuffer, vk::Image, vk::Image, uint32_t, uint32_t) {
 	return false;
 }
+MultiFrameResult FrameGenerator::GenerateMultiple(vk::CommandBuffer,vk::Image,std::span<const vk::Image>,uint32_t,uint32_t,uint32_t,const MultiFrameDiagnostics*) { return {}; }
 bool FrameGenerator::IsSceneCut(uint64_t) {
 	return false;
 }

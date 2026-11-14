@@ -279,6 +279,55 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
 
+set(multi_frame_shader_source "${gpu_tiler_shader_dir}/multi_frame_warp.comp")
+set(multi_frame_shader_header "${gpu_tiler_generated_dir}/multi_frame_warp_spv.h")
+set(multi_frame_shader_spv "${gpu_tiler_generated_dir}/multi_frame_warp.spv")
+add_custom_command(OUTPUT "${multi_frame_shader_header}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+    COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${multi_frame_shader_spv}" "${multi_frame_shader_source}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${multi_frame_shader_spv} -DOUTPUT=${multi_frame_shader_header}
+        -DSYMBOL=MULTI_FRAME_WARP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${multi_frame_shader_source}" VERBATIM)
+list(APPEND gpu_tiler_shader_headers "${multi_frame_shader_header}")
+
+# Independent local RGB consistency refinement, once per Multi real pair.
+set(multi_refine_shader_source "${gpu_tiler_shader_dir}/multi_frame_refine.comp")
+set(multi_refine_shader_header "${gpu_tiler_generated_dir}/multi_frame_refine_spv.h")
+set(multi_refine_shader_spv "${gpu_tiler_generated_dir}/multi_frame_refine.spv")
+add_custom_command(OUTPUT "${multi_refine_shader_header}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+    COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${multi_refine_shader_spv}" "${multi_refine_shader_source}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${multi_refine_shader_spv} -DOUTPUT=${multi_refine_shader_header}
+        -DSYMBOL=MULTI_FRAME_REFINE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${multi_refine_shader_source}" VERBATIM)
+list(APPEND gpu_tiler_shader_headers "${multi_refine_shader_header}")
+
+# Multi-only synchronized SCD shader. Preserve all original embedded SDK blobs.
+set(multi_scd_shader_source "${gpu_tiler_shader_dir}/multi_frame_scd_sync.comp")
+set(multi_scd_shader_spv "${gpu_tiler_generated_dir}/multi_frame_scd_sync.spv")
+set(multi_scd_shader_header "${gpu_tiler_generated_dir}/multi_frame_scd_sync_spv.h")
+add_custom_command(OUTPUT "${multi_scd_shader_header}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+    COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${multi_scd_shader_spv}" "${multi_scd_shader_source}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${multi_scd_shader_spv} -DOUTPUT=${multi_scd_shader_header}
+        -DSYMBOL=MULTI_FRAME_SCD_SYNC_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${multi_scd_shader_source}" VERBATIM)
+if(WIN32)
+    add_custom_target(kyty_multi_scd_shader DEPENDS "${multi_scd_shader_header}")
+    add_dependencies(ffx_vulkan_fsr3_vk_framegeneration_3_1_6 kyty_multi_scd_shader)
+endif()
+
+set(multi_motion_shader_source "${gpu_tiler_shader_dir}/multi_frame_motion_validate.comp")
+set(multi_motion_shader_header "${gpu_tiler_generated_dir}/multi_frame_motion_validate_spv.h")
+set(multi_motion_shader_spv "${gpu_tiler_generated_dir}/multi_frame_motion_validate.spv")
+add_custom_command(OUTPUT "${multi_motion_shader_header}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+    COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${multi_motion_shader_spv}" "${multi_motion_shader_source}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${multi_motion_shader_spv} -DOUTPUT=${multi_motion_shader_header}
+        -DSYMBOL=MULTI_FRAME_MOTION_VALIDATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${multi_motion_shader_source}" VERBATIM)
+list(APPEND gpu_tiler_shader_headers "${multi_motion_shader_header}")
+
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
 set(fault_buffer_shader_header "${gpu_tiler_generated_dir}/fault_buffer_process_spv.h")
@@ -673,6 +722,19 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_executable(multi_frame_generation_hud_oracle_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MultiFrameGenerationHudOracleTests.cpp")
+
+add_executable(multi_frame_present_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MultiFramePresentPolicyTests.cpp")
+target_include_directories(multi_frame_present_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(multi_frame_generation_local_oracle_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MultiFrameGenerationLocalOracleTests.cpp")
+
+add_executable(multi_frame_generation_oracle_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MultiFrameGenerationOracleTests.cpp")
+
 add_executable(frame_generation_pacing_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FrameGenerationPacingTests.cpp")
 target_include_directories(frame_generation_pacing_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -701,6 +763,10 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_too_long
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 12345678901234567)
 	set_tests_properties(emulator_user_name_too_long PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_frame_generation_options_cli
+		COMMAND ${CMAKE_COMMAND} -DEMULATOR=$<TARGET_FILE:kyty_emulator>
+		-P "${KYTY_TESTS_DIR}/FrameGenerationOptionsCli.cmake")
+	set_tests_properties(emulator_frame_generation_options_cli PROPERTIES LABELS "cpu;frame_generation_options")
 	add_test(NAME emulator_present_mode_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Immediate)
 	add_test(NAME emulator_present_mode_invalid
@@ -713,6 +779,19 @@ if(BUILD_TESTING)
 	add_test(NAME table_leaf_getpc_native COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-leaf-getpc-only)
 	add_test(NAME table_tracking_soft_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-tracking-failure-only)
 	# Each child gets an explicit environment; the default-OFF case clears inherited settings.
+	add_test(NAME multi_frame_generation_hud_oracle COMMAND $<TARGET_FILE:multi_frame_generation_hud_oracle_tests>)
+	set_tests_properties(multi_frame_generation_hud_oracle PROPERTIES LABELS "cpu;frame_generation;multi_fg;hud")
+	add_test(NAME multi_frame_present_policy COMMAND $<TARGET_FILE:multi_frame_present_policy_tests>)
+	set_tests_properties(multi_frame_present_policy PROPERTIES LABELS "cpu;frame_generation;multi_fg")
+	add_test(NAME multi_frame_generation_local_oracle COMMAND $<TARGET_FILE:multi_frame_generation_local_oracle_tests>)
+	set_tests_properties(multi_frame_generation_local_oracle PROPERTIES LABELS "cpu;frame_generation;multi_fg")
+	add_test(NAME multi_frame_generation_oracle COMMAND $<TARGET_FILE:multi_frame_generation_oracle_tests>)
+	set_tests_properties(multi_frame_generation_oracle PROPERTIES LABELS "cpu;frame_generation;multi_fg")
+	if(WIN32) # Current FSR optical-flow integration is Windows-only.
+		add_test(NAME multi_frame_generation_native
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --multi-frame-generation-only)
+		set_tests_properties(multi_frame_generation_native PROPERTIES LABELS "gpu;frame_generation;multi_fg" TIMEOUT 180 RUN_SERIAL TRUE)
+	endif()
 	add_test(NAME frame_generation_pacing COMMAND $<TARGET_FILE:frame_generation_pacing_tests>)
 	set_tests_properties(frame_generation_pacing PROPERTIES LABELS "cpu;frame_generation_pacing")
 	add_test(NAME frame_generation_diag_off
@@ -913,6 +992,10 @@ set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		multi_frame_generation_hud_oracle_tests
+		multi_frame_present_policy_tests
+		multi_frame_generation_local_oracle_tests
+		multi_frame_generation_oracle_tests
 		frame_generation_pacing_tests
 		frame_generation_diag_tests
 		psml_tests

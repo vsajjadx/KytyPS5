@@ -41,6 +41,8 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
+	EXIT_IF(!IsFrameGenerationBackendValid(cfg.frame_generation_backend));
+	EXIT_IF(!IsFrameGenerationMultiplierValid(cfg.frame_generation_multiplier));
 
 	RevisionMutation revision_mutation;
 	*g_config = cfg;
@@ -146,6 +148,14 @@ bool Output1080pEnabled() {
 
 bool FrameGenerationEnabled() {
 	return g_config->frame_generation_enabled;
+}
+
+const std::string& FrameGenerationBackend() {
+	return g_config->frame_generation_backend;
+}
+
+uint32_t FrameGenerationMultiplier() {
+	return g_config->frame_generation_multiplier;
 }
 
 bool HideCursorEnabled() {

@@ -33,6 +33,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(hdr_enabled);
 	KYTY_CFG_SET(output_1080p_enabled);
 	KYTY_CFG_SET(frame_generation_enabled);
+	KYTY_CFG_SET(frame_generation_backend);
+	KYTY_CFG_SET(frame_generation_multiplier);
 	KYTY_CFG_SET(hide_cursor_enabled);
 	KYTY_CFG_SET(stretch_enabled);
 	KYTY_CFG_SET(readback_linear_images);
@@ -106,6 +108,14 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(output_1080p_enabled);
 	KYTY_CFG_GET(frame_generation_enabled);
+	frame_generation_backend = s.value("frame_generation_backend", QStringLiteral("fsr")).toString();
+	if (!Config::IsFrameGenerationBackendValid(frame_generation_backend.toStdString())) {
+		frame_generation_backend = QStringLiteral("fsr");
+	}
+	bool multiplier_ok = false;
+	const int multiplier = s.value("frame_generation_multiplier", 2).toInt(&multiplier_ok);
+	frame_generation_multiplier = multiplier_ok &&
+	    Config::IsFrameGenerationMultiplierValid(static_cast<uint32_t>(multiplier)) ? multiplier : 2;
 	KYTY_CFG_GET(hide_cursor_enabled);
 	KYTY_CFG_GET(stretch_enabled);
 	KYTY_CFG_GET(readback_linear_images);

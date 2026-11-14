@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Config {
@@ -27,6 +28,14 @@ enum class LogDirection { Silent, Console, File };
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class PssrUpscaler { Linear, DLSS, FSR };
+
+inline bool IsFrameGenerationBackendValid(std::string_view backend) {
+	return backend == "fsr" || backend == "multi";
+}
+
+constexpr bool IsFrameGenerationMultiplierValid(uint32_t multiplier) {
+	return multiplier >= 2 && multiplier <= 6;
+}
 
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
@@ -117,6 +126,9 @@ struct ConfigOptions {
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   frame_generation_enabled        = false;
+	// Selecting a backend or multiplier does not enable generation.
+	std::string            frame_generation_backend        = "fsr";
+	uint32_t               frame_generation_multiplier     = 2;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -158,6 +170,8 @@ bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     Output1080pEnabled();
 bool        FrameGenerationEnabled();
+const std::string& FrameGenerationBackend();
+uint32_t    FrameGenerationMultiplier();
 bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();

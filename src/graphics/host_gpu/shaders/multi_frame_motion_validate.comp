@@ -1,0 +1,185 @@
+// Copyright 2026 KytyPS5 contributors. SPDX-License-Identifier: GPL-2.0-only
+// Independent per-pixel correspondence and conditional static/moving layer fit.
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D previous_image;
+layout(set=0,binding=1) uniform sampler2D current_image;
+layout(set=0,binding=2) uniform isampler2D coarse_flow;
+layout(set=0,binding=6) uniform isampler2D raw_flow;
+layout(set=0,binding=7,rgba32i) uniform writeonly iimage2D full_motion;
+layout(set=0,binding=8,rgba32f) uniform writeonly image2D static_layer;
+layout(push_constant) uniform Parameters { uvec2 extent; uvec2 flow_extent; float time; uint copy_history; } pc;
+bool inside(ivec2 p){return all(greaterThanEqual(p,ivec2(0)))&&all(lessThan(p,ivec2(pc.extent)));}
+vec3 old_at(ivec2 p){return texelFetch(previous_image,clamp(p,ivec2(0),ivec2(pc.extent)-1),0).rgb;}
+vec3 new_at(ivec2 p){return texelFetch(current_image,clamp(p,ivec2(0),ivec2(pc.extent)-1),0).rgb;}
+uint squared(vec3 a,vec3 b){ivec3 d=ivec3(round(a*255.0))-ivec3(round(b*255.0));return uint(d.x*d.x+d.y*d.y+d.z*d.z);}
+uvec2 score(ivec2 p,ivec2 v){
+    if(!inside(p+v))return uvec2(0xffffffffu);
+    uint center=squared(new_at(p),old_at(p+v)),support=0u;
+    for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x)
+        support+=squared(new_at(p+ivec2(x,y)),old_at(p+v+ivec2(x,y)));
+    return uvec2(center,support);
+}
+bool better(uvec2 a,uvec2 b){return a.x<b.x||(a.x==b.x&&a.y<b.y);}
+// Endpoint-only background support; no oracle alpha, mask, reference or UI coordinates.
+bool background_at(ivec2 p,ivec2 v){return inside(p)&&inside(p+v)&&score(p,v).x<=score(p,ivec2(0)).x;}
+bool affine_bound(inout float lower,inout float upper,float a,float b,float c,float d){
+    float slope=b-d,rhs=c-a;
+    if(slope>0.0)upper=min(upper,rhs/slope);
+    else if(slope<0.0)lower=max(lower,rhs/slope);
+    else if(rhs<0.0)return false;
+    return lower<=upper;
+}
+bool layer_fit(vec3 p,vec3 c,vec3 b0,vec3 b1,out vec4 result){
+    vec3 delta=b1-b0;float denominator=dot(delta,delta);
+    if(!(denominator>0.0))return false; // Unidentifiable stationary/periodic background.
+    const float quantum=0.5/255.0;
+    float low=0.0,high=1.0;
+    // Exact affine feasible-beta interval for the nearest-RGBA8 uncertainty boxes.
+    for(int ch=0;ch<3;++ch){
+        float la[3]=float[](0.0,p[ch]-quantum,c[ch]-quantum);
+        float lb[3]=float[](0.0,-b0[ch]-quantum,-b1[ch]-quantum);
+        float ua[3]=float[](1.0,p[ch]+quantum,c[ch]+quantum);
+        float ub[3]=float[](-1.0,-b0[ch]+quantum,-b1[ch]+quantum);
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
+            if(!affine_bound(low,high,la[i],lb[i],ua[j],ub[j]))return false;
+    }
+    float estimate=dot(c-p,delta)/denominator;
+    if(isnan(estimate)||isinf(estimate)||low>high||(low==0.0&&high==1.0))return false;
+    // Project only onto a proven physically feasible interval, never clamp-and-accept.
+    float beta=clamp(estimate,low,high),eps=quantum*(1.0+beta);
+    vec3 k0=p-beta*b0,k1=c-beta*b1;
+    vec3 lower=max(vec3(0),max(k0-vec3(eps),k1-vec3(eps)));
+    vec3 upper=min(vec3(1.0-beta),min(k0+vec3(eps),k1+vec3(eps)));
+    if(any(greaterThan(lower,upper)))return false;
+    result=vec4((lower+upper)*0.5,beta);
+    return !any(isnan(result))&&!any(isinf(result));
+}
+// Compare changing surrounding observations, not the composited center pixel.
+// Fixed SDK-block-scale ring; exact stationary samples carry no moving evidence.
+uvec3 context_score(ivec2 p,ivec2 v){
+    const ivec2 ring[12]=ivec2[](ivec2(-8,0),ivec2(8,0),ivec2(0,-8),ivec2(0,8),
+        ivec2(-16,0),ivec2(16,0),ivec2(0,-16),ivec2(0,16),
+        ivec2(-8,-8),ivec2(8,-8),ivec2(-8,8),ivec2(8,8));
+    uvec3 value=uvec3(0);
+    for(int i=0;i<12;++i){
+        ivec2 q=p+ring[i];if(!inside(q)||!inside(q+v))continue;
+        uint baseline=squared(new_at(q),old_at(q));if(baseline==0u)continue;
+        uint error=squared(new_at(q),old_at(q+v));
+        value.x+=baseline>error?baseline-error:0u;value.y+=error;value.z++;
+    }
+    return value;
+}
+bool context_better(uvec3 a,uvec3 b){
+    if(a.z==0u||a.x==0u)return false;if(b.z==0u)return true;
+    uint gain_a=a.x*b.z,gain_b=b.x*a.z;
+    return gain_a>gain_b||(gain_a==gain_b&&a.y*b.z<b.y*a.z);
+}
+bool stationary_at(ivec2 p){return squared(new_at(p),old_at(p))==0u;}
+// One observed stationary-color neighbor plus ONE background endpoint can
+// identify a layer when the other integer background endpoint is occluded.
+// All bounds share the same beta/K and the same observed foreground quantization
+// bin: no independent spending of format uncertainty between the two endpoints.
+bool one_anchor_value(vec3 known,vec3 other,vec3 foreground,vec3 background,out vec4 result){
+    const float q=0.5/255.0;
+    vec3 flo=max(vec3(0),foreground-vec3(q)),fhi=min(vec3(1),foreground+vec3(q));
+    vec3 blo=max(vec3(0),background-vec3(q)),bhi=min(vec3(1),background+vec3(q));
+    vec3 ylo=max(vec3(0),known-vec3(q)),yhi=min(vec3(1),known+vec3(q));
+    vec3 olo=max(vec3(0),other-vec3(q)),ohi=min(vec3(1),other+vec3(q));
+    vec3 delta=background-foreground;float denominator=dot(delta,delta);
+    if(!(denominator>0.0))return false;
+    float low=0.0,high=1.0;
+    for(int ch=0;ch<3;++ch){
+        float la[3]=float[](flo[ch],ylo[ch],olo[ch]);
+        float lb[3]=float[](-flo[ch],-bhi[ch],-1.0);
+        float ua[3]=float[](fhi[ch],yhi[ch],ohi[ch]);
+        float ub[3]=float[](-fhi[ch],-blo[ch],0.0);
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
+            if(!affine_bound(low,high,la[i],lb[i],ua[j],ub[j]))return false;
+    }
+    float estimate=dot(known-foreground,delta)/denominator;
+    if(isnan(estimate)||isinf(estimate)||low>high||(low==0.0&&high==1.0))return false;
+    float beta=clamp(estimate,low,high);if(!(beta>0.0))return false;
+    vec3 lower=max((1.0-beta)*flo,max(ylo-beta*bhi,olo-vec3(beta)));
+    vec3 upper=min((1.0-beta)*fhi,min(yhi-beta*blo,ohi));
+    if(any(greaterThan(lower,upper)))return false;
+    result=vec4((lower+upper)*0.5,beta);
+    return !any(isnan(result))&&!any(isinf(result));
+}
+bool stationary_anchor_fit(ivec2 p,ivec2 v,out vec4 result){
+    vec3 colors[24];int colors_count=0;float best_residual=1.0e20;bool found=false;
+    for(int y=-2;y<=2;++y)for(int x=-2;x<=2;++x){
+        if(x==0&&y==0)continue;ivec2 at=p+ivec2(x,y);
+        if(!inside(at)||!stationary_at(at))continue;
+        vec3 foreground=new_at(at);bool duplicate=false;
+        for(int i=0;i<colors_count;++i)duplicate=duplicate||all(equal(foreground,colors[i]));
+        if(duplicate)continue;colors[colors_count++]=foreground;
+        for(int endpoint=0;endpoint<2;++endpoint){
+            ivec2 source=endpoint==0?p-v:p+v;
+            if(!inside(source)||stationary_at(source))continue;
+            vec3 known=endpoint==0?old_at(p):new_at(p),other=endpoint==0?new_at(p):old_at(p);
+            vec3 background=endpoint==0?new_at(source):old_at(source);vec4 fit;
+            if(one_anchor_value(known,other,foreground,background,fit)){
+                vec3 residual=known-fit.rgb-fit.a*background;float error=dot(residual,residual);
+                if(error<best_residual){best_residual=error;result=fit;found=true;}
+            }
+        }
+    }
+    return found;
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(!inside(p))return;
+    // Exact observed RGB stationarity is the minimum-motion solution; no color threshold.
+    // Quarantine this source pixel from moving hypotheses as well as preserving its output.
+    vec3 observed=new_at(p);
+    if(all(equal(uvec3(round(old_at(p)*255.0)),uvec3(round(observed*255.0))))){
+        imageStore(full_motion,p,ivec4(0));imageStore(static_layer,p,vec4(observed,0));return;
+    }
+    ivec2 cell=p/8,hi=ivec2(pc.flow_extent)-1;
+    const ivec2 offsets[5]=ivec2[](ivec2(0),ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    ivec2 candidates[11];int count=0;
+    for(int i=0;i<5;++i)candidates[count++]=texelFetch(coarse_flow,clamp(cell+offsets[i],ivec2(0),hi),0).xy;
+    for(int i=0;i<5;++i)candidates[count++]=texelFetch(raw_flow,clamp(cell+offsets[i],ivec2(0),hi),0).xy;
+    candidates[count++]=ivec2(0);
+    ivec2 seen[11],best=ivec2(0),alternate=ivec2(0);int unique=0;
+    uvec2 best_score=uvec2(0xffffffffu),alternate_score=best_score;
+    for(int n=0;n<count;++n){
+        ivec2 v=candidates[n];bool duplicate=false;
+        for(int i=0;i<unique;++i)duplicate=duplicate||all(equal(v,seen[i]));
+        if(duplicate)continue;seen[unique++]=v;uvec2 value=score(p,v);
+        // Lexicographic center then spatial support keeps one-pixel correspondences
+        // from being outvoted by surrounding pixels of another motion layer.
+        if(better(value,best_score)){best=v;best_score=value;}
+        if(any(notEqual(v,ivec2(0)))&&better(value,alternate_score)){alternate=v;alternate_score=value;}
+    }
+    vec4 layer=vec4(0,0,0,-1);
+    if(any(notEqual(alternate,ivec2(0)))&&inside(p-alternate)&&inside(p+alternate)&&
+       background_at(p-alternate,alternate)&&background_at(p+alternate,alternate)){
+        vec4 fit;
+        if(layer_fit(old_at(p),new_at(p),new_at(p-alternate),old_at(p+alternate),fit))layer=fit;
+    }
+    // Exact center correspondences retain the old moving-foreground choice.
+    // Ambiguous/composited centers use independent changing-neighbor evidence;
+    // physical layer feasibility participates BEFORE committing the alternate.
+    if(best_score.x!=0u){
+        const ivec2 block_ring[9]=ivec2[](ivec2(0),ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
+            ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2));
+        ivec2 tried[18];int tried_count=0;uvec3 chosen_score=uvec3(0);
+        for(int n=0;n<18;++n){
+            ivec2 at=clamp(cell+block_ring[n%9],ivec2(0),hi);
+            ivec2 v=n<9?texelFetch(coarse_flow,at,0).xy:texelFetch(raw_flow,at,0).xy;
+            if(all(equal(v,ivec2(0))))continue;
+            bool duplicate=false;for(int j=0;j<tried_count;++j)duplicate=duplicate||all(equal(v,tried[j]));
+            if(duplicate)continue;tried[tried_count++]=v;
+            uvec3 evidence=context_score(p,v);if(!context_better(evidence,chosen_score))continue;
+            if(!inside(p-v)||!inside(p+v))continue;
+            vec4 fit;bool fitted=false;
+            if(!stationary_at(p-v)&&!stationary_at(p+v))
+                fitted=layer_fit(old_at(p),new_at(p),new_at(p-v),old_at(p+v),fit);
+            if(!fitted)fitted=stationary_anchor_fit(p,v,fit);
+            if(fitted){chosen_score=evidence;alternate=v;layer=fit;}
+        }
+    }
+    imageStore(full_motion,p,ivec4(best,alternate));
+    imageStore(static_layer,p,layer);
+}

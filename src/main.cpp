@@ -110,6 +110,9 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf(
 	    "  --frame-generation                   Interpolate a frame between game frames (F3).\n");
+	::printf("  --frame-generation-backend <fsr|multi> Backend; multi is experimental. Default: fsr.\n");
+	::printf("  --frame-generation-multiplier <2-6>  Requested Multi factor; FSR stays 2x. Default: 2.\n");
+	::printf("                                       Selection alone does not enable generation.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -388,6 +391,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.keyboard_player) ||
 			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
 				::printf("invalid keyboard player: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--frame-generation-backend") {
+			if (!Config::IsFrameGenerationBackendValid(value)) {
+				::printf("invalid frame generation backend (expected fsr or multi): %s\n", value.c_str());
+				return false;
+			}
+			options.config.frame_generation_backend = value;
+		} else if (arg == "--frame-generation-multiplier") {
+			if (!ParseUint32(value, options.config.frame_generation_multiplier) ||
+			    !Config::IsFrameGenerationMultiplierValid(options.config.frame_generation_multiplier)) {
+				::printf("invalid frame generation multiplier (expected integer 2-6): %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--present-mode") {

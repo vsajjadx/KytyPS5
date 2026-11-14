@@ -162,6 +162,13 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
 		            log == Configuration::LogDirection::File);
 	        });
+	// The saved multiplier applies to Multi only; FSR always generates one frame.
+	const auto update_fg_backend = [this] {
+		m_ui->comboBox_frame_generation_multiplier->setEnabled(
+		    m_ui->comboBox_frame_generation_backend->currentData().toString() == QStringLiteral("multi"));
+	};
+	connect(m_ui->comboBox_frame_generation_backend, &QComboBox::currentIndexChanged,
+	        this, update_fg_backend);
 	// Pro mode shows the upscaler and its folder.
 	const auto show_pssr = [this] {
 		const bool pro = m_ui->checkBox_pro->isChecked();
@@ -301,6 +308,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_output_1080p->setChecked(info.output_1080p_enabled);
 	m_ui->checkBox_frame_generation->setChecked(info.frame_generation_enabled);
+	m_ui->comboBox_frame_generation_backend->clear();
+	m_ui->comboBox_frame_generation_backend->addItem(tr("AMD FSR 3.1 (2x)"), QStringLiteral("fsr"));
+	m_ui->comboBox_frame_generation_backend->addItem(tr("Multi (experimental)"), QStringLiteral("multi"));
+	m_ui->comboBox_frame_generation_backend->setCurrentIndex(
+	    m_ui->comboBox_frame_generation_backend->findData(info.frame_generation_backend));
+	m_ui->comboBox_frame_generation_multiplier->clear();
+	for (int factor = 2; factor <= 6; ++factor) {
+		m_ui->comboBox_frame_generation_multiplier->addItem(tr("%1x").arg(factor), factor);
+	}
+	m_ui->comboBox_frame_generation_multiplier->setCurrentIndex(
+	    m_ui->comboBox_frame_generation_multiplier->findData(info.frame_generation_multiplier));
+	m_ui->comboBox_frame_generation_multiplier->setEnabled(info.frame_generation_backend == QStringLiteral("multi"));
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_stretch->setChecked(info.stretch_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
@@ -562,6 +581,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.output_1080p_enabled      = ui.checkBox_output_1080p->isChecked();
 	info.frame_generation_enabled  = ui.checkBox_frame_generation->isChecked();
+	info.frame_generation_backend  = ui.comboBox_frame_generation_backend->currentData().toString();
+	info.frame_generation_multiplier = ui.comboBox_frame_generation_multiplier->currentData().toInt();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.stretch_enabled           = ui.checkBox_stretch->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();

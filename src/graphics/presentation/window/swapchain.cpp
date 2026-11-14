@@ -16,6 +16,7 @@
 #include "graphics/presentation/frameGeneration.h"
 #include "graphics/presentation/frameGenerationDiag.h"
 #include "graphics/presentation/frameGenerationPacing.h"
+#include "graphics/presentation/multiFramePresentPolicy.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
@@ -27,6 +28,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <charconv>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -48,8 +55,12 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	uint32_t      references   = 0; // FramePool mutex; each queued/layer/last-shown owner holds one.
+	bool          clear_pending = false;
+	vk::ClearColorValue clear_color {};
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
+	bool TryConfigure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
@@ -111,11 +122,21 @@ public:
 		}
 		m_free.pop_back();
 		frame->busy = true;
+		frame->references = 1;
+		frame->clear_pending = false;
 		m_mutex.Unlock();
 
 		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::SwapchainFrame);
-		m_scheduler.Wait(frame->present_tick);
+		// A released frame only names submitted uses. Pool reuse must not run scheduler
+		// callbacks or record/submit from a guest preparation thread.
+		m_scheduler.GetMasterSemaphore().Wait(frame->present_tick);
 		return frame;
+	}
+
+	void Retain(Presenter::Frame* frame) {
+		Common::LockGuard lock(m_mutex);
+		EXIT_IF(!frame->busy || frame->references == 0);
+		++frame->references;
 	}
 
 	void Release(Presenter::Frame* frame) {
@@ -123,6 +144,8 @@ public:
 		if (!frame->busy) {
 			EXIT("prepared frame was released twice\n");
 		}
+		EXIT_IF(frame->references == 0);
+		if (--frame->references != 0) return;
 		frame->busy = false;
 		m_free.push_back(frame);
 	}
@@ -181,6 +204,51 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
 		     extent.width, extent.height, static_cast<int>(format));
 	}
+}
+
+bool Presenter::Frame::TryConfigure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
+		return false;
+	}
+	auto&      dst        = image;
+	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
+	                        dst.extent.height == extent.height && dst.format == format;
+	if (compatible) {
+		return true;
+	}
+
+	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
+	const auto required =
+	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
+	    vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eTransferSrc |
+	    vk::FormatFeatureFlagBits::eTransferDst;
+	if ((features & required) != required) {
+		return false;
+	}
+
+	if (dst.image != nullptr) {
+		graphics.device.destroyImageView(view, nullptr);
+		view = nullptr;
+		graphics.DeleteImage(dst);
+	}
+
+	vk::ImageCreateInfo create {};
+	create.sType         = vk::StructureType::eImageCreateInfo;
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+	               vk::ImageUsageFlagBits::eSampled;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, dst)) {
+		return false;
+	}
+	return true;
 }
 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
@@ -320,9 +388,141 @@ static void CaptureMenuTestFrame(CommandBuffer& command, Presenter::Frame& frame
 	});
 }
 
+// Optional owned-menu-test capture of a committed Multi generated source. This
+// is pre-composition/pre-Present evidence, never proof of successful WSI/scanout.
+struct MenuGeneratedCapture {
+    MenuGeneratedCapture() {
+        const char* directory = std::getenv("KYTY_MENU_TEST");
+        if (directory != nullptr && directory[0] != '\0') folder = std::filesystem::path(directory);
+    }
+    std::filesystem::path folder;
+    std::chrono::steady_clock::time_point next_poll {};
+    uint64_t seen_sequence = 0, pending_sequence = 0;
+    uint32_t requested_ordinal = 0; // 0 selects the next committed generated ticket.
+};
+static void CaptureMenuTestGeneratedFrame(WindowContext& window, CommandScheduler& scheduler,
+    FrameGenerator* generator, Presenter::Frame& frame, uint32_t ordinal, uint32_t factor,
+    uint64_t epoch, MenuGeneratedCapture& state) {
+    if (state.folder.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto& folder = state.folder;
+    if (now >= state.next_poll) {
+        state.next_poll = now + std::chrono::milliseconds(200);
+        std::ifstream request(folder / "capture-generated.txt", std::ios::binary);
+        std::array<char, 64> bytes {};
+        request.read(bytes.data(), bytes.size());
+        const auto count = request.gcount();
+        if (count > 0 && count < static_cast<std::streamsize>(bytes.size())) {
+            const char* at = bytes.data(); const char* end = at + count;
+            const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+            const auto skip = [&] { while (at != end && space(*at)) ++at; };
+            skip();
+            uint64_t sequence = 0; uint32_t requested_ordinal = 0;
+            const auto sequence_parse = std::from_chars(at, end, sequence);
+            bool valid = sequence_parse.ec == std::errc {} && sequence != 0;
+            at = sequence_parse.ptr;
+            valid = valid && (at == end || space(*at));
+            skip();
+            if (valid && at != end) {
+                const auto ordinal_parse = std::from_chars(at, end, requested_ordinal);
+                valid = ordinal_parse.ec == std::errc {} && requested_ordinal >= 1 && requested_ordinal <= 5;
+                at = ordinal_parse.ptr; skip();
+            }
+            valid = valid && at == end;
+            if (valid && sequence > state.seen_sequence) {
+                state.seen_sequence = sequence; state.pending_sequence = sequence;
+                state.requested_ordinal = requested_ordinal;
+                std::printf("MENU_TEST_GENERATED: requested sequence=%llu ordinal=%u (0=next committed)\n",
+                    static_cast<unsigned long long>(sequence), requested_ordinal);
+                std::fflush(stdout);
+            }
+        }
+    }
+    if (!state.pending_sequence || (state.requested_ordinal && state.requested_ordinal != ordinal)) return;
+    if (!generator || factor < 2 || factor > 6 || ordinal == 0 || ordinal >= factor) return;
+    const auto scene = generator->GetMultipleSceneStatus();
+    if (scene.state != MultiFrameSceneState::Clear || scene.flags != 0 || scene.recorded_tick == 0 ||
+        !scheduler.IsFree(scene.recorded_tick) || frame.present_tick >= scheduler.CurrentTick() ||
+        !scheduler.IsFree(frame.present_tick)) return;
+    const auto sequence = std::exchange(state.pending_sequence, uint64_t {0});
+    const auto width = frame.image.extent.width, height = frame.image.extent.height;
+    if (frame.image.format != vk::Format::eR8G8B8A8Unorm || width == 0 || height == 0 ||
+        width > 4096 || height > 4096 || frame.image.extent.depth != 1) {
+        std::printf("MENU_TEST_GENERATED: rejected sequence=%llu format=%d size=%ux%u\n",
+            static_cast<unsigned long long>(sequence), static_cast<int>(frame.image.format), width, height);
+        std::fflush(stdout); return;
+    }
+    const uint64_t size = uint64_t {width} * height * 4;
+    const auto path = folder / ("capture-generated-" + std::to_string(sequence) +
+                               "-ordinal-" + std::to_string(ordinal) + ".ppm");
+    // Exclusive creation occurs BEFORE allocation/recording. Existing evidence is
+    // never opened for truncation, even after a process restart with the same sequence.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    auto* raw_output = _wfopen(path.c_str(), L"wbx");
+#else
+    auto* raw_output = std::fopen(path.c_str(), "wbx");
+#endif
+    if (!raw_output) {
+        std::printf("MENU_TEST_GENERATED: exclusive open failed sequence=%llu path=%s\n",
+            static_cast<unsigned long long>(sequence), path.string().c_str());
+        std::fflush(stdout); return;
+    }
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> output(raw_output, &std::fclose);
+    Buffer download(window.graphic_ctx, scheduler, MemoryUsage::Download, 0,
+                    vk::BufferUsageFlagBits::eTransferDst, size);
+    // The worker reaches this committed-ticket boundary with no live command:
+    // BeginMulti submitted/waited its generation; the preceding Present also submitted.
+    // BeginCommand enforces that precondition instead of implicitly flushing any work.
+    auto& command = scheduler.BeginCommand();
+    frame.Transit(command.Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+    vk::BufferImageCopy copy {};
+    copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    copy.imageExtent = {width, height, 1}; // rowLength/imageHeight0: tight RGBA8.
+    command.Handle().copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+                                      download.Handle(), copy);
+    vk::BufferMemoryBarrier barrier {};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = download.Handle(); barrier.size = size;
+    command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    const auto copy_tick = scheduler.Submit();
+    frame.present_tick = MultiFramePresentPolicy::RetainTick(frame.present_tick, copy_tick);
+    scheduler.Wait(copy_tick); // Submitted tick only. Buffer/source survive through completion.
+    download.Invalidate(0, size);
+    const auto bytes = download.Mapped();
+    if (bytes.size() < size) {
+        std::printf("MENU_TEST_GENERATED: mapped download too small sequence=%llu\n",
+            static_cast<unsigned long long>(sequence));
+        std::fflush(stdout); return; // GPU copy completed; retain the incomplete evidence file.
+    }
+    bool okay = std::fprintf(output.get(),
+        "P6\n# MENU_TEST_GENERATED sequence=%llu ordinal=%u factor=%u epoch=%llu scene_flags=0 generation_tick=%llu copy_tick=%llu source=multi_generated_pre_present scanout=unknown\n%u %u\n255\n",
+        static_cast<unsigned long long>(sequence), ordinal, factor,
+        static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(scene.recorded_tick),
+        static_cast<unsigned long long>(copy_tick), width, height) > 0;
+    std::vector<uint8_t> row(size_t(width) * 3);
+    for (uint32_t y = 0; okay && y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const auto* source = bytes.data() + (uint64_t {y} * width + x) * 4;
+            row[size_t(x) * 3] = source[0]; row[size_t(x) * 3 + 1] = source[1]; row[size_t(x) * 3 + 2] = source[2];
+        }
+        okay = std::fwrite(row.data(), 1, row.size(), output.get()) == row.size();
+    }
+    okay = std::fflush(output.get()) == 0 && okay;
+    okay = std::fclose(output.release()) == 0 && okay;
+    std::printf("MENU_TEST_GENERATED: capture sequence=%llu ordinal=%u factor=%u scene_flags=0 generation_tick=%llu copy_tick=%llu size=%ux%u ok=%u source=multi_generated_pre_present path=%s\n",
+        static_cast<unsigned long long>(sequence), ordinal, factor,
+        static_cast<unsigned long long>(scene.recorded_tick), static_cast<unsigned long long>(copy_tick),
+        width, height, okay ? 1u : 0u, path.string().c_str());
+    std::fflush(stdout);
+}
+
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, PresentedRecreate };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
@@ -384,12 +584,21 @@ struct Presenter::Impl {
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		FrameGeneration::SetBackend(Config::FrameGenerationBackend() == "multi"
+		    ? FrameGeneration::Backend::Multi : FrameGeneration::Backend::Fsr);
+		FrameGeneration::SetMultiplier(Config::FrameGenerationMultiplier());
 		const char* env = std::getenv("KYTY_FRAME_GENERATION");
 		FrameGeneration::SetEnabled(Config::FrameGenerationEnabled() ||
 		                            (env != nullptr && env[0] == '1'));
 	}
 	~Impl() {
+		StopAsync();
 		frame_generator.reset();
+		present_scheduler.Wait(present_scheduler.CurrentTick() - 1);
+		for (auto& set: multi_outputs) for (auto& frame: set) {
+			window.graphic_ctx.device.destroyImageView(frame.view, nullptr);
+			if (frame.image.image) window.graphic_ctx.DeleteImage(frame.image);
+		}
 		if (generated.image.image != nullptr) {
 			present_scheduler.Wait(present_scheduler.CurrentTick() - 1);
 			window.graphic_ctx.device.destroyImageView(generated.view, nullptr);
@@ -494,6 +703,14 @@ struct Presenter::Impl {
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
+		if (async_owner.load(std::memory_order_acquire)) {
+			async_epoch.fetch_add(1, std::memory_order_release);
+			const auto cancelled = multi_cadence.Cancel();
+			multi_superseded += cancelled.generated;
+			force_real_after_recovery |= cancelled.real != 0;
+			active_output_set = -1;
+			if (frame_generator) frame_generator->Reset();
+		}
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
@@ -523,7 +740,26 @@ struct Presenter::Impl {
 		return image;
 	}
 	// `kind` is the calling site's identity, used only by the default-off KYTY_FG_DIAG statistics.
-	void Present(FrameGenerationDiag::PresentKind kind = FrameGenerationDiag::PresentKind::Real);
+	bool Present(FrameGenerationDiag::PresentKind kind = FrameGenerationDiag::PresentKind::Real);
+	static uint64_t AsyncNow() {
+		return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now().time_since_epoch()).count());
+	}
+	struct Job { std::array<Layer, 2> layers {}; size_t count = 0; uint64_t arrived = 0; };
+	bool UseAsync();
+	bool IsPooled(Frame* frame) const;
+	void SetLastShown(Frame* frame);
+	void DropJob(Job job);
+	void Enqueue(std::span<const Layer> incoming);
+	void RequestRepeat();
+	void RequestClear(int bus);
+	void StopAsync();
+	void CancelMulti(bool show_real);
+	void ProcessJob(Job job);
+	bool BeginMulti(Frame* real, uint64_t arrived);
+	void RunAsync();
+	void ReportMulti(bool force = false);
+	void ResetMultiWindow();
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -541,7 +777,442 @@ struct Presenter::Impl {
 	bool                                  pending_real    = false;
 	uint64_t                              generated_count = 0;
 	FrameGenerationDiag::Stats            fg_diag;
+	std::atomic_bool async_owner {false}, async_pending {false}, async_visible {false};
+	std::atomic<uint64_t> async_epoch {1}, async_real_dropped {0};
+	std::mutex async_mutex;
+	std::condition_variable async_wake;
+	std::thread async_worker;
+	MultiFramePresentPolicy::Queue<Job> async_jobs;
+	bool async_stopping = false, async_repeat = false;
+	uint32_t async_clear_mask = 0, async_queue_peak = 0;
+	Frame* last_shown = nullptr;
+	std::array<std::array<Frame, MultiFramePresentPolicy::MaxGenerated>, MultiFramePresentPolicy::OutputSets> multi_outputs {};
+	MultiFramePresentPolicy::Cadence multi_cadence;
+	MenuGeneratedCapture menu_generated_capture; // Worker-owned; disabled without KYTY_MENU_TEST.
+	int active_output_set = -1;
+	uint64_t batch_overlay_revision = 0, last_multi_arrival = 0;
+	std::chrono::nanoseconds multi_interval {};
+	bool emitting_multi_generated = false, force_real_after_recovery = false;
+	bool main_real_accounted = true;
+	bool async_multi_mode = false, multi_window_enabled = false;
+	uint32_t multi_window_factor = 2;
+	MultiFramePresentPolicy::SuccessCounts multi_success;
+	uint64_t multi_requested = 0, multi_eligible = 0, multi_batches = 0, multi_recorded = 0;
+	uint64_t multi_seeded = 0, multi_failed = 0, multi_scene = 0, multi_late = 0, multi_superseded = 0;
+	uint64_t multi_present_failed = 0, multi_report_start = 0, multi_last_present = 0, multi_sample_dropped = 0;
+	std::array<uint64_t, 512> multi_samples {};
+	uint32_t multi_sample_count = 0;
 };
+
+// One owner after activation. Mailbox locks protect only bounded CPU ownership transfers.
+bool Presenter::Impl::UseAsync() {
+    if (async_owner.load(std::memory_order_acquire)) return true;
+    if (FrameGeneration::GetBackend() != FrameGeneration::Backend::Multi ||
+        !FrameGeneration::IsAvailable()) return false;
+    Common::LockGuard legacy(present_mutex);
+    if (!async_owner.load(std::memory_order_relaxed)) {
+        async_owner.store(true, std::memory_order_release);
+        async_worker = std::thread([this] { RunAsync(); });
+    }
+    return true;
+}
+
+bool Presenter::Impl::IsPooled(Frame* frame) const {
+    if (!frame || frame == &generated) return false;
+    for (const auto& set: multi_outputs)
+        for (const auto& output: set) if (frame == &output) return false;
+    return true;
+}
+void Presenter::Impl::SetLastShown(Frame* frame) {
+    if (last_shown == frame) {
+        async_visible.store(frame != nullptr || layers[1].frame != nullptr, std::memory_order_release);
+        return;
+    }
+    if (IsPooled(frame)) frames.Retain(frame);
+    auto* previous = last_shown;
+    last_shown = frame;
+    if (IsPooled(previous)) frames.Release(previous);
+    async_visible.store(frame != nullptr || layers[1].frame != nullptr, std::memory_order_release);
+}
+void Presenter::Impl::DropJob(Job job) {
+    for (size_t i = 0; i < job.count; ++i) {
+        if (job.layers[i].bus == 0 && job.layers[i].frame && !job.layers[i].frame->blank)
+            async_real_dropped.fetch_add(1, std::memory_order_relaxed);
+        if (job.layers[i].frame) frames.Release(job.layers[i].frame);
+    }
+}
+void Presenter::Impl::Enqueue(std::span<const Layer> incoming) {
+    // FlipQueue hands off only Ready groups, after its producer-GPU completion callback.
+    // Deferred blank clears have no producer GPU work; the worker records them below.
+    EXIT_IF(incoming.empty() || incoming.size() > layers.size());
+    Job job;
+    job.count = incoming.size();
+    job.arrived = AsyncNow();
+    for (size_t i = 0; i < incoming.size(); ++i) {
+        EXIT_IF(incoming[i].bus < 0 || incoming[i].bus >= int(layers.size()));
+        job.layers[i] = incoming[i];
+        // One prepared lease may intentionally feed both buses. Each layer owns a reference.
+        if (incoming[i].frame) for (size_t j = 0; j < i; ++j)
+            if (incoming[j].frame == incoming[i].frame) { frames.Retain(incoming[i].frame); break; }
+    }
+    std::optional<Job> evicted;
+    {
+        std::lock_guard lock(async_mutex);
+        evicted = async_jobs.Push(std::move(job));
+        async_epoch.fetch_add(1, std::memory_order_release);
+        async_pending.store(true, std::memory_order_release);
+        async_queue_peak = std::max(async_queue_peak, async_jobs.Size());
+    }
+    if (evicted) DropJob(std::move(*evicted));
+    async_wake.notify_one();
+}
+void Presenter::Impl::RequestRepeat() {
+    { std::lock_guard lock(async_mutex); async_repeat = true; }
+    async_wake.notify_one();
+}
+void Presenter::Impl::RequestClear(int bus) {
+    std::array<Job, MultiFramePresentPolicy::InputCapacity> retained {};
+    std::array<Job, MultiFramePresentPolicy::InputCapacity * 2> discarded {};
+    size_t retained_count = 0, discarded_count = 0;
+    {
+        std::lock_guard lock(async_mutex);
+        while (auto job = async_jobs.Pop()) {
+            Job keep, remove;
+            keep.arrived = remove.arrived = job->arrived;
+            for (size_t i = 0; i < job->count; ++i) {
+                if (job->layers[i].bus == bus) remove.layers[remove.count++] = job->layers[i];
+                else keep.layers[keep.count++] = job->layers[i];
+            }
+            if (keep.count) retained[retained_count++] = std::move(keep);
+            if (remove.count) discarded[discarded_count++] = std::move(remove);
+        }
+        for (size_t i = 0; i < retained_count; ++i)
+            if (auto rejected = async_jobs.Push(std::move(retained[i])))
+                discarded[discarded_count++] = std::move(*rejected);
+        async_clear_mask |= 1u << bus;
+        async_epoch.fetch_add(1, std::memory_order_release);
+        async_pending.store(true, std::memory_order_release);
+    }
+    for (size_t i = 0; i < discarded_count; ++i) DropJob(std::move(discarded[i]));
+    async_wake.notify_one();
+}
+void Presenter::Impl::StopAsync() {
+    if (!async_worker.joinable()) return;
+    {
+        std::lock_guard lock(async_mutex);
+        async_stopping = true;
+        async_jobs.Close();
+        async_epoch.fetch_add(1, std::memory_order_release);
+    }
+    async_wake.notify_all();
+    // Never join while holding either the mailbox or the legacy presentation mutex.
+    async_worker.join();
+}
+void Presenter::Impl::CancelMulti(bool show_real) {
+    const auto cancelled = multi_cadence.Cancel();
+    multi_superseded += cancelled.generated;
+    active_output_set = -1;
+    if (cancelled.real && layers[0].frame) {
+        if (show_real) Present(FrameGenerationDiag::PresentKind::Real);
+        else if (!layers[0].frame->blank && !main_real_accounted) {
+            async_real_dropped.fetch_add(1, std::memory_order_relaxed);
+            main_real_accounted = true;
+        }
+    }
+}
+void Presenter::Impl::ProcessJob(Job job) {
+    bool main_updated = false;
+    std::array<Frame*, 2> cleared {};
+    size_t clear_count = 0;
+    CommandBuffer* clear_command = nullptr;
+    for (size_t i = 0; i < job.count; ++i) {
+        auto* frame = job.layers[i].frame;
+        if (frame && frame->clear_pending) {
+            if (!clear_command) clear_command = &present_scheduler.BeginCommand();
+            frame->Clear(*clear_command, frame->clear_color);
+            frame->clear_pending = false;
+            cleared[clear_count++] = frame;
+        }
+    }
+    if (clear_count) {
+        const auto tick = present_scheduler.Submit();
+        for (size_t i = 0; i < clear_count; ++i)
+            cleared[i]->present_tick = MultiFramePresentPolicy::RetainTick(cleared[i]->present_tick, tick);
+    }
+    for (size_t i = 0; i < job.count; ++i) {
+        auto& old = layers[job.layers[i].bus];
+        if (job.layers[i].bus == 0) {
+            if (old.frame && !old.frame->blank && !main_real_accounted)
+                async_real_dropped.fetch_add(1, std::memory_order_relaxed);
+            main_real_accounted = false;
+        }
+        if (old.frame) frames.Release(old.frame);
+        old = job.layers[i]; // Transfer the job's existing reference into the layer.
+        main_updated |= old.bus == 0;
+    }
+    auto* real = layers[0].frame;
+    if (!main_updated) {
+        layers[0].frame = last_shown;
+        Present(last_shown ? FrameGenerationDiag::PresentKind::Repeat : FrameGenerationDiag::PresentKind::Blank);
+        layers[0].frame = real;
+        return;
+    }
+    if (main_updated && FrameGeneration::GetBackend() == FrameGeneration::Backend::Multi) {
+        if (BeginMulti(real, job.arrived)) return;
+    } else if (main_updated && real && FrameGeneration::GetBackend() == FrameGeneration::Backend::Fsr) {
+        // The default FSR algorithm remains the existing implementation. Do not overwrite a
+        // generated image which is still the last successful source after a failed real present.
+        if (last_shown != &generated && PresentWithGeneratedFrame(real)) return;
+    }
+    Present(real && !real->blank ? FrameGenerationDiag::PresentKind::Real
+                                : FrameGenerationDiag::PresentKind::Blank);
+}
+bool Presenter::Impl::BeginMulti(Frame* real, uint64_t arrived) {
+    using namespace std::chrono_literals;
+    if (last_multi_arrival && arrived > last_multi_arrival) {
+        const auto interval = std::chrono::nanoseconds(arrived - last_multi_arrival);
+        multi_interval = multi_interval.count() == 0 || interval > multi_interval * 3
+            ? interval : (multi_interval * 7 + interval) / 8;
+    }
+    last_multi_arrival = arrived;
+    const auto factor = FrameGeneration::GetMultiplier();
+    const auto format = real ? real->image.format : vk::Format::eUndefined;
+    const bool supported = format == vk::Format::eR8G8B8A8Unorm ||
+        format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eA2R10G10B10UnormPack32 ||
+        format == vk::Format::eA2B10G10R10UnormPack32;
+    const bool eligible = real && !real->blank && !real->hdr && supported &&
+        layers[1].frame == nullptr && FrameGeneration::IsEnabled() && factor >= 2 && factor <= 6 &&
+        multi_interval >= 1ms && multi_interval <= 150ms;
+    ++multi_requested;
+    if (!eligible) { if (frame_generator) frame_generator->Reset(); return false; }
+    ++multi_eligible;
+    int set_index = -1;
+    for (size_t set = 0; set < multi_outputs.size(); ++set) {
+        bool shown = false;
+        for (auto& frame: multi_outputs[set]) shown |= last_shown == &frame;
+        if (!shown) { set_index = int(set); break; }
+    }
+    if (set_index < 0) { ++multi_failed; return false; }
+    auto& outputs = multi_outputs[set_index];
+    const vk::Extent2D extent {real->image.extent.width, real->image.extent.height};
+    std::array<vk::Image, MultiFramePresentPolicy::MaxGenerated> handles {};
+    for (uint32_t i = 0; i < factor - 1; ++i) {
+        present_scheduler.Wait(outputs[i].present_tick);
+        if (!outputs[i].TryConfigure(window.graphic_ctx, extent, vk::Format::eR8G8B8A8Unorm)) {
+            ++multi_failed; if (frame_generator) frame_generator->Reset(); return false;
+        }
+        handles[i] = outputs[i].image.image;
+    }
+    if (!frame_generator) frame_generator = std::make_unique<FrameGenerator>(window.graphic_ctx, present_scheduler);
+    auto& command = present_scheduler.BeginCommand();
+    real->Transit(command.Handle(), vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eTransferRead);
+    for (uint32_t i = 0; i < factor - 1; ++i)
+        outputs[i].Transit(command.Handle(), vk::ImageLayout::eGeneral,
+                           vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+    const auto result = frame_generator->GenerateMultiple(command.Handle(), real->image.image,
+        std::span<const vk::Image>(handles.data(), factor - 1), extent.width, extent.height, factor);
+    real->image.state = {vk::PipelineStageFlagBits2::eAllCommands,
+        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, vk::ImageLayout::eGeneral};
+    const auto generation_tick = present_scheduler.Submit();
+    real->present_tick = MultiFramePresentPolicy::RetainTick(real->present_tick, generation_tick);
+    for (uint32_t i = 0; i < factor - 1; ++i) {
+        outputs[i].present_tick = MultiFramePresentPolicy::RetainTick(outputs[i].present_tick, generation_tick);
+        if (result.written_mask & (1u << i)) outputs[i].image.state = {
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+            vk::ImageLayout::eTransferSrcOptimal};
+    }
+    // No mailbox, renderer or queue mutex is held during this wait.
+    present_scheduler.Wait(generation_tick);
+    if (result.status == MultiFrameStatus::Seeded) { ++multi_seeded; return false; }
+    if (result.status != MultiFrameStatus::Generated || result.count != factor - 1 ||
+        result.written_mask != (1u << (factor - 1)) - 1u) { ++multi_failed; return false; }
+    ++multi_batches; multi_recorded += result.count;
+    if (frame_generator->MultipleSceneChanged()) { ++multi_scene; return false; }
+    active_output_set = set_index;
+    batch_overlay_revision = GetSystemOverlayVisualState().revision;
+    const auto now = AsyncNow();
+    if (!multi_cadence.Begin(factor, now, uint64_t(multi_interval.count()),
+                              async_epoch.load(std::memory_order_acquire))) {
+        active_output_set = -1; ++multi_failed; return false;
+    }
+    async_pending.store(true, std::memory_order_release);
+    return true;
+}
+
+void Presenter::Impl::RunAsync() {
+    if (frame_generator) frame_generator->Reset();
+    auto backend = FrameGeneration::GetBackend();
+    auto factor = FrameGeneration::GetMultiplier();
+    auto enabled = FrameGeneration::IsEnabled();
+    async_multi_mode = backend == FrameGeneration::Backend::Multi;
+    multi_window_factor = factor; multi_window_enabled = enabled;
+    ResetMultiWindow();
+    while (true) {
+        uint32_t clear_mask = 0;
+        bool stopping = false;
+        {
+            std::lock_guard lock(async_mutex);
+            stopping = async_stopping;
+            clear_mask = std::exchange(async_clear_mask, 0u);
+        }
+        if (stopping) break;
+        const auto next_backend = FrameGeneration::GetBackend();
+        const auto next_factor = FrameGeneration::GetMultiplier();
+        const auto next_enabled = FrameGeneration::IsEnabled();
+        if (next_backend != backend || next_factor != factor || next_enabled != enabled) {
+            const bool previous_multi_mode = async_multi_mode;
+            async_epoch.fetch_add(1, std::memory_order_release);
+            CancelMulti(true);
+            if (pending_real) { pending_real = false; Present(FrameGenerationDiag::PresentKind::DelayedReal); }
+            if (frame_generator) frame_generator->Reset();
+            ReportMulti(true); // Close the old settings window explicitly, before changing its labels.
+            backend = next_backend; factor = next_factor; enabled = next_enabled;
+            async_multi_mode = backend == FrameGeneration::Backend::Multi;
+            multi_window_factor = factor; multi_window_enabled = enabled;
+            if (!previous_multi_mode) async_real_dropped.exchange(0, std::memory_order_relaxed);
+            ResetMultiWindow();
+            last_multi_arrival = 0; multi_interval = {};
+        }
+        if (clear_mask) {
+            const auto cancelled = multi_cadence.Cancel();
+            multi_superseded += cancelled.generated;
+            active_output_set = -1; pending_real = false;
+            if (frame_generator) frame_generator->Reset();
+            for (size_t bus = 0; bus < layers.size(); ++bus) if (clear_mask & (1u << bus)) {
+                if (bus == 0) {
+                    if (layers[0].frame && !layers[0].frame->blank && !main_real_accounted)
+                        async_real_dropped.fetch_add(1, std::memory_order_relaxed);
+                    main_real_accounted = true;
+                    SetLastShown(nullptr);
+                }
+                if (layers[bus].frame) frames.Release(layers[bus].frame);
+                layers[bus] = {};
+            }
+            if (cancelled.real && !(clear_mask & 1u) && layers[0].frame)
+                Present(FrameGenerationDiag::PresentKind::Real);
+            async_visible.store(last_shown != nullptr || layers[1].frame != nullptr, std::memory_order_release);
+        }
+        bool newer = false;
+        {
+            std::lock_guard lock(async_mutex);
+            newer = async_jobs.Size() != 0;
+        }
+        if (multi_cadence.Pending()) {
+            if (swapchain.NeedsResize() || GetSystemOverlayVisualState().revision != batch_overlay_revision) {
+                async_epoch.fetch_add(1, std::memory_order_release);
+                if (frame_generator) frame_generator->Reset();
+            }
+            const auto before = multi_cadence.GetCounts();
+            const auto ticket = multi_cadence.Take(AsyncNow(), async_epoch.load(std::memory_order_acquire), newer);
+            const auto after = multi_cadence.GetCounts();
+            multi_late += after.late - before.late;
+            multi_superseded += after.superseded - before.superseded;
+            if (ticket.kind == MultiFramePresentPolicy::Cadence::Kind::Generated) {
+                // This is the commit boundary: a subsequent mailbox update cancels later tickets,
+                // while this already committed GPU/WSI use retains its own image through its tick.
+                if (!MultiFramePresentPolicy::Cadence::Current(ticket, async_epoch.load(std::memory_order_acquire))) {
+                    ++multi_superseded; CancelMulti(true); continue;
+                }
+                auto* real = layers[0].frame;
+                layers[0].frame = &multi_outputs[active_output_set][ticket.index];
+                emitting_multi_generated = true;
+                if (!menu_generated_capture.folder.empty())
+                    CaptureMenuTestGeneratedFrame(window, present_scheduler, frame_generator.get(),
+                        *layers[0].frame, ticket.index + 1, factor, ticket.epoch, menu_generated_capture);
+                Present(FrameGenerationDiag::PresentKind::Generated);
+                emitting_multi_generated = false;
+                layers[0].frame = real;
+            } else if (ticket.kind == MultiFramePresentPolicy::Cadence::Kind::Real) {
+                active_output_set = -1;
+                Present(FrameGenerationDiag::PresentKind::Real);
+            }
+            if (ticket.kind != MultiFramePresentPolicy::Cadence::Kind::None) {
+                if (force_real_after_recovery) { force_real_after_recovery = false; Present(FrameGenerationDiag::PresentKind::Real); }
+                ReportMulti(); continue;
+            }
+        } else if (pending_real && (newer || std::chrono::steady_clock::now() >= real_due)) {
+            pending_real = false; Present(FrameGenerationDiag::PresentKind::DelayedReal); continue;
+        }
+        if (!multi_cadence.Pending() && !pending_real) {
+            std::optional<Job> job;
+            bool repeat = false;
+            {
+                std::lock_guard lock(async_mutex);
+                job = async_jobs.Pop();
+                if (!job) repeat = std::exchange(async_repeat, false);
+            }
+            if (job) { ProcessJob(std::move(*job)); ReportMulti(); continue; }
+            if (repeat && (last_shown || layers[1].frame)) {
+                auto* real = layers[0].frame;
+                layers[0].frame = last_shown;
+                Present(FrameGenerationDiag::PresentKind::Repeat);
+                layers[0].frame = real;
+                ReportMulti(); continue;
+            }
+        }
+        ReportMulti();
+        std::unique_lock lock(async_mutex);
+        const bool pending = multi_cadence.Pending() || pending_real || async_jobs.Size() != 0;
+        async_pending.store(pending, std::memory_order_release);
+        auto due = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+        if (multi_cadence.Pending()) due = std::min(due, std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(multi_cadence.NextDue()))));
+        else if (pending_real) due = std::min(due, real_due);
+        // condition_variable releases the mailbox lock while waiting.
+        async_wake.wait_until(lock, due);
+    }
+    CancelMulti(false); pending_real = false;
+    while (true) {
+        std::optional<Job> job;
+        { std::lock_guard lock(async_mutex); job = async_jobs.Pop(); }
+        if (!job) break;
+        DropJob(std::move(*job));
+    }
+    if (layers[0].frame && !layers[0].frame->blank && !main_real_accounted)
+        async_real_dropped.fetch_add(1, std::memory_order_relaxed);
+    main_real_accounted = true;
+    for (auto& layer: layers) { if (layer.frame) frames.Release(layer.frame); layer = {}; }
+    SetLastShown(nullptr);
+    present_scheduler.Finish();
+    ReportMulti(true);
+    async_pending.store(false, std::memory_order_release);
+}
+void Presenter::Impl::ResetMultiWindow() {
+    multi_requested = multi_eligible = multi_batches = multi_recorded = multi_seeded = multi_failed = multi_scene = 0;
+    multi_late = multi_superseded = multi_present_failed = multi_sample_dropped = 0;
+    multi_success = {}; multi_sample_count = 0; multi_last_present = 0;
+    multi_report_start = AsyncNow();
+}
+void Presenter::Impl::ReportMulti(bool force) {
+    if (!FrameGenerationDiag::Enabled() || !async_multi_mode) return;
+    const auto now = AsyncNow();
+    if (!multi_report_start) { multi_report_start = now; return; }
+    const auto duration = now - multi_report_start;
+    if (!force && duration < 2'000'000'000ull) return;
+    uint32_t depth = 0, peak = 0;
+    { std::lock_guard lock(async_mutex); depth = async_jobs.Size(); peak = std::exchange(async_queue_peak, depth); }
+    std::sort(multi_samples.begin(), multi_samples.begin() + multi_sample_count);
+    const auto percentile = [&](uint32_t pct) -> uint64_t {
+        return multi_sample_count ? multi_samples[(uint64_t(multi_sample_count - 1) * pct + 99) / 100] / 1000 : 0;
+    };
+    const auto dropped = async_real_dropped.exchange(0, std::memory_order_relaxed);
+    std::printf("FG_DIAG v=2 window_ms=%llu window_ns=%llu partial=%u enabled=%u requested_backend=multi requested_factor=%u requested=%llu eligible=%llu batches_generated=%llu outputs_recorded=%llu generated_presented=%llu real_presented=%llu repeat_presented=%llu blank_presented=%llu seeded=%llu failed=%llu scene=%llu generated_late=%llu generated_superseded=%llu real_dropped=%llu present_failed=%llu queue_depth=%u queue_peak=%u queue_capacity=%u effective_num=%llu effective_den=%llu pending=%u sample_n=%u sample_dropped=%llu p50_us=%llu p90_us=%llu p99_us=%llu max_us=%llu scanout=unknown\n",
+        (unsigned long long)(duration / 1'000'000), (unsigned long long)duration, force ? 1u : 0u,
+        multi_window_enabled ? 1u : 0u, multi_window_factor,
+        (unsigned long long)multi_requested, (unsigned long long)multi_eligible,
+        (unsigned long long)multi_batches, (unsigned long long)multi_recorded,
+        (unsigned long long)multi_success.generated, (unsigned long long)multi_success.real,
+        (unsigned long long)multi_success.repeat, (unsigned long long)multi_success.blank,
+        (unsigned long long)multi_seeded, (unsigned long long)multi_failed, (unsigned long long)multi_scene,
+        (unsigned long long)multi_late, (unsigned long long)multi_superseded, (unsigned long long)dropped,
+        (unsigned long long)multi_present_failed, depth, peak, MultiFramePresentPolicy::InputCapacity,
+        (unsigned long long)(multi_success.real + multi_success.generated), (unsigned long long)multi_success.real,
+        multi_cadence.Pending() ? 1u : 0u, multi_sample_count, (unsigned long long)multi_sample_dropped,
+        (unsigned long long)percentile(50), (unsigned long long)percentile(90), (unsigned long long)percentile(99),
+        (unsigned long long)(multi_sample_count ? multi_samples[multi_sample_count - 1] / 1000 : 0));
+    multi_requested = multi_eligible = multi_batches = multi_recorded = multi_seeded = multi_failed = multi_scene = 0;
+    multi_late = multi_superseded = multi_present_failed = multi_sample_dropped = 0;
+    multi_success = {}; multi_sample_count = 0; multi_report_start = now;
+}
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
 	const auto& formats    = m_window.surface_capabilities.formats;
@@ -1122,7 +1793,7 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			return Status::PresentedRecreate;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -1183,17 +1854,34 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	if (producer != nullptr) {
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
+	} else if (m_impl->UseAsync()) {
+		frame->clear_pending = true;
+		frame->clear_color = clear;
 	} else {
 		Common::LockGuard lock(m_impl->present_mutex);
-		auto& command = m_impl->present_scheduler.BeginCommand();
-		frame->Clear(command, clear);
-		frame->present_tick = m_impl->present_scheduler.Submit();
+		if (m_impl->async_owner.load(std::memory_order_acquire)) {
+			frame->clear_pending = true;
+			frame->clear_color = clear;
+		} else {
+			auto& command = m_impl->present_scheduler.BeginCommand();
+			frame->Clear(command, clear);
+			frame->present_tick = m_impl->present_scheduler.Submit();
+		}
 	}
 	return *frame;
 }
 
 bool Presenter::PresentLastFrame() {
+	if (m_impl->UseAsync()) {
+		const bool available = m_impl->async_visible.load(std::memory_order_acquire) ||
+		    m_impl->async_pending.load(std::memory_order_acquire);
+		if (available) m_impl->RequestRepeat();
+		return available;
+	}
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (m_impl->async_owner.load(std::memory_order_acquire)) {
+		m_impl->RequestRepeat(); return true;
+	}
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
@@ -1228,7 +1916,9 @@ void Presenter::Present(Frame& frame) {
 }
 
 void Presenter::Present(std::span<const Layer> layers) {
+	if (m_impl->UseAsync()) { m_impl->Enqueue(layers); return; }
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (m_impl->async_owner.load(std::memory_order_acquire)) { m_impl->Enqueue(layers); return; }
 	bool main_updated = false;
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
@@ -1267,7 +1957,9 @@ void Presenter::Present(std::span<const Layer> layers) {
 }
 
 bool Presenter::PresentPendingFrame() {
+	if (m_impl->UseAsync()) return m_impl->async_pending.load(std::memory_order_acquire);
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (m_impl->async_owner.load(std::memory_order_acquire)) return m_impl->async_pending.load(std::memory_order_acquire);
 	return m_impl->PresentPendingRealFrame();
 }
 
@@ -1275,7 +1967,9 @@ void Presenter::ClearLayer(int bus) {
 	if (static_cast<size_t>(bus) >= m_impl->layers.size()) {
 		return;
 	}
+	if (m_impl->UseAsync()) { m_impl->RequestClear(bus); return; }
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (m_impl->async_owner.load(std::memory_order_acquire)) { m_impl->RequestClear(bus); return; }
 	auto& layer = m_impl->layers[bus];
 	if (layer.frame != nullptr) {
 		m_impl->frames.Release(layer.frame);
@@ -1283,7 +1977,7 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
+bool Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 	KYTY_PROFILER_FUNCTION();
 	using Common::DebugCounters::Counter;
 	using Common::DebugCounters::ScopedTimer;
@@ -1297,6 +1991,7 @@ void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
+		if (emitting_multi_generated) return false;
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = [&] {
@@ -1305,6 +2000,7 @@ void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			if (emitting_multi_generated) return false;
 			continue;
 		}
 		// present_mutex owns the prepared frames and this scheduler. Only queue submission
@@ -1320,18 +2016,41 @@ void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 		const auto tick = swapchain.Submit(present_scheduler);
 		for (const auto& layer: layers) {
 			if (layer.frame != nullptr) {
-				layer.frame->present_tick = tick;
+				layer.frame->present_tick = MultiFramePresentPolicy::RetainTick(layer.frame->present_tick, tick);
 			}
 		}
 		status = swapchain.Present();
-		if (status != Swapchain::Status::Success) {
+		const bool accepted = MultiFramePresentPolicy::AcceptedPresent(
+		    status == Swapchain::Status::Success,
+		    status == Swapchain::Status::PresentedRecreate, async_multi_mode);
+		if (!accepted) {
+			if (async_multi_mode) ++multi_present_failed;
 			RecoverSwapchain(status);
+			if (emitting_multi_generated) return false;
 			continue;
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
-		if (FrameGenerationDiag::Enabled()) {
+		if (async_owner.load(std::memory_order_acquire)) {
+			SetLastShown(layers[0].frame);
+			if (kind == FrameGenerationDiag::PresentKind::Real || kind == FrameGenerationDiag::PresentKind::DelayedReal)
+				main_real_accounted = true;
+			if (async_multi_mode) {
+				using K = MultiFramePresentPolicy::PresentedKind;
+				const auto classified = kind == FrameGenerationDiag::PresentKind::Generated ? K::Generated :
+				    kind == FrameGenerationDiag::PresentKind::Repeat ? K::Repeat :
+				    kind == FrameGenerationDiag::PresentKind::Blank ? K::Blank : K::Real;
+				multi_success.Presented(classified); // Only after actual successful vkQueuePresentKHR.
+				const auto now = AsyncNow();
+				if (multi_last_present && now >= multi_last_present) {
+					if (multi_sample_count < multi_samples.size()) multi_samples[multi_sample_count++] = now - multi_last_present;
+					else ++multi_sample_dropped;
+				}
+				multi_last_present = now;
+			}
+		}
+		if (FrameGenerationDiag::Enabled() && (!async_owner.load(std::memory_order_acquire) || !async_multi_mode)) {
 			// Successful vkQueuePresentKHR only; CPU monotonic time, no GPU query or wait.
 			char       line[1024];
 			const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1340,11 +2059,15 @@ void Presenter::Impl::Present(FrameGenerationDiag::PresentKind kind) {
 				std::printf("%s\n", line);
 			}
 		}
-		return;
+		// Suboptimal still accepted this image. Multi counts it once and recreates;
+		// the default FSR path above preserves its existing retry behavior.
+		if (status == Swapchain::Status::PresentedRecreate) RecoverSwapchain(Swapchain::Status::Recreate);
+		return true;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
-	if (FrameGenerationDiag::Enabled()) fg_diag.NoteFailed(kind);
+	if (FrameGenerationDiag::Enabled() && (!async_owner.load(std::memory_order_acquire) || !async_multi_mode)) fg_diag.NoteFailed(kind);
+	return false;
 }
 
 void Presenter::Discard(Frame& frame) {

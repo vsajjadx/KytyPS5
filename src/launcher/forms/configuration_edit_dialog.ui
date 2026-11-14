@@ -203,9 +203,17 @@
               <property name="text"><string>Use a 1080p display</string></property>
              </widget>
             </item>
+            <item row="12" column="0">
+             <layout class="QFormLayout" name="frameGenerationLayout">
+              <item row="0" column="0"><widget class="QLabel" name="label_frame_generation_backend"><property name="text"><string>FG backend:</string></property></widget></item>
+              <item row="0" column="1"><widget class="QComboBox" name="comboBox_frame_generation_backend"><property name="toolTip"><string>FSR produces one generated frame. Multi is experimental. The selected backend is used only when frame generation is enabled.</string></property></widget></item>
+              <item row="1" column="0"><widget class="QLabel" name="label_frame_generation_multiplier"><property name="text"><string>Multi multiplier:</string></property></widget></item>
+              <item row="1" column="1"><widget class="QComboBox" name="comboBox_frame_generation_multiplier"><property name="toolTip"><string>Requested total frames per game frame, including the real frame. Applies only to Multi. Actual presentations depend on eligibility and display pacing; this is not game FPS.</string></property></widget></item>
+             </layout>
+            </item>
             <item row="12" column="1">
              <widget class="QCheckBox" name="checkBox_frame_generation">
-              <property name="toolTip"><string>Show an AMD FSR 3.1 generated frame between game frames when the game runs below the display rate. Toggle in game with F3.</string></property>
+              <property name="toolTip"><string>Interpolate frames using the selected backend when eligible. Toggle in game with F3. Selecting a backend or multiplier does not enable generation.</string></property>
               <property name="text"><string>Enable frame generation</string></property>
              </widget>
             </item>

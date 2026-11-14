@@ -1,0 +1,89 @@
+// This file is part of the FidelityFX SDK.
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files(the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+// Synchronization adaptation Copyright2026 KytyPS5 contributors. SPDX-License-Identifier: MIT
+// Same SDK9histograms/3shifts/quantization/threshold; one workgroup owns all shared state.
+#version 450
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+layout(set=0,binding=0,r32ui) uniform uimage2D rw_optical_flow_scd_histogram;
+layout(set=0,binding=1,r32f) uniform image2D rw_optical_flow_scd_previous_histogram;
+layout(set=0,binding=2,r32ui) uniform uimage2D rw_optical_flow_scd_temp;
+layout(set=0,binding=3,r32ui) uniform uimage2D rw_optical_flow_scd_output;
+shared float sourceHistogram[256];
+shared float filteredHistogram[256];
+shared float tempBuffer[256];
+shared vec2 tempBuffer2[256];
+const float kernel[11]=float[](0.0088122291,0.027143577,0.065114059,0.12164907,0.17699835,
+    0.20056541,0.17699835,0.12164907,0.065114059,0.027143577,0.0088122291);
+void main() {
+    // The SDK still dispatches9x3. This test is uniform within every workgroup.
+    if(any(notEqual(gl_WorkGroupID,uvec3(0))))return;
+    const uint lane=gl_LocalInvocationIndex;
+    uvec3 contributions=uvec3(0);
+    for(int histogram=0;histogram<9;++histogram) {
+        const ivec2 address=ivec2(histogram*256+int(lane),0);
+        sourceHistogram[lane]=float(imageLoad(rw_optical_flow_scd_histogram,address).x);
+        const float old=imageLoad(rw_optical_flow_scd_previous_histogram,address).x;
+        barrier();
+        precise float smoothed=0.0;
+        for(int tap=0;tap<11;++tap)
+            smoothed+=kernel[tap]*sourceHistogram[clamp(int(lane)-5+tap,0,255)];
+        smoothed+=1.0;
+        float unshifted=0.0;
+        for(uint shift=0;shift<3;++shift) {
+            if(shift==0){if(lane==0)filteredHistogram[255]=1.0;else filteredHistogram[lane-1]=smoothed;}
+            else if(shift==1)filteredHistogram[lane]=smoothed;
+            else {if(lane==255)filteredHistogram[0]=1.0;else filteredHistogram[lane+1]=smoothed;}
+            barrier();
+            tempBuffer[lane]=filteredHistogram[lane];barrier();
+            // No implicit wave-size/lockstep assumption at the final reduction levels.
+            for(uint stride=128;stride>0;stride>>=1){if(lane<stride)tempBuffer[lane]+=tempBuffer[lane+stride];barrier();}
+            precise float current=filteredHistogram[lane]/tempBuffer[0];
+            if(shift==1)unshifted=current;
+            // Reset clears previous histogram to0. Define the KL zero limit explicitly,
+            // avoiding the old 0*log(0) NaN->uint case during unpublished warmup.
+            tempBuffer2[lane]=old>0.0?vec2(current*log(current/old),old*log(old/current)):
+                vec2(uintBitsToFloat(0x7f800000u),0.0);
+            barrier();
+            for(uint stride=128;stride>1;stride>>=1){if(lane<stride)tempBuffer2[lane]+=tempBuffer2[lane+stride];barrier();}
+            if(lane==0){
+                precise vec2 sum=tempBuffer2[0]+tempBuffer2[1];
+                precise float distance=1.0-exp(-(abs(sum.x)+abs(sum.y)));
+                contributions[shift]+=uint((distance/9.0)*1000000.0);
+            }
+            barrier();
+        }
+        // All3 variants have finished their reads. Other histograms use disjoint bins.
+        imageStore(rw_optical_flow_scd_previous_histogram,address,vec4(unshifted,0,0,0));
+        imageStore(rw_optical_flow_scd_histogram,address,uvec4(0));
+        barrier();
+    }
+    if(lane==0){
+        float sceneChange=float(min(contributions.x,min(contributions.y,contributions.z)))/1000000.0;
+        uint history=imageLoad(rw_optical_flow_scd_output,ivec2(1,0)).x<<1;
+        if(sceneChange>0.45)history|=1u;
+        imageStore(rw_optical_flow_scd_output,ivec2(0,0),uvec4(floatBitsToUint(sceneChange),0,0,0));
+        imageStore(rw_optical_flow_scd_output,ivec2(1,0),uvec4(history,0,0,0));
+        imageStore(rw_optical_flow_scd_output,ivec2(2,0),uvec4(0));
+        for(int i=0;i<3;++i)imageStore(rw_optical_flow_scd_temp,ivec2(i,0),uvec4(0));
+    }
+}

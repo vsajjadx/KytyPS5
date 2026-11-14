@@ -118,6 +118,8 @@ public:
 	bool                   hdr_enabled                 = false;
 	bool                   output_1080p_enabled        = false;
 	bool                   frame_generation_enabled    = false;
+	QString                frame_generation_backend    = QStringLiteral("fsr");
+	int                    frame_generation_multiplier = 2;
 	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
@@ -182,6 +184,8 @@ public:
 		hdr_enabled                 = other.hdr_enabled;
 		output_1080p_enabled        = other.output_1080p_enabled;
 		frame_generation_enabled    = other.frame_generation_enabled;
+		frame_generation_backend    = other.frame_generation_backend;
+		frame_generation_multiplier = other.frame_generation_multiplier;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;

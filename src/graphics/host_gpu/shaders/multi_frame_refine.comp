@@ -1,0 +1,47 @@
+// Copyright 2026 KytyPS5 contributors. SPDX-License-Identifier: GPL-2.0-only
+// Independent bounded local RGB validation; no scene-wide motion assumption.
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D previous_image;
+layout(set=0,binding=1) uniform sampler2D current_image;
+layout(set=0,binding=2) uniform isampler2D input_flow;
+layout(set=0,binding=3,rgba32i) uniform writeonly iimage2D output_flow;
+layout(push_constant) uniform Parameters { uvec2 extent; uvec2 flow_extent; float time; uint copy_history; } pc;
+float score(ivec2 cell,ivec2 motion) {
+    float error=0.0; uint valid=0u,possible=0u;
+    // Full8x8 coverage includes thin odd-position strokes; all three RGB channels.
+    for(int y=0;y<8;++y)for(int x=0;x<8;++x) {
+        ivec2 p=cell*8+ivec2(x,y);
+        if(any(greaterThanEqual(p,ivec2(pc.extent))))continue;
+        ++possible;ivec2 q=p+motion;
+        if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(pc.extent))))continue;
+        vec3 d=texelFetch(current_image,p,0).rgb-texelFetch(previous_image,q,0).rgb;
+        error+=dot(d,d);++valid;
+    }
+    return valid>=max(1u,(possible+1u)/2u)?error/float(valid):1.0e20;
+}
+void main() {
+    ivec2 cell=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(cell,ivec2(pc.flow_extent))))return;
+    ivec2 best=texelFetch(input_flow,cell,0).xy;float best_score=score(cell,best);
+    // At most9 existing vectors pluszero. Repeated raw candidates need no repeated
+    // photometric work, and exactzero error cannot be strictly improved.
+    ivec2 seen[10];int unique=1;seen[0]=best;
+    for(int y=-1;y<=1&&best_score!=0.0;++y)for(int x=-1;x<=1&&best_score!=0.0;++x) {
+        // copy_history is this pipeline's fixed neighbour stride (1,2,4,8).
+        ivec2 neighbour=clamp(cell+ivec2(x,y)*int(pc.copy_history),ivec2(0),ivec2(pc.flow_extent)-1);
+        ivec2 candidate=texelFetch(input_flow,neighbour,0).xy;
+        bool duplicate=false;for(int i=0;i<unique;++i)duplicate=duplicate||all(equal(seen[i],candidate));
+        if(duplicate)continue;
+        seen[unique++]=candidate;
+        float candidate_score=score(cell,candidate);
+        if(candidate_score<best_score){best=candidate;best_score=candidate_score;}
+    }
+    // Stationary content is a general motion candidate even if every raw neighbour
+    // moved. Testitlast: exactties retain the best pre-existing motion vector.
+    if(best_score!=0.0) {
+        bool duplicate=false;for(int i=0;i<unique;++i)duplicate=duplicate||all(equal(seen[i],ivec2(0)));
+        if(!duplicate){float zero_score=score(cell,ivec2(0));if(zero_score<best_score)best=ivec2(0);}
+    }
+    imageStore(output_flow,cell,ivec4(best,0,0));
+}

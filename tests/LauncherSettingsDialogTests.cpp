@@ -67,6 +67,17 @@ int main(int argc, char** argv) {
 		auto* search     = Control<QLineEdit>(dialog, "settings_search");
 		Check(VisibleCategories(categories) == 10, "global categories");
 		search->setText(QStringLiteral("frame generation"));
+		const auto* current_category = categories->currentItem();
+		const auto current_name = current_category ? current_category->text() : QStringLiteral("<none>");
+		if (VisibleCategories(categories) != 1 ||
+		    current_name != QStringLiteral("Enhancements")) {
+			std::fprintf(stderr, "FG search visible=%d current=%s\n", VisibleCategories(categories),
+			             qPrintable(current_name));
+			for (int i = 0; i < categories->count(); ++i) {
+				if (!categories->item(i)->isHidden())
+					std::fprintf(stderr, "FG search category: %s\n", qPrintable(categories->item(i)->text()));
+			}
+		}
 		Check(VisibleCategories(categories) == 1 &&
 		          categories->currentItem()->text() == "Enhancements",
 		      "search finds frame generation in its category");

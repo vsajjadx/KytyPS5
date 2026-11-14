@@ -5,6 +5,13 @@ add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updat
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+# The settings implementation is compiled into both the launcher and its UI test.
+# UIC can refresh its generated header after Ninja has checked the previous header
+# timestamp. Track the form directly so a UI-only edit rebuilds both consumers in
+# the same invocation rather than leaving either executable one build behind.
+set_property(SOURCE src/configurationEditDialog.cpp APPEND PROPERTY OBJECT_DEPENDS
+	"${CMAKE_CURRENT_SOURCE_DIR}/forms/configuration_edit_dialog.ui")
+
 file(GLOB launcher_src
 	"include/*.h"
 	"src/*.cpp"

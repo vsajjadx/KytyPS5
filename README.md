@@ -1,5 +1,7 @@
 # KytyPS5
 
+Upstream build status:
+
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -20,6 +22,50 @@ can change significantly between builds.
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
 > not distribute games or copyrighted system software. Use only game files that you have obtained
 > legally.
+
+## This Fork
+
+These fork-specific notes describe the Windows release from the
+[`ufc6-latest` source branch](https://github.com/vsajjadx/KytyPS5/tree/ufc6-latest),
+[source commit `93402f6`](https://github.com/vsajjadx/KytyPS5/commit/93402f6554353bc699c58b133c779810a81b3980).
+Download [the 2026-11-14 frame-generation release](https://github.com/vsajjadx/KytyPS5/releases/tag/KytyPS5-2026-11-14-93402f6)
+or browse [all fork releases](https://github.com/vsajjadx/KytyPS5/releases).
+The emulator source for these changes is on that branch; `main` retains its existing code.
+
+This is an unofficial fork of KytyPS5. Builds and notes are on the
+[fork releases page](https://github.com/vsajjadx/KytyPS5/releases); report fork-specific problems
+in [this repository](https://github.com/vsajjadx/KytyPS5/issues). Fork changes are tested on
+Windows x64 only.
+
+**Tested status.** This build was checked on the UFC 6 main menu (offline, animated) and with
+the regression tests; this does not establish general game compatibility. Wolverine does not
+work: its latest test no longer exits on the earlier shader-tracking error, but still shows a
+black screen at 0 FPS and reports an unsupported formatted three-component buffer load through a
+GPU-selected descriptor. Further compatibility problems may remain.
+
+**Frame generation.** Off by default. Turn it on with **Enable frame generation** in the
+launcher's game configuration, `kyty_emulator --frame-generation`, or the environment variable
+`KYTY_FRAME_GENERATION=1`; press **F3** in game to toggle it. One AMD FSR 3.1 interpolated frame
+is shown between consecutive game frames. Multi-frame generation is not implemented or released
+yet.
+
+Turning it on is a request. A frame is generated only on Windows builds, for non-HDR output, an
+8-bit RGBA/BGRA or 10-bit A2R10G10B10/A2B10G10R10 frame, no second video-out layer, and a smoothed
+game frame interval between 1.8 configured vblank periods and 150 ms (at 60 Hz, roughly 6.7 to 33 game
+FPS). Other frames are shown unchanged.
+
+On the UFC 6 main menu at 60 Hz the game still runs at about 25 FPS; this release raises
+successful presentations from about 35 to about 50 per second. That is not 50 or 60 game FPS;
+smoothness, latency and artifacts were not measured.
+
+<p align="center">
+  <img src="docs/screenshots/ufc6-fork-fg-menu.png" width="600" alt="UFC 6 main menu in this fork with frame generation enabled">
+</p>
+
+**Known issue.** One frame-generation-off run with diagnostics on showed black blocks on the UFC 6
+menu fighter; runs without diagnostics and the previous release were clean. Cause unknown,
+reproduction pending. Long-term stability is not established.
+
 
 ## Current Status
 
@@ -44,6 +90,8 @@ Compatibility, stability, and performance can vary between versions. You may enc
 or graphical glitches, so please include the version you tested when reporting an issue.
 
 ## Screenshots
+
+The gallery below comes from upstream. This fork's verified UFC 6 observation is shown above.
 
 <table align="center">
   <tr>
@@ -123,6 +171,22 @@ Important areas of the codebase:
 
 The renderer targets Vulkan 1.3. Keep shader changes aligned with both the RDNA 2 ISA semantics and
 the Vulkan/SPIR-V validation rules.
+
+### Fork frame generation diagnostics and validation
+
+`KYTY_FG_DIAG=1` (exactly `1`; off by default) prints an `FG_DIAG` line every 2 seconds:
+requested versus eligible frames, recorded, seeded (first frame after a reset; nothing generated
+is shown) and failed generations, and successful presents by kind at the presenter. These are not
+physical scanout, unique images or latency (`scanout=unknown`).
+
+The release comparison is one sequential before/after pair with identical settings (1080p,
+Immediate present mode, 60 Hz vblank, 512 KiB download window, dummy audio, generation and
+diagnostics on) in the animated UFC 6 main menu, over 15 consecutive windows without shader
+compilation. Before: 764 generated and 288 delayed real presents in 30.26 s (34.8/s), 476 real
+frames replaced unshown. After: 757 and 756 in 30.30 s (49.9/s), none replaced, failed or
+repeated. Separately measured game rates: 25.3 and 25.0 FPS. Streams were not phase-aligned;
+per-present timestamps were not recorded.
+
 
 ## Building
 

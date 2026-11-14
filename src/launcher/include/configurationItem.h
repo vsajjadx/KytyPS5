@@ -9,7 +9,6 @@
 
 class QComboBox;
 class QLabel;
-class QLineEdit;
 class QTreeWidget;
 class QWidget;
 
@@ -29,7 +28,6 @@ public:
 	void               SetCompatibilityEditable(bool editable);
 	[[nodiscard]] bool IsRunning() const { return m_running; }
 	QComboBox*         GetStatusCombo() { return m_status_combo; }
-	QLineEdit*         GetCommentEdit() { return m_comment_edit; }
 
 private:
 	void UpdateIcon();
@@ -41,7 +39,6 @@ private:
 	QComboBox*                     m_status_combo     = nullptr;
 	QLabel*                        m_status_indicator = nullptr;
 	QWidget*                       m_status_widget    = nullptr;
-	QLineEdit*                     m_comment_edit     = nullptr;
 };
 
 #endif // CONFIGURATION_ITEM_H

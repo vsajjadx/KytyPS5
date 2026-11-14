@@ -53,6 +53,8 @@ protected:
 	void InitGameDirectories();
 	void AddGameDirectoryItem(const QString& dir);
 	void MakeTabsScrollable();
+	void InitNavigation();
+	void FilterCategories(const QString& query);
 	void GrowToFitContents();
 	void ShowTab(QWidget* page);
 

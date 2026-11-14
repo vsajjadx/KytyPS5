@@ -16,6 +16,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -30,6 +31,8 @@
 #include <QStringList>
 #include <QStyleHints>
 #include <QVariant>
+#include <QVBoxLayout>
+#include <QScrollArea>
 #include <QtCore>
 
 #include <cstdint>
@@ -123,6 +126,22 @@ MainDialogPrivate::~MainDialogPrivate() {
 void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
+	auto* options = new QDialog(main_dialog);
+	options->setWindowTitle(tr("Launcher options"));
+	options->resize(640, 620);
+	auto* options_layout = new QVBoxLayout(options);
+	auto* options_scroll = new QScrollArea(options);
+	options_scroll->setWidgetResizable(true);
+	options_scroll->setFrameShape(QFrame::NoFrame);
+	options_scroll->setWidget(m_ui->launcher_options_content);
+	options_layout->addWidget(options_scroll, 1);
+	auto* options_hint = new QLabel(tr("Launcher preferences are saved automatically."), options);
+	options_hint->setWordWrap(true);
+	options_layout->addWidget(options_hint);
+	auto* options_buttons = new QDialogButtonBox(QDialogButtonBox::Close, options);
+	options_layout->addWidget(options_buttons);
+	connect(options_buttons, &QDialogButtonBox::rejected, options, &QDialog::reject);
+	connect(m_ui->widget, &ConfigurationListWidget::LauncherOptionsRequested, options, &QDialog::exec);
 	m_ui->widget->SetControllerPreview(&m_controller_preview);
 
 	m_main_dialog = main_dialog;

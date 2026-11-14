@@ -52,6 +52,7 @@ signals:
 	void CreateShortcut();
 	void Select();
 	void PreviewControllerColor(const QString& color);
+	void LauncherOptionsRequested();
 
 protected:
 	void changeEvent(QEvent* event) override;

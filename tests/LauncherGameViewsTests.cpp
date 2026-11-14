@@ -68,12 +68,17 @@ int main(int argc, char **argv) {
   auto *list  = ui.cfgs_list;
   auto *grid  = ui.cfgs_grid;
   SetupGameGrid(list, grid);
+  list->setItemDelegateForColumn(GAME_NAME_COLUMN, new GameListNameDelegate(list));
+  list->setColumnHidden(GAME_SERIAL_COLUMN, true);
+  list->setColumnHidden(GAME_VERSION_COLUMN, true);
   grid->setIconSize(QSize(64, 64));
 
   QPixmap cover(64, 64);
   cover.fill(Qt::blue);
   auto *item = new QTreeWidgetItem(list, {QStringLiteral("Game")});
   item->setIcon(GAME_NAME_COLUMN, QIcon(cover));
+  item->setText(GAME_SERIAL_COLUMN, QStringLiteral("PPSA23566"));
+  item->setText(GAME_VERSION_COLUMN, QStringLiteral("01.004.000"));
 
   host.resize(480, 360);
   views->SetBackgroundImage(game.path());
@@ -83,6 +88,18 @@ int main(int argc, char **argv) {
 
   Check(ShowsBackground(views->grab().toImage().pixelColor(empty)),
         "the game background is hidden behind the list view");
+
+  PaintCounter list_counter;
+  list->viewport()->installEventFilter(&list_counter);
+  item->setText(GAME_VERSION_COLUMN, QStringLiteral("01.005.000"));
+  QApplication::processEvents();
+  Check(list_counter.paints > 0, "the name cell does not repaint when hidden metadata changes");
+  const auto preview_dir = qEnvironmentVariable("KYTY_UI_PREVIEW_DIR");
+  if (!preview_dir.isEmpty()) {
+    list->setColumnWidth(GAME_NAME_COLUMN, 360);
+    Check(host.grab().save(QDir(preview_dir).filePath(QStringLiteral("Library-list.png"))),
+          "save library preview");
+  }
 
   views->setCurrentWidget(grid);
   QApplication::processEvents();

@@ -57,10 +57,38 @@ add_executable(launcher_frame_generation_tests EXCLUDE_FROM_ALL
 target_link_libraries(launcher_frame_generation_tests Qt6::Gui common)
 target_include_directories(launcher_frame_generation_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_frame_generation_tests PROPERTIES AUTOMOC ON)
+
+add_executable(launcher_settings_dialog_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherSettingsDialogTests.cpp"
+	include/configuration.h
+	include/configurationEditDialog.h
+	include/mandatoryLineEdit.h
+	src/configuration.cpp
+	src/configurationEditDialog.cpp
+	src/mandatoryLineEdit.cpp
+	src/gameContent.cpp
+	src/launcherTheme.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_settings_dialog_tests Qt6::Widgets Vulkan::Headers SDL3::SDL3-static common)
+target_include_directories(launcher_settings_dialog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_settings_dialog_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 if(BUILD_TESTING)
 	add_test(NAME launcher_frame_generation COMMAND $<TARGET_FILE:launcher_frame_generation_tests>)
 	set_tests_properties(launcher_frame_generation PROPERTIES LABELS "cpu;launcher;frame_generation_options")
 	add_dependencies(kyty_tests launcher_frame_generation_tests)
+	add_test(NAME launcher_settings_dialog COMMAND $<TARGET_FILE:launcher_settings_dialog_tests>)
+	set_tests_properties(launcher_settings_dialog PROPERTIES
+		LABELS "cpu;launcher"
+		ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>"
+		TIMEOUT 30)
+	add_dependencies(kyty_tests launcher_settings_dialog_tests)
+	add_test(NAME launcher_game_views COMMAND $<TARGET_FILE:launcher_game_views_tests>)
+	set_tests_properties(launcher_game_views PROPERTIES
+		LABELS "cpu;launcher"
+		ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>"
+		TIMEOUT 30)
+	add_dependencies(kyty_tests launcher_game_views_tests)
 endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)

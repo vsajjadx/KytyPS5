@@ -10,6 +10,7 @@
 #include "gameContent.h"
 #include "gameViews.h"
 #include "inputMappingDialog.h"
+#include "launcherIcons.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
 #include "trophyViewerDialog.h"
@@ -39,7 +40,6 @@
 #include <QListView>
 #include <QMenu>
 #include <QMessageBox>
-#include <QPainter>
 #include <QPalette>
 #include <QPointer>
 #include <QProcess>
@@ -52,7 +52,6 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSlider>
-#include <QStyle>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
@@ -197,10 +196,13 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->setupUi(this);
 
 	m_ui->refresh_action->setShortcuts(QKeySequence::Refresh);
+	m_ui->refresh_action->setText(tr("Refresh"));
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
 	addAction(m_ui->refresh_action);
 
 	UpdateToolbarIcons();
+	connect(m_ui->launcher_options_button, &QToolButton::clicked, this,
+	        &ConfigurationListWidget::LauncherOptionsRequested);
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
 
@@ -214,15 +216,17 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setItemDelegateForColumn(GAME_NAME_COLUMN,
 	                                          new GameListNameDelegate(m_ui->cfgs_list));
 	m_ui->cfgs_list->setUniformRowHeights(true);
+	m_ui->game_views->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	m_ui->cfgs_list->setSortingEnabled(true);
-	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
-	m_ui->cfgs_list->setColumnWidth(GAME_SERIAL_COLUMN, 110);
-	m_ui->cfgs_list->setColumnWidth(GAME_VERSION_COLUMN, 120);
+	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 360);
+	m_ui->cfgs_list->setColumnHidden(GAME_SERIAL_COLUMN, true);
+	m_ui->cfgs_list->setColumnHidden(GAME_VERSION_COLUMN, true);
 	m_ui->cfgs_list->setColumnWidth(GAME_FIRMWARE_VERSION_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_SIZE_COLUMN, 100);
 	m_ui->cfgs_list->setColumnWidth(GAME_PATH_COLUMN, 320);
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
-	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
+	m_ui->cfgs_list->header()->setSectionResizeMode(GAME_PATH_COLUMN, QHeaderView::Stretch);
+	m_ui->cfgs_list->header()->setStretchLastSection(false);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
 	SetupGameGrid(m_ui->cfgs_list, m_ui->cfgs_grid);
 	m_ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -304,24 +308,23 @@ void ConfigurationListWidget::changeEvent(QEvent* event) {
 }
 
 void ConfigurationListWidget::UpdateToolbarIcons() {
-	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
-	                                                                      : QColor(Qt::black);
-	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
-		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
-		QPainter painter(&pixmap);
-		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
-		painter.fillRect(pixmap.rect(), color);
-		button->setIcon(QIcon(pixmap));
+	using LauncherIcons::Symbol;
+	const auto set_icon = [](QToolButton* button, Symbol symbol, const QString& title) {
+		button->setIcon(LauncherIcons::Make(symbol));
+		button->setIconSize(QSize(20, 20));
+		button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+		button->setMinimumSize(76, 50);
+		button->setText(title);
 	};
-
-	set_icon(m_ui->refresh_button, QStringLiteral(":/icons/refresh.svg"));
+	set_icon(m_ui->refresh_button, Symbol::Refresh, tr("Refresh"));
 	m_ui->refresh_action->setIcon(m_ui->refresh_button->icon());
-	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
-	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
-	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
-	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
-	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
-	set_icon(m_ui->grid_view_button, QStringLiteral(":/icons/grid-view.svg"));
+	set_icon(m_ui->global_settings_button, Symbol::Settings, tr("Settings"));
+	set_icon(m_ui->input_mapping_button, Symbol::Controller, tr("Controls"));
+	set_icon(m_ui->edit_button, Symbol::Edit, tr("Game settings"));
+	set_icon(m_ui->delete_button, Symbol::Trash, tr("Clear config"));
+	set_icon(m_ui->trophy_overview_button, Symbol::Trophy, tr("Trophies"));
+	set_icon(m_ui->grid_view_button, Symbol::Grid, tr("Grid view"));
+	set_icon(m_ui->launcher_options_button, Symbol::Settings, tr("Launcher options"));
 }
 
 void ConfigurationListWidget::WriteSettings() {
@@ -734,21 +737,7 @@ void ConfigurationListWidget::ScanGameDirectory() {
 			        m_ui->cfgs_list->setCurrentItem(item);
 			        SelectItem(item);
 		        });
-		connect(item->GetCommentEdit(), &QLineEdit::editingFinished, item, [this, item]() {
-			if (!m_compatibility->IsLocal()) {
-				return;
-			}
 
-			const auto& title_id = item->GetInfo().title_id;
-			if (title_id.trimmed().isEmpty()) {
-				return;
-			}
-			item->GetInfo().game_comment = item->GetCommentEdit()->text();
-			item->Update();
-			m_compatibility->SetComment(title_id, item->GetInfo().game_comment);
-			m_ui->cfgs_list->setCurrentItem(item);
-			SelectItem(item);
-		});
 	};
 	const auto scan_archives = [&add_game](const QDir& directory, const QDir& root) {
 		const auto entries = directory.entryInfoList(QDir::Files | QDir::NoSymLinks, QDir::Name);
@@ -1271,14 +1260,16 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
-	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	menu.addSection(tr("Play"));
+	QAction* action_run = menu.addAction(LauncherIcons::Make(LauncherIcons::Symbol::Play), tr("Run"), this, SIGNAL(Run()));
 	QAction* action_shortcut = menu.addAction(tr("Create desktop shortcut"), this,
 	                                          SIGNAL(CreateShortcut()));
+	menu.addSection(tr("Game content"));
 	QAction* action_open_folder =
-	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
+	    menu.addAction(LauncherIcons::Make(LauncherIcons::Symbol::Folder), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));
 	QAction* action_view_trophies = menu.addAction(
-	    style()->standardIcon(QStyle::SP_FileDialogContentsView), tr("View trophies..."));
+	    LauncherIcons::Make(LauncherIcons::Symbol::Trophy), tr("View trophies..."));
 	connect(action_view_trophies, &QAction::triggered, this,
 	        &ConfigurationListWidget::ViewTrophies);
 	QAction* action_patches = menu.addAction(tr("Cheats (experimental)..."));
@@ -1292,7 +1283,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	action_patches->setVisible(item != nullptr &&
 	                           Cheats::IsSupportedTitleId(item->GetInfo().title_id));
 	QAction* action_addcont = menu.addAction(
-	    style()->standardIcon(QStyle::SP_DirIcon), tr("Additional Content..."));
+	    LauncherIcons::Make(LauncherIcons::Symbol::Folder), tr("Additional Content..."));
 	connect(action_addcont, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
@@ -1314,21 +1305,22 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	action_addcont->setEnabled(item != nullptr && !item->GetInfo().title_id.trimmed().isEmpty());
 	QAction* action_compress =
 	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
+	menu.addSection(tr("Saved data"));
 	QAction* action_remove_save_data =
-	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
+	    menu.addAction(LauncherIcons::Make(LauncherIcons::Symbol::Trash),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
-	menu.addSeparator();
+	menu.addSection(tr("Configuration"));
 	QAction* action_edit =
-	    menu.addAction(style()->standardIcon(QStyle::SP_FileIcon), tr("Edit game config..."),
+	    menu.addAction(LauncherIcons::Make(LauncherIcons::Symbol::Edit), tr("Edit game config..."),
 	                   this, SLOT(edit_configuration()));
 	QAction* action_delete =
-	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
+	    menu.addAction(LauncherIcons::Make(LauncherIcons::Symbol::Trash),
 	                   tr("Clear game config"), this, SLOT(delete_configuartion()));
 
 	if (item == nullptr) {
 		menu.addSeparator();
 		/*QAction *action_global = */ menu.addAction(
-		    style()->standardIcon(QStyle::SP_FileDialogDetailedView), tr("Global settings..."),
+		    LauncherIcons::Make(LauncherIcons::Symbol::Settings), tr("Global settings..."),
 		    this, SLOT(edit_global_settings()));
 	}
 

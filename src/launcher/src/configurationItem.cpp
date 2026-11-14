@@ -13,7 +13,6 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
-#include <QLineEdit>
 #include <QLocale>
 #include <QPixmap>
 #include <QSize>
@@ -35,7 +34,6 @@ enum Column {
 	SizeColumn,
 	PathColumn,
 	StatusColumn,
-	CommentsColumn,
 };
 
 class NoWheelComboBox: public QComboBox {
@@ -100,9 +98,7 @@ QString GetDisplayText(const Configuration& info) {
 	if (!path.isEmpty()) {
 		lines.append(QStringLiteral("Path: %1").arg(path));
 	}
-	if (!info.game_comment.isEmpty()) {
-		lines.append(QStringLiteral("Comment: %1").arg(info.game_comment));
-	}
+
 
 	return lines.join(QLatin1Char('\n'));
 }
@@ -149,12 +145,6 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 
 	parent->setItemWidget(this, StatusColumn, m_status_widget);
 
-	m_comment_edit = new QLineEdit(parent);
-	m_comment_edit->setObjectName(QStringLiteral("game_comment_editor"));
-	MakeTransparent(m_comment_edit);
-	m_comment_edit->setClearButtonEnabled(true);
-	m_comment_edit->setFrame(false);
-	parent->setItemWidget(this, CommentsColumn, m_comment_edit);
 
 	Update(true);
 	SetRunning(false);
@@ -202,6 +192,8 @@ void ConfigurationItem::Update(bool reload_icon) {
 	const auto path         = GetPathText(*m_info);
 
 	setText(NameColumn, m_info->name);
+	setData(NameColumn, Qt::AccessibleTextRole,
+	        QStringLiteral("%1, %2, %3").arg(m_info->name, m_info->title_id, m_info->gameVersion));
 	setData(NameColumn, Qt::UserRole, m_info->pro_supported);
 	setText(SerialColumn, m_info->title_id);
 	setText(GameVersionColumn,
@@ -210,14 +202,11 @@ void ConfigurationItem::Update(bool reload_icon) {
 	        m_info->firmwareVer.isEmpty() ? QStringLiteral("\u2014") : m_info->firmwareVer);
 	setText(PathColumn, path);
 	setText(StatusColumn, {});
-	setText(CommentsColumn, {});
-	for (int column = NameColumn; column <= CommentsColumn; column++) {
+	for (int column = NameColumn; column <= StatusColumn; column++) {
 		setToolTip(column, display_text);
 	}
 	SetStatus(m_status_combo, m_info->game_status);
-	if (m_comment_edit->text() != m_info->game_comment) {
-		m_comment_edit->setText(m_info->game_comment);
-	}
+
 
 	if (reload_icon) {
 		const auto icon_data = GameContent::ReadFile(
@@ -257,9 +246,6 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 			return QVersionNumber::compare(QVersionNumber::fromString(version),
 			                               QVersionNumber::fromString(other_version)) < 0;
 		}
-		case CommentsColumn:
-			return m_info->game_comment.toCaseFolded() <
-			       other_item->m_info->game_comment.toCaseFolded();
 		default: return text(column).toCaseFolded() < other.text(column).toCaseFolded();
 	}
 }
@@ -269,7 +255,7 @@ void ConfigurationItem::SetRunning(bool state) {
 
 	QFont f = font(NameColumn);
 	f.setBold(state);
-	for (int column = NameColumn; column <= CommentsColumn; column++) {
+	for (int column = NameColumn; column <= StatusColumn; column++) {
 		setFont(column, f);
 	}
 
@@ -278,8 +264,6 @@ void ConfigurationItem::SetRunning(bool state) {
 
 void ConfigurationItem::SetCompatibilityEditable(bool editable) {
 	m_status_combo->setEnabled(editable);
-	m_comment_edit->setReadOnly(!editable);
-	m_comment_edit->setClearButtonEnabled(editable);
 }
 
 void ConfigurationItem::UpdateIcon() {

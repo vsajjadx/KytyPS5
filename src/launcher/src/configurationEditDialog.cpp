@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
+#include "launcherIcons.h"
 #include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
@@ -29,7 +30,7 @@
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
-#include <QStyle>
+#include <QTabBar>
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
@@ -43,7 +44,7 @@
 #include "ui_configuration_edit_dialog.h"
 
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
-constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
+constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "organized_geometry";
 constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 400;
 
 static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
@@ -191,6 +192,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	setSizeGripEnabled(true);
 
 	Init(info);
+	show_pssr();
+	update_fg_backend();
+	InitNavigation();
 	m_geometry_restored = restoreGeometry(g_last_geometry);
 	if (!m_geometry_restored) {
 		GrowToFitContents();
@@ -408,13 +412,17 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	button_layout->setSpacing(4);
 
 	auto* add_button = new QToolButton(m_game_dirs_group);
-	add_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+	add_button->setIcon(LauncherIcons::Make(LauncherIcons::Symbol::Folder));
+	add_button->setText(tr("Add folder"));
+	add_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	add_button->setToolTip(tr("Add game folder"));
 	add_button->setAutoRaise(true);
 	button_layout->addWidget(add_button);
 
 	m_remove_game_dir_button = new QToolButton(m_game_dirs_group);
-	m_remove_game_dir_button->setIcon(style()->standardIcon(QStyle::SP_DialogDiscardButton));
+	m_remove_game_dir_button->setIcon(LauncherIcons::Make(LauncherIcons::Symbol::Trash));
+	m_remove_game_dir_button->setText(tr("Remove selected"));
+	m_remove_game_dir_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	m_remove_game_dir_button->setToolTip(tr("Remove selected game folders"));
 	m_remove_game_dir_button->setAutoRaise(true);
 	button_layout->addWidget(m_remove_game_dir_button);
@@ -430,7 +438,9 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	m_addons_dir_edit->setPlaceholderText(tr("Folder containing extracted add-on (DLC) packages"));
 	addons_layout->addWidget(m_addons_dir_edit, 1);
 	auto* addons_button = new QToolButton(m_game_dirs_group);
-	addons_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+	addons_button->setIcon(LauncherIcons::Make(LauncherIcons::Symbol::Folder));
+	addons_button->setText(tr("Browse"));
+	addons_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 	addons_button->setToolTip(tr("Select add-ons folder"));
 	addons_button->setAutoRaise(true);
 	addons_layout->addWidget(addons_button);
@@ -444,7 +454,7 @@ void ConfigurationEditDialog::InitGameDirectories() {
 		}
 	});
 
-	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
+	m_ui->library_tab_layout->insertWidget(0, m_game_dirs_group);
 	m_game_dirs_group->setVisible(false);
 
 	connect(add_button, &QToolButton::clicked, this, &ConfigurationEditDialog::add_game_directory);
@@ -458,6 +468,7 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
 	m_global_settings = true;
+	m_ui->settings_scope->setText(tr("Global defaults for games without custom settings"));
 	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
 	auto* menu = new QMenu(m_ui->settings_button);
 	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
@@ -473,6 +484,7 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
+	FilterCategories(m_ui->settings_search->text());
 	update_game_directory_buttons();
 	if (!m_geometry_restored) {
 		GrowToFitContents();
@@ -494,23 +506,72 @@ void ConfigurationEditDialog::MakeTabsScrollable() {
 	tabs->setCurrentIndex(0);
 }
 
-void ConfigurationEditDialog::GrowToFitContents() {
-	layout()->activate();
+void ConfigurationEditDialog::InitNavigation() {
 	auto* tabs = m_ui->settings_tabs;
-	QSize content;
-	for (int i = 0; i < tabs->count(); i++) {
-		content = content.expandedTo(
-		    static_cast<QScrollArea*>(tabs->widget(i))->widget()->minimumSizeHint());
+	auto* categories = m_ui->settings_categories;
+	tabs->tabBar()->hide();
+	m_ui->settingsSidebar->setMinimumWidth(190);
+	m_ui->settingsSidebar->setMaximumWidth(230);
+	for (int i = 0; i < tabs->count(); ++i) {
+		auto* item = new QListWidgetItem(tabs->tabText(i), categories);
+		item->setSizeHint(QSize(180, 40));
+		auto* page = static_cast<QScrollArea*>(tabs->widget(i))->widget();
+		item->setToolTip(page->toolTip());
+		page->setToolTip({});
 	}
-	const QSize chrome = size() - tabs->currentWidget()->size();
-	resize(size().expandedTo(content + chrome).boundedTo(screen()->availableGeometry().size()));
+	connect(categories, &QListWidget::currentRowChanged, this, [this](int row) {
+		if (row < 0) return;
+		m_ui->settings_tabs->setCurrentIndex(row);
+		m_ui->settings_page_title->setText(m_ui->settings_categories->item(row)->text());
+		m_ui->settings_page_description->setText(m_ui->settings_categories->item(row)->toolTip());
+	});
+	connect(m_ui->settings_search, &QLineEdit::textChanged, this,
+	        &ConfigurationEditDialog::FilterCategories);
+	FilterCategories({});
+}
+
+void ConfigurationEditDialog::FilterCategories(const QString& query) {
+	const auto words = query.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+	int first = -1;
+	for (int i = 0; i < m_ui->settings_tabs->count(); ++i) {
+		auto* item = m_ui->settings_categories->item(i);
+		auto* page = static_cast<QScrollArea*>(m_ui->settings_tabs->widget(i))->widget();
+		QString text = item->text() + QLatin1Char(' ') + item->toolTip();
+		for (auto* child: page->findChildren<QWidget*>()) {
+			text += QLatin1Char(' ') + child->property("text").toString();
+			text += QLatin1Char(' ') + child->property("title").toString();
+			text += QLatin1Char(' ') + child->toolTip();
+			if (auto* combo = qobject_cast<QComboBox*>(child)) {
+				for (int j = 0; j < combo->count(); ++j) text += QLatin1Char(' ') + combo->itemText(j);
+			}
+		}
+		bool matches = m_global_settings || (page != m_ui->library_tab && page != m_ui->controller_tab);
+		for (const auto& word: words) matches = matches && text.contains(word, Qt::CaseInsensitive);
+		item->setHidden(!matches);
+		if (matches && first < 0) first = i;
+	}
+	m_ui->settings_no_results->setVisible(first < 0);
+	m_ui->settings_tabs->setVisible(first >= 0);
+	m_ui->settings_page_title->setVisible(first >= 0);
+	m_ui->settings_page_description->setVisible(first >= 0);
+	const auto* current = m_ui->settings_categories->currentItem();
+	if (first >= 0 && (current == nullptr || current->isHidden())) {
+		m_ui->settings_categories->setCurrentRow(first);
+	}
+}
+
+void ConfigurationEditDialog::GrowToFitContents() {
+	// Each category scrolls independently; the longest page must not enlarge the dialog.
+	resize(QSize(1040, 760).boundedTo(screen()->availableGeometry().size() - QSize(40, 60)));
 }
 
 void ConfigurationEditDialog::ShowTab(QWidget* page) {
+	m_ui->settings_search->clear();
 	auto* tabs = m_ui->settings_tabs;
 	for (int i = 0; i < tabs->count(); i++) {
 		if (tabs->widget(i)->isAncestorOf(page)) {
-			tabs->setCurrentIndex(i);
+			m_ui->settings_categories->setCurrentRow(i);
+			static_cast<QScrollArea*>(tabs->widget(i))->ensureWidgetVisible(page);
 			return;
 		}
 	}
@@ -650,19 +711,22 @@ void ConfigurationEditDialog::save() {
 
 	const auto user_name = m_ui->lineEdit_user_name->text().trimmed();
 	if (user_name.isEmpty() || user_name.toUtf8().size() > Config::MAX_USER_NAME_LENGTH) {
+		ShowTab(m_ui->lineEdit_user_name);
+		m_ui->lineEdit_user_name->setFocus();
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("User name must contain 1-16 UTF-8 bytes"));
 		return;
 	}
 	m_ui->lineEdit_user_name->setText(user_name);
 	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
+		ShowTab(m_ui->spinBox_user_id);
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
 		return;
 	}
 	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
 	        .isEmpty()) {
-		ShowTab(m_ui->settings_tab);
+		ShowTab(m_ui->graphics_tab);
 		m_ui->comboBox_screen_resolution->setFocus();
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")

@@ -99,22 +99,64 @@ QComboBox#game_status_editor QAbstractItemView {
     selection-color: palette(highlighted-text);
 }
 
-QLineEdit#game_comment_editor {
-    background: transparent;
-    border: 0;
-    color: palette(text);
-    padding-left: 2px;
-    selection-background-color: palette(highlight);
-    selection-color: palette(highlighted-text);
-}
-
-QLineEdit#game_comment_editor:focus {
-    background: palette(base);
-    border: 1px solid palette(mid);
-    border-radius: 3px;
-}
-
 QLabel#game_status_indicator {
     border: 1px solid palette(base);
     border-radius: 6px;
 }
+
+/* Shared adaptive surfaces: retain system light/dark palette and keyboard focus. */
+QWidget { font-family: "Segoe UI"; font-size: 10pt; }
+QDialog { background: palette(window); }
+QGroupBox { border: 1px solid palette(mid); border-radius: 10px; margin-top: 18px; padding: 16px 12px 12px; font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 6px; }
+QPushButton { min-height: 28px; padding: 5px 16px; border: 1px solid palette(mid); border-radius: 7px; background: palette(button); color: palette(button-text); }
+QPushButton:hover { border-color: palette(highlight); background: palette(midlight); }
+QPushButton:pressed { background: palette(mid); }
+QPushButton:default { border: 2px solid palette(highlight); font-weight: 600; }
+QPushButton:focus, QToolButton:focus { border: 2px solid palette(highlight); }
+QPushButton:disabled, QToolButton:disabled { color: palette(disabled, button-text); }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { min-height: 26px; padding: 4px 8px; border: 1px solid palette(mid); border-radius: 6px; background: palette(base); color: palette(text); selection-background-color: palette(highlight); }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: palette(highlight); }
+QComboBox { padding-right: 24px; }
+QComboBox QAbstractItemView { background: palette(base); color: palette(text); selection-background-color: palette(highlight); }
+QTabWidget::pane { border: 1px solid palette(mid); border-radius: 8px; padding: 8px; }
+QTabBar::tab { padding: 10px 18px; margin-right: 3px; border-bottom: 3px solid transparent; }
+QTabBar::tab:selected { border-bottom-color: palette(highlight); font-weight: 600; }
+QTabBar::tab:hover { background: palette(midlight); }
+QCheckBox, QRadioButton { spacing: 8px; padding: 4px 0; }
+QScrollArea { border: none; }
+QToolTip { padding: 6px 9px; border: 1px solid palette(mid); }
+QTreeWidget#cfgs_list::item { padding: 9px 6px; }
+QTreeWidget#cfgs_list QHeaderView::section { padding: 10px 8px; font-weight: 600; }
+QLabel#label_settings_file, QLabel#label_Interpreter, QLabel#label_Version { font-size: 9pt; }
+QPushButton#run_button { min-width: 130px; min-height: 34px; font-weight: 600; }
+
+
+/* Settings navigation stays still while each category scrolls independently. */
+QListWidget#settings_categories {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 8px;
+    padding: 5px;
+    outline: 0;
+}
+QListWidget#settings_categories::item { padding: 0 12px; border-radius: 5px; }
+QListWidget#settings_categories::item:hover { background: palette(midlight); }
+QListWidget#settings_categories::item:selected {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    font-weight: 600;
+}
+QLabel#settings_page_title { font-size: 20pt; font-weight: 600; padding-top: 4px; }
+QLabel#settings_scope { font-size: 9pt; }
+QLabel#settings_page_description { padding-bottom: 6px; }
+QTabWidget#settings_tabs::pane { border: none; padding: 0; }
+QWidget#settingsSidebar { background: transparent; }
+QDialog#ConfigurationEditDialog QToolButton {
+    padding: 6px 10px;
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+}
+QDialog#ConfigurationEditDialog QToolButton:hover { background: palette(midlight); }
+QMenu::section { padding: 8px 12px 4px; font-weight: 600; }
+QMenu::item { padding: 7px 24px; }

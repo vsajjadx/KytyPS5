@@ -205,9 +205,11 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	    inst.opcode == Decoder::Opcode::S_SWAPPC_B64
 	        ? IR::U64(ir.Emit(IR::ValueOpcode::CallReturnAddress,
 	                          {IR::Value(static_cast<uint32_t>(inst.pc) + 4u)}))
-	        : IR::U64(ir.Emit(IR::ValueOpcode::IAdd64,
-	                          {IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase)),
-	                           IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	        : inst.getpc_guest_next_pc != 0u
+	              ? IR::U64(IR::Value(inst.getpc_guest_next_pc))
+	              : IR::U64(ir.Emit(IR::ValueOpcode::IAdd64,
+	                                {IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase)),
+	                                 IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}

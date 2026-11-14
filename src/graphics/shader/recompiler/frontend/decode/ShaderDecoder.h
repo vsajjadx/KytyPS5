@@ -899,6 +899,9 @@ struct Instruction {
 		bool     vm     = false;
 	} exp;
 	std::string_view unsupported_reason;
+	// Linker-derived TABLE-leaf GETPC next guest PC. Zero keeps ordinary caller-relative
+	// behavior. Not decoded/serialized; never changes raw words, instruction width or CFG PCs.
+	uint64_t       getpc_guest_next_pc          = 0;
 };
 
 struct Program {

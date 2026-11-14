@@ -130,6 +130,8 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (candidate.opcode == Opcode::S_GETPC_B64 && IsScalarCode(candidate.dst, dst_code)) {
+			// A TABLE leaf's original absolute guest PC is not a PC in this relocated CFG.
+			if (candidate.getpc_guest_next_pc != 0u) return false;
 			*index = candidate_index;
 			return true;
 		}
@@ -315,8 +317,8 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	const auto& getpc = program.instructions[setpc_index - 3u];
 	const auto& add   = program.instructions[setpc_index - 2u];
 	const auto& addc  = program.instructions[setpc_index - 1u];
-	if (getpc.opcode != Opcode::S_GETPC_B64 || !IsScalarCode(getpc.dst, pc_reg) ||
-	    add.opcode != Opcode::S_ADD_U32 || !IsScalarCode(add.dst, pc_reg) ||
+	if (getpc.opcode != Opcode::S_GETPC_B64 || getpc.getpc_guest_next_pc != 0u ||
+	    !IsScalarCode(getpc.dst, pc_reg) || add.opcode != Opcode::S_ADD_U32 || !IsScalarCode(add.dst, pc_reg) ||
 	    addc.opcode != Opcode::S_ADDC_U32 || !IsScalarCode(addc.dst, pc_reg + 1u)) {
 		return false;
 	}
@@ -498,8 +500,8 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 	if (setpc_index >= 2u) {
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code) &&
-		    IsScalarCode(arith.dst, pc_code)) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.getpc_guest_next_pc == 0u &&
+		    IsScalarCode(getpc.dst, pc_code) && IsScalarCode(arith.dst, pc_code)) {
 			uint32_t imm  = 0;
 			bool     adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
 			bool     subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
@@ -515,7 +517,8 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	if (setpc_index >= 1u) {
 		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code)) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.getpc_guest_next_pc == 0u &&
+		    IsScalarCode(getpc.dst, pc_code)) {
 			target = InstructionEndPc(getpc);
 			return true;
 		}

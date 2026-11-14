@@ -14026,6 +14026,7 @@ public:
   }
 
 #include "ShaderTableCallNativeTests.inc"
+#include "ShaderTableLeafGetpcNativeTests.inc"
 #include "snippets/table-call-resource-failure.inc"
 #include "ShaderPreparedStreamLifetimeTests.inc"
 
@@ -58205,6 +58206,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--table-call-resource-failure-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTableCallResourceFailure();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--table-leaf-getpc-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTableLeafOriginalGetpc();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--table-call-only") == 0) {

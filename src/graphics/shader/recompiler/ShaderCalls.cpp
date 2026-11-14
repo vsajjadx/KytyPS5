@@ -498,7 +498,8 @@ LeafRead ReadLeaf(uint64_t address, uint32_t call_pc, bool soft,
 		index += inst.word_count;
 		if (inst.opcode == Decoder::Opcode::UNKNOWN || inst.opcode == Decoder::Opcode::UNSUPPORTED)
 			return fail("has a leaf with an undecodable instruction");
-		if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+		if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+		    (!soft && inst.opcode == Decoder::Opcode::S_GETPC_B64) ||
 		    inst.opcode == Decoder::Opcode::S_ENDPGM) {
 			if (!soft) EXIT_NOT_IMPLEMENTED(true);
 			static const bool diagnostic = [] {
@@ -745,6 +746,8 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 		EXIT_IF(function_pc > UINT32_MAX - function_size);
 		const auto function_offset = static_cast<uint32_t>(linked.code.size());
 		for (auto inst: body) {
+			// A cached decoded body may have first been loaded by a TABLE site.
+			if (!soft && inst.opcode == Decoder::Opcode::S_GETPC_B64) EXIT_NOT_IMPLEMENTED(true);
 			const auto clobbers_target = CFG::MayWriteScalarRegister(inst, call.dst.reg, source.wave_size) ||
 			                             CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u, source.wave_size);
 			if (clobbers_target) {
@@ -757,6 +760,12 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 					if (!soft) EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
 					return fmt::format("callee clobbers scalar target dependency s{}", code);
 				}
+			}
+			if (soft && inst.opcode == Decoder::Opcode::S_GETPC_B64) {
+				// Preserve the next ORIGINAL guest PC before assigning this copy a synthetic PC.
+				// ReadLeaf checked this address range; TABLE select marker words already key
+				// the target address. Keep the exact original raw slice for refresh equality.
+				inst.getpc_guest_next_pc = plan[site_index][slot] + uint64_t {inst.pc} + 4u;
 			}
 			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
 			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {

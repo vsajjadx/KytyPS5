@@ -43,6 +43,6 @@ The synchronous 60 Hz baseline reached the menu and survived the FG on/off test.
 Further 60 Hz asynchronous startup tests, including a separate empty-cache working
 directory with copied saves, did not reproduce the divide-by-zero. This rules out
 claiming a confirmed FG exception or a proven root-cause crash fix. The preset is a
-conservative launch workaround; the earlier exception remains unconfirmed.
+conservative launch workaround; the cause of the earlier exception remains unconfirmed.
 
 No divide exception was suppressed and no guest binary was patched.

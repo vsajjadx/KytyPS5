@@ -785,7 +785,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 			inst.pc += function_pc;
 			linked.decoded.instructions.push_back(std::move(inst));
 		}
-		linked.functions.push_back({function_offset, function_size / 4u, site_index, slot});
+		linked.functions.push_back({function_offset, function_size / 4u, site_index, slot, function_pc});
 		function_pc += function_size;
 		return {};
 	};
@@ -936,6 +936,40 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	source.linked = std::move(linked);
 	++source.revision;
 	return &source.linked->decoded;
+}
+
+LinkedPcOrigin DescribeLinkedPc(const ShaderSource& source, uint32_t linked_pc) {
+	LinkedPcOrigin origin;
+	if (!source.linked || source.decoded.instructions.empty()) return origin;
+	const auto&    last       = source.decoded.instructions.back();
+	const uint32_t caller_end = last.pc + last.word_count * sizeof(uint32_t);
+	if (linked_pc < caller_end) {
+		origin.kind     = LinkedPcOrigin::Kind::Caller;
+		origin.local_pc = linked_pc;
+		return origin;
+	}
+	const auto& linked = *source.linked;
+	// Beyond the last linked instruction there is nothing to attribute.
+	if (linked.decoded.instructions.empty()) return origin;
+	const auto&    linked_last = linked.decoded.instructions.back();
+	const uint64_t linked_end  = uint64_t {linked_last.pc} + linked_last.word_count * sizeof(uint32_t);
+	if (linked_pc >= linked_end) return origin;
+	for (const auto& function: linked.functions) {
+		if (function.synthetic_pc == UINT32_MAX || linked_pc < function.synthetic_pc ||
+		    uint64_t {linked_pc - function.synthetic_pc} >= uint64_t {function.size} * sizeof(uint32_t))
+			continue;
+		if (function.site >= linked.site_targets.size() ||
+		    function.slot >= linked.site_targets[function.site].size())
+			return origin;
+		origin.kind     = LinkedPcOrigin::Kind::Callee;
+		origin.site     = function.site;
+		origin.slot     = function.slot;
+		origin.callee   = linked.site_targets[function.site][function.slot];
+		origin.local_pc = linked_pc - function.synthetic_pc;
+		return origin;
+	}
+	origin.kind = LinkedPcOrigin::Kind::Stub; // compare/miss/skip/enter stubs inside the linked span
+	return origin;
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {

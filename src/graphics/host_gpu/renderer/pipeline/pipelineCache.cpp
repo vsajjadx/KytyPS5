@@ -25,6 +25,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -447,6 +448,35 @@ bool HasTableCalls(const ShaderRecompiler::ShaderSource* source) {
 	return source != nullptr && std::ranges::any_of(source->calls, [](const auto& call) {
 		return call.kind == ShaderRecompiler::ShaderSource::Call::Kind::Table;
 	});
+}
+
+// Bounded provenance of a TABLE-linked tracking refusal: the linked PC, its decoded instruction
+// (opcode text and first raw words) and its origin in the current link. No memory is read.
+std::string DescribeTrackingFailure(const ShaderRecompiler::ShaderSource& source,
+                                    const ShaderRecompiler::IR::ResourceTrackingFailure& failure) {
+	using Origin = ShaderRecompiler::LinkedPcOrigin;
+	std::string text = fmt::format("table-linked resource tracking failed revision={} linked_pc=0x{:08x}",
+	                               source.revision, failure.pc);
+	const auto& decoded = source.linked->decoded.instructions;
+	const auto  inst    = std::ranges::find(decoded, failure.pc, &ShaderRecompiler::Decoder::Instruction::pc);
+	if (inst != decoded.end()) {
+		text += fmt::format(" inst=\"{}\" raw={:08x}", ShaderRecompiler::Decoder::InstructionToString(*inst),
+		                    inst->raw[0]);
+		if (inst->word_count > 1u) text += fmt::format(",{:08x}", inst->raw[1]);
+	} else {
+		text += " inst=unknown";
+	}
+	const auto origin = ShaderRecompiler::DescribeLinkedPc(source, failure.pc);
+	switch (origin.kind) {
+	case Origin::Kind::Caller: text += fmt::format(" origin=caller pc=0x{:08x}", origin.local_pc); break;
+	case Origin::Kind::Callee:
+		text += fmt::format(" origin=callee site={} slot={} callee=0x{:x} callee_pc=0x{:x}", origin.site,
+		                    origin.slot, origin.callee, origin.local_pc);
+		break;
+	case Origin::Kind::Stub: text += " origin=stub"; break;
+	default: text += " origin=unknown"; break;
+	}
+	return text + ": " + failure.reason;
 }
 
 } // namespace
@@ -874,6 +904,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				input_info.stage = {};
 				return nullptr;
 			}
+			// An unchanged source that failed resource tracking must not reach FindModule: the
+			// preceding valid variant's plan/modules belong to a different link. A changed source
+			// retries tracking below.
+			if (!source_changed && cached.call_tracking_failed) {
+				++m_call_tracking.cached_rejections;
+				NoteCallFailure(params.hash, cached.call_tracking_failure);
+				input_info.stage = {};
+				return nullptr;
+			}
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, materialization_failed);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, materialization_failed);
@@ -948,7 +987,30 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				}
 				NoteCallDiagnostic(params.hash, *current);
 			}
-			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+			// TABLE-linked translation turns a resource-tracking refusal into a failed dispatch;
+			// pure Uniform links keep the historical fatal exit. Only that typed failure is caught.
+			const bool table_linked = HasTableCalls(current);
+			try {
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options, table_linked);
+			} catch (const ShaderRecompiler::IR::ResourceTrackingFailure& failure) {
+				auto reason = DescribeTrackingFailure(*current, failure);
+				++m_call_tracking.translation_failures;
+				NoteCallFailure(params.hash, reason);
+				input_info.stage = {};
+				if (entry == m_program_cache.end()) {
+					// Keep only refreshable source; never a skipped Program, module or queued compile.
+					m_unlinked_call_sources[m_lookup_key] =
+					    std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
+				} else {
+					entry->second.call_tracking_failed  = true;
+					entry->second.call_tracking_failure = std::move(reason);
+				}
+				return nullptr;
+			}
+			if (entry != m_program_cache.end()) {
+				entry->second.call_tracking_failed = false;
+				entry->second.call_tracking_failure.clear();
+			}
 			translated.program.source_reads = current->reads;
 			call_address_writes = HasAddressWrites(translated.program);
 		} else {

@@ -377,8 +377,9 @@ private:
 class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-	        ShaderStageInputInfo input)
-	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
+	        ShaderStageInputInfo input, bool soft_failure = false)
+	    : m_soft_failure(soft_failure), m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
+	      m_input(input),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
@@ -603,6 +604,7 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (m_soft_failure) throw ResourceTrackingFailure {pc, reason, message};
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -4296,8 +4298,12 @@ private:
 				                                                        : ResourceKind::Buffer) ||
 				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     fmt::format("buffer descriptor is not a valid runtime value; GPU-selected access "
+					                 "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load "
+					                 "(op={} memory_kind={} bits={} dwords={} formatted={} typed={})",
+					                 static_cast<uint32_t>(op), static_cast<uint32_t>(memory.kind),
+					                 memory.data_bits, memory.data_dwords, memory.formatted ? 1 : 0,
+					                 memory.typed ? 1 : 0));
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				return;
@@ -4422,6 +4428,8 @@ private:
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
 	}
 
+	// TABLE-linked translation only: Fail throws ResourceTrackingFailure instead of exiting.
+	bool                                       m_soft_failure = false;
 	Program&                                   m_program;
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
@@ -4504,8 +4512,8 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 } // namespace
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
+                    ShaderStageInputInfo input, bool soft_failure) {
+	Tracker(program, decoded, native_cfg, input, soft_failure).Run();
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
 }
 

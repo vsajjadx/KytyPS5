@@ -13511,6 +13511,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderTableCallCfgTests.inc"
 #include "ShaderTableLeafGetpcCfgTests.inc"
+#include "ShaderTableTrackingFailureCfgTests.inc"
 #include "ShaderMixedGetpcFatalProbe.inc"
 #include "ShaderRayTracingTests.inc"
 
@@ -13531,6 +13532,18 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--tagged-leaf-getpc-cfg-fatal-probe") == 0) {
     ProbeTaggedLeafGetpcCfgFatal();
+    return 2;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--table-tracking-failure-only") == 0) {
+    TestTableTrackingSoftFailure();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--table-tracking-normal-fatal-probe") == 0) {
+    ProbeTableTrackingNormalFatal();
+    return 2;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--table-tracking-uniform-fatal-probe") == 0) {
+    ProbeTableTrackingUniformFatal();
     return 2;
   }
   if (argc == 2 && std::strcmp(argv[1], "--table-leaf-getpc-only") == 0) {
@@ -13673,6 +13686,7 @@ int main(int argc, char** argv) {
   TestMemoryFedScalarLeafCall();
   TestTableSelectedLeafCall();
   TestTableLeafOriginalGetpc();
+  TestTableTrackingSoftFailure();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

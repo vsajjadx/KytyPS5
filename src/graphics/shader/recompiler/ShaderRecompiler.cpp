@@ -504,7 +504,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
-TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
+TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options,
+                                 bool soft_tracking_failure) {
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
@@ -618,7 +619,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
 		     MakeIrDump(cfg_dump, ir).c_str());
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	IR::TrackResources(ir, decoded, native_cfg, options.input_info, soft_tracking_failure);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

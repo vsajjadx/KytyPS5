@@ -61,7 +61,12 @@ struct ShaderSource {
 	};
 	struct Linked {
 		// One leaf copy per uniform site, or per (table site, callee slot).
-		struct Function { uint32_t offset; uint32_t size; size_t site = 0; uint32_t slot = 0; };
+		// offset/size index RAW DWORDs of `code`; synthetic_pc is this copy's first translation PC
+		// (the caller keeps its original PCs; copies start after the caller's last instruction).
+		struct Function {
+			uint32_t offset; uint32_t size; size_t site = 0; uint32_t slot = 0;
+			uint32_t synthetic_pc = UINT32_MAX;
+		};
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
 		std::vector<Function> functions;
@@ -95,8 +100,21 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 [[nodiscard]] const Decoder::Program* TryRefreshShaderSource(ShaderSource& source,
                                                              const IR::SrtRuntime& runtime,
                                                              std::string& failure);
+// soft_tracking_failure (TABLE-linked translation only) throws IR::ResourceTrackingFailure from
+// resource tracking instead of exiting; every other translation keeps the fatal behavior.
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
-	                                           const CompileOptions& options);
+	                                           const CompileOptions& options,
+	                                           bool soft_tracking_failure = false);
+// Diagnostic only: where a linked translation PC came from (no memory reads, current link only).
+struct LinkedPcOrigin {
+	enum class Kind { Unknown, Caller, Callee, Stub };
+	Kind     kind     = Kind::Unknown;
+	size_t   site     = 0;
+	uint32_t slot     = 0;
+	uint64_t callee   = 0;
+	uint32_t local_pc = 0; // caller: original PC; callee: PC inside the callee
+};
+[[nodiscard]] LinkedPcOrigin DescribeLinkedPc(const ShaderSource& source, uint32_t linked_pc);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

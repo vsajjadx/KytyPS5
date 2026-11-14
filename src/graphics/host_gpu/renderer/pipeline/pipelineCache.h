@@ -221,6 +221,12 @@ public:
 	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info);
 	// Fails ONE dispatch of a table-call program (logged at powers of two; never cached).
 	void NoteCallFailure(uint64_t hash, const std::string& reason);
+	// TABLE-linked resource-tracking refusals: translations that failed, and unchanged failed
+	// sources refused before any module lookup or materialization (diagnostics/tests).
+	struct CallTrackingCounters {
+		uint64_t translation_failures = 0, cached_rejections = 0;
+	};
+	[[nodiscard]] CallTrackingCounters CallTracking() const { return m_call_tracking; }
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -245,6 +251,10 @@ private:
 		std::string call_failure;
 		// Linked program stores through computed addresses (flat/global): unbounded writes.
 		bool call_address_writes = false;
+		// The current linked source failed resource tracking (reason kept for diagnostics). Set
+		// only by a failed TABLE-linked translation, cleared only by a successful one.
+		bool        call_tracking_failed = false;
+		std::string call_tracking_failure;
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor,
@@ -279,6 +289,7 @@ private:
 	std::unordered_map<ProgramKey, std::unique_ptr<ShaderRecompiler::ShaderSource>, ProgramKeyHash>
 	    m_unlinked_call_sources;
 	std::unordered_map<uint64_t, uint64_t> m_call_failures;
+	CallTrackingCounters                   m_call_tracking;
 
 	void NoteCallDiagnostic(uint64_t hash, const ShaderRecompiler::ShaderSource& source);
 	static std::string CallCodeConflict(const Program& program, const ShaderModule& module);

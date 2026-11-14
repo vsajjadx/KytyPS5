@@ -47,6 +47,10 @@ public:
 
 	[[nodiscard]] uint64_t SignatureId() const { return m_signature_id; }
 
+	// Whether the last Generate call recorded writes to its `output` image (it can, and still
+	// return false for the first frame after a reset). Its layout is then transfer source.
+	[[nodiscard]] bool OutputWritten() const { return m_output_written; }
+
 	// Whether the frame with this signature id differs so much from the previous one that
 	// interpolating between them would blend two unrelated shots. Needs its GPU work complete.
 	[[nodiscard]] bool IsSceneCut(uint64_t id);
@@ -103,6 +107,7 @@ private:
 	uint32_t                                  m_height   = 0;
 	uint64_t                                  m_frame_id = 0;
 	std::atomic_bool                          m_reset {true};
+	bool                                      m_output_written = false;
 	bool                                      m_failed               = false;
 	uint32_t                                  m_consecutive_failures = 0;
 	uint64_t                                  m_failed_tick          = 0;

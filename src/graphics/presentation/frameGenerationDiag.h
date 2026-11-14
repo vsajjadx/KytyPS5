@@ -46,6 +46,17 @@ public:
     }
     // FrameGenerator::Generate recorded (true) or failed (false) for an eligible frame.
     void NoteGeneration(bool recorded) { (recorded ? m_generation_recorded : m_generation_failed)++; }
+    // Three-way form for the present path. gen_recorded: Generate returned true, an interpolated
+    // frame was recorded and goes to presentation. gen_seeded: it returned false after writing its
+    // output (first frame after a reset seeds history; nothing generated is shown). gen_failed:
+    // nothing was written. A seed is never counted as recorded or failed.
+    void NoteGeneration(bool recorded, bool output_written) {
+        if (!recorded && output_written) {
+            ++m_generation_seeded;
+        } else {
+            NoteGeneration(recorded);
+        }
+    }
     // A pending delayed real frame was replaced by a newer frame before it was presented.
     void NoteSuperseded() { ++m_superseded_real; }
     // Swapchain recreated: the next interval would span a recreation, so it is not sampled.
@@ -101,7 +112,7 @@ private:
             "FG_DIAG v=1 window_ms=%llu frames=%llu requested=%llu eligible=%llu gen_recorded=%llu gen_failed=%llu "
             "superseded_real=%llu ok_real=%llu ok_generated=%llu ok_delayed_real=%llu ok_repeat=%llu ok_blank=%llu "
             "fail_real=%llu fail_generated=%llu fail_delayed_real=%llu fail_repeat=%llu fail_blank=%llu "
-            "recreates=%llu interval_us %s dropped=%llu source=callsite scanout=unknown",
+            "recreates=%llu interval_us %s dropped=%llu source=callsite scanout=unknown gen_seeded=%llu",
             static_cast<unsigned long long>(window_ns / 1'000'000u), static_cast<unsigned long long>(m_requests),
             static_cast<unsigned long long>(m_requested), static_cast<unsigned long long>(m_eligible),
             static_cast<unsigned long long>(m_generation_recorded),
@@ -109,7 +120,7 @@ private:
             p(PresentKind::Real), p(PresentKind::Generated), p(PresentKind::DelayedReal), p(PresentKind::Repeat),
             p(PresentKind::Blank), f(PresentKind::Real), f(PresentKind::Generated), f(PresentKind::DelayedReal),
             f(PresentKind::Repeat), f(PresentKind::Blank), static_cast<unsigned long long>(m_recreates), interval,
-            static_cast<unsigned long long>(m_dropped));
+            static_cast<unsigned long long>(m_dropped), static_cast<unsigned long long>(m_generation_seeded));
         if (written < 0 || static_cast<size_t>(written) >= size) {
             std::snprintf(out, size, "FG_DIAG v=1 error=truncated");
         }
@@ -117,7 +128,7 @@ private:
 
     void ResetWindow(uint64_t now_ns) {
         m_requests = m_requested = m_eligible = m_generation_recorded = m_generation_failed = 0;
-        m_superseded_real = m_recreates = m_dropped = 0;
+        m_superseded_real = m_recreates = m_dropped = m_generation_seeded = 0;
         m_presented.fill(0);
         m_failed.fill(0);
         m_count           = 0;
@@ -125,7 +136,7 @@ private:
     }
 
     uint64_t m_requests = 0, m_requested = 0, m_eligible = 0, m_generation_recorded = 0, m_generation_failed = 0;
-    uint64_t m_superseded_real = 0, m_recreates = 0, m_dropped = 0;
+    uint64_t m_superseded_real = 0, m_recreates = 0, m_dropped = 0, m_generation_seeded = 0;
     std::array<uint64_t, static_cast<size_t>(PresentKind::Count)> m_presented {}, m_failed {};
     std::array<uint32_t, MaxSamples> m_samples {};
     uint32_t m_count           = 0;

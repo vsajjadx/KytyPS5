@@ -467,6 +467,7 @@ bool FrameGenerator::Recreate(vk::CommandBuffer command, uint32_t width, uint32_
 bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Image output,
                               uint32_t frame_width, uint32_t frame_height) {
 	m_signature_id = 0;
+	m_output_written = false;
 	if (frame_width == 0 || frame_height == 0) {
 		return false;
 	}
@@ -506,8 +507,8 @@ bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Im
 		        Access::eTransferWrite, Layout::eUndefined, Layout::eGeneral)};
 	PipelineBarriers(command, to_copy);
 	CopyImage(command, frame, Layout::eGeneral, m_color.image, Layout::eGeneral, m_width, m_height);
-	RecordSignature(command, frame, m_width, m_height, m_frame_id + 1);
-	m_signature_id = m_frame_id + 1;
+	// The scene-cut signature (RecordSignature/IsSceneCut/SignatureId) has no consumer in src or
+	// tests, so its per-frame downsample chain and host copy are no longer recorded.
 
 	const std::array to_interpolate {
 	    Barrier(m_color.image, Stage::eTransfer, Access::eTransferWrite, Stage::eAllCommands,
@@ -582,6 +583,7 @@ bool FrameGenerator::Generate(vk::CommandBuffer command, vk::Image frame, vk::Im
 	PipelineBarriers(command, to_output);
 	CopyImage(command, m_interpolated.image, Layout::eGeneral, output, Layout::eTransferDstOptimal,
 	          m_width, m_height);
+	m_output_written = true; // the barrier below leaves it in the transfer source layout
 
 	const std::array to_present {
 	    Barrier(output, Stage::eTransfer, Access::eTransferWrite, Stage::eTransfer,

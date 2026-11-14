@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/frameGeneration.h"
 #include "graphics/presentation/frameGenerationDiag.h"
+#include "graphics/presentation/frameGenerationPacing.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
@@ -400,6 +401,14 @@ struct Presenter::Impl {
 	// a later vblank. Returns false when the frame should be shown right away instead.
 	bool PresentWithGeneratedFrame(Frame* real) {
 		using namespace std::chrono_literals;
+		if (real->blank) {
+			// Not a game frame: it neither samples the game frame interval nor keeps a pending real.
+			if (frame_generator != nullptr) {
+				frame_generator->Reset();
+			}
+			pending_real = false;
+			return false;
+		}
 		const auto now = std::chrono::steady_clock::now();
 		if (last_real_frame.time_since_epoch().count() != 0) {
 			const auto interval = now - last_real_frame;
@@ -445,11 +454,18 @@ struct Presenter::Impl {
 		real->image.state = {vk::PipelineStageFlagBits2::eAllCommands,
 		                     vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
 		                     vk::ImageLayout::eGeneral};
+		// Generate may write the output and still decline it (first frame after a reset).
 		generated.image.state = {
 		    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
-		    ok ? vk::ImageLayout::eTransferSrcOptimal : generated.image.state.layout};
-		present_scheduler.Submit();
-		if (FrameGenerationDiag::Enabled()) fg_diag.NoteGeneration(ok);
+		    frame_generator->OutputWritten() ? vk::ImageLayout::eTransferSrcOptimal
+		                                     : generated.image.state.layout};
+		// This submission reads `real` and writes `generated`: neither may be reused (pool reuse
+		// and the next Configure wait on present_tick) before it completes, whatever happens next.
+		const auto generation_tick = present_scheduler.Submit();
+		real->present_tick      = FrameGenerationPacing::RetainTick(real->present_tick, generation_tick);
+		generated.present_tick  = FrameGenerationPacing::RetainTick(generated.present_tick, generation_tick);
+		// A reset seed (output written, declined) is not a generation failure.
+		if (FrameGenerationDiag::Enabled()) fg_diag.NoteGeneration(ok, frame_generator->OutputWritten());
 		if (!ok) {
 			pending_real = false;
 			return false;
@@ -463,7 +479,7 @@ struct Presenter::Impl {
 			            std::chrono::duration<double, std::milli>(real_interval).count());
 		}
 		pending_real = true;
-		real_due     = now + real_interval / 2;
+		real_due     = now + FrameGenerationPacing::PendingRealDelay(real_interval, vblank);
 		return true;
 	}
 
@@ -1181,7 +1197,14 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present(FrameGenerationDiag::PresentKind::Repeat);
+	// layers[0] already holds a waiting real frame (PresentWithGeneratedFrame): this overlay
+	// refresh shows it now, so it is that frame's one delayed-real present, not a repeat.
+	auto kind = FrameGenerationDiag::PresentKind::Repeat;
+	if (m_impl->pending_real) {
+		m_impl->pending_real = false;
+		kind                 = FrameGenerationDiag::PresentKind::DelayedReal;
+	}
+	m_impl->Present(kind);
 	return true;
 }
 
@@ -1206,23 +1229,41 @@ void Presenter::Present(Frame& frame) {
 
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
+	bool main_updated = false;
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+		main_updated |= layer.bus == 0;
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
-			// A delayed real frame still waiting for its vblank is replaced unpresented.
-			if (layer.bus == 0 && m_impl->pending_real && FrameGenerationDiag::Enabled())
-				m_impl->fg_diag.NoteSuperseded();
+			if (layer.bus == 0 && m_impl->pending_real) {
+				// The waiting real frame is about to be released: show it first when it is due
+				// (the flip was only handled first in this vblank); otherwise it is superseded.
+				if (FrameGenerationPacing::FlushPendingReal(true, std::chrono::steady_clock::now(),
+				                                            m_impl->real_due)) {
+					m_impl->pending_real = false;
+					m_impl->Present(FrameGenerationDiag::PresentKind::DelayedReal);
+				} else if (FrameGenerationDiag::Enabled()) {
+					m_impl->fg_diag.NoteSuperseded();
+				}
+			}
 			m_impl->frames.Release(previous.frame);
 		}
 		previous = layer;
 	}
 	auto* main_frame = m_impl->layers[0].frame;
-	if (main_frame != nullptr && m_impl->PresentWithGeneratedFrame(main_frame)) {
+	// Only a new main-bus frame is a game frame; an overlay-only update must not sample the frame
+	// interval, regenerate from the same frame or reset the generator.
+	if (main_updated && main_frame != nullptr && m_impl->PresentWithGeneratedFrame(main_frame)) {
 		return;
 	}
-	m_impl->Present(main_frame == nullptr || main_frame->blank ? FrameGenerationDiag::PresentKind::Blank
-	                                                           : FrameGenerationDiag::PresentKind::Real);
+	auto kind = main_frame == nullptr || main_frame->blank ? FrameGenerationDiag::PresentKind::Blank
+	                                                       : FrameGenerationDiag::PresentKind::Real;
+	if (!main_updated && m_impl->pending_real) {
+		// This present shows the waiting real frame (with the new overlay) now.
+		m_impl->pending_real = false;
+		kind                 = FrameGenerationDiag::PresentKind::DelayedReal;
+	}
+	m_impl->Present(kind);
 }
 
 bool Presenter::PresentPendingFrame() {

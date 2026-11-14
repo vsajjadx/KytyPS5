@@ -673,6 +673,10 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_executable(frame_generation_pacing_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FrameGenerationPacingTests.cpp")
+target_include_directories(frame_generation_pacing_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(frame_generation_diag_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FrameGenerationDiagTests.cpp")
 target_include_directories(frame_generation_diag_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -709,6 +713,8 @@ if(BUILD_TESTING)
 	add_test(NAME table_leaf_getpc_native COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-leaf-getpc-only)
 	add_test(NAME table_tracking_soft_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-tracking-failure-only)
 	# Each child gets an explicit environment; the default-OFF case clears inherited settings.
+	add_test(NAME frame_generation_pacing COMMAND $<TARGET_FILE:frame_generation_pacing_tests>)
+	set_tests_properties(frame_generation_pacing PROPERTIES LABELS "cpu;frame_generation_pacing")
 	add_test(NAME frame_generation_diag_off
 		COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_FG_DIAG $<TARGET_FILE:frame_generation_diag_tests> off)
 	add_test(NAME frame_generation_diag_on
@@ -907,6 +913,7 @@ set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		frame_generation_pacing_tests
 		frame_generation_diag_tests
 		psml_tests
 		ime_dialog_tests

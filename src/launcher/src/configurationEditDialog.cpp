@@ -522,7 +522,6 @@ void ConfigurationEditDialog::InitNavigation() {
 	connect(categories, &QListWidget::currentRowChanged, this, [this](int row) {
 		if (row < 0) return;
 		m_ui->settings_tabs->setCurrentIndex(row);
-		m_ui->settings_page_title->setText(m_ui->settings_categories->item(row)->text());
 		m_ui->settings_page_description->setText(m_ui->settings_categories->item(row)->toolTip());
 	});
 	connect(m_ui->settings_search, &QLineEdit::textChanged, this,
@@ -552,7 +551,6 @@ void ConfigurationEditDialog::FilterCategories(const QString& query) {
 	}
 	m_ui->settings_no_results->setVisible(first < 0);
 	m_ui->settings_tabs->setVisible(first >= 0);
-	m_ui->settings_page_title->setVisible(first >= 0);
 	m_ui->settings_page_description->setVisible(first >= 0);
 	const auto* current = m_ui->settings_categories->currentItem();
 	if (first >= 0 && (current == nullptr || current->isHidden())) {

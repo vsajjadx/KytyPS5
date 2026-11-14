@@ -147,7 +147,6 @@ QListWidget#settings_categories::item:selected {
     color: palette(highlighted-text);
     font-weight: 600;
 }
-QLabel#settings_page_title { font-size: 20pt; font-weight: 600; padding-top: 4px; }
 QLabel#settings_scope { font-size: 9pt; }
 QLabel#settings_page_description { padding-bottom: 6px; }
 QTabWidget#settings_tabs::pane { border: none; padding: 0; }

@@ -386,7 +386,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	});
 #endif
 	process->start();
-#if !defined(_WIN32)
 	// Report immediate launch failures.
 	if (!process->waitForStarted(5000)) {
 		QMessageBox::critical(
@@ -394,7 +393,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
 		return;
 	}
-#endif
 	process->waitForFinished(100);
 }
 

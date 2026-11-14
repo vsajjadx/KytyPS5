@@ -47,6 +47,15 @@ Frame generation is **off by default**. In the launcher's game configuration:
 2. For Multi, select a **Multi multiplier** of **2x, 3x, 4x, 5x or 6x**.
 3. Check **Enable frame generation**, save, and start the game. **F3** toggles generation in game.
 
+With **Recommended settings for known games** enabled, the UFC 6 launcher preset uses 60 Hz
+virtual vblank and synchronous shader/pipeline compilation, alongside 1080p output, Immediate
+presentation and the shader cache. A launch with the saved 360 Hz/asynchronous settings
+stalled on the splash screen in local testing; the synchronous 60 Hz baseline reached the menu. Saved settings and the
+chosen FG backend, factor and enable state stay intact. Disable the preset to use your own
+values. This conservative startup workaround does not establish the cause of the earlier guest
+divide-by-zero crash: subsequent 60 Hz asynchronous launches, including one without a shader
+cache, did not reproduce it. See [the verification notes](docs/ufc6-launcher-stability-2026-11-14.md).
+
 The multiplier includes the real frame: **5x requests four intermediate images followed by the
 real image**. Selecting a backend or factor does not enable generation. Those selections remain
 saved while the enable checkbox is off, so a later F3 uses them. FSR always remains 2x; switching

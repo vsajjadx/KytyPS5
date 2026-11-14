@@ -99,6 +99,64 @@ int main(int argc, char** argv) {
 		Check(enabled_args == run_args, "enable checkbox changed backend or other arguments");
 	}
 
+	// The UFC 6 compatibility preset must survive unsafe saved/global settings without
+	// changing the user's FG selection. Other titles and the tuning opt-out retain their values.
+	for (int multiplier = 2; multiplier <= 6; ++multiplier) {
+		for (const bool enabled: {false, true}) {
+			Configuration ufc6;
+			ufc6.title_id = QStringLiteral("PPSA23566");
+			ufc6.name = QStringLiteral("EA SPORTS UFC 6");
+			ufc6.game_tuning_enabled = true;
+			ufc6.async_shaders_enabled = true;
+			ufc6.async_compute_enabled = true;
+			ufc6.async_pipelines_enabled = true;
+			ufc6.vblank_frequency = 360;
+			ufc6.frame_generation_backend = QStringLiteral("multi");
+			ufc6.frame_generation_multiplier = multiplier;
+			ufc6.frame_generation_enabled = enabled;
+			const auto safe_args = CreateEmulatorArgs(ufc6);
+			Check(Value(safe_args, "--vblank-frequency") == QStringLiteral("60") &&
+			      !safe_args.contains("--async-shaders") &&
+			      !safe_args.contains("--async-compute") &&
+			      !safe_args.contains("--async-pipelines"), "UFC 6 compatibility preset missing");
+			Check(Value(safe_args, "--frame-generation-backend") == QStringLiteral("multi") &&
+			      Value(safe_args, "--frame-generation-multiplier") == QString::number(multiplier) &&
+			      safe_args.contains("--frame-generation") == enabled,
+			      "UFC 6 compatibility preset changed FG selection");
+			Check(!safe_args.contains("--skip-notice-screen"), "UFC 6 preset skipped notices");
+			ufc6.skip_notice_screen = true;
+			Check(CreateEmulatorArgs(ufc6).contains("--skip-notice-screen"),
+			      "UFC 6 preset discarded skip-notice selection");
+			ufc6.skip_notice_screen = false;
+			Check(ufc6.vblank_frequency == 360 && ufc6.async_shaders_enabled &&
+			      ufc6.async_compute_enabled && ufc6.async_pipelines_enabled,
+			      "argument generation overwrote saved settings");
+			ufc6.title_id = QStringLiteral(" ppsa23566 ");
+			ufc6.name = QStringLiteral("Regional title");
+			Check(CreateEmulatorArgs(ufc6) == safe_args,
+			      "UFC 6 title ID missed compatibility preset");
+			ufc6.title_id = QStringLiteral("OTHER-REGION");
+			ufc6.name = QStringLiteral("EA SPORTS UFC 6");
+			Check(CreateEmulatorArgs(ufc6) == safe_args,
+			      "UFC 6 name fallback missed compatibility preset");
+			ufc6.game_tuning_enabled = false;
+			const auto opted_out = CreateEmulatorArgs(ufc6);
+			Check(Value(opted_out, "--vblank-frequency") == QStringLiteral("360") &&
+			      opted_out.contains("--async-shaders") && opted_out.contains("--async-compute") &&
+			      opted_out.contains("--async-pipelines"), "UFC 6 tuning opt-out ignored");
+			for (const auto& title: {QStringLiteral("PPSA03541"), QStringLiteral("PPSA03671")}) {
+				ufc6.game_tuning_enabled = true;
+				ufc6.title_id = title;
+				ufc6.name = title == QStringLiteral("PPSA03541") ? QStringLiteral("UFC 5")
+				                                                   : QStringLiteral("Marvel's Wolverine");
+				const auto other_args = CreateEmulatorArgs(ufc6);
+				Check(Value(other_args, "--vblank-frequency") == QStringLiteral("360") &&
+				      other_args.contains("--async-shaders") && other_args.contains("--async-compute") &&
+				      other_args.contains("--async-pipelines"), "UFC 6 policy changed another game");
+			}
+		}
+	}
+
 	Configuration json;
 	QString error;
 	Configuration legacy_json;

@@ -76,16 +76,6 @@
         </widget>
        </item>
        <item>
-        <widget class="QLabel" name="settings_page_title">
-         <property name="text">
-          <string>System</string>
-         </property>
-         <property name="wordWrap">
-          <bool>true</bool>
-         </property>
-        </widget>
-       </item>
-       <item>
         <widget class="QLabel" name="settings_page_description">
          <property name="wordWrap">
           <bool>true</bool>
@@ -221,7 +211,7 @@
               <item row="1" column="0" colspan="2">
                <widget class="QCheckBox" name="checkBox_game_tuning">
                 <property name="toolTip">
-                 <string>Start known games (UFC 5 and UFC 6) with the settings they were tuned with: a 1080p display, Immediate presentation and the shader cache.</string>
+                 <string>Use a 1080p display, Immediate presentation and the shader cache for UFC 5 and UFC 6. UFC 6 also uses 60 Hz vblank and synchronous shader/pipeline compilation for startup stability. These launch overrides preserve your saved settings and frame-generation selection. Disable this option to use your own values.</string>
                 </property>
                 <property name="text">
                  <string>Recommended settings for known games</string>

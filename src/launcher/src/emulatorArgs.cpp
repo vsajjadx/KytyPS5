@@ -23,9 +23,20 @@ static bool IsTunedGame(const Configuration& info) {
 	return title_ids.contains(info.title_id.trimmed().toUpper()) || name.match(info.name).hasMatch();
 }
 
+static bool IsUfc6(const Configuration& info) {
+	static const QRegularExpression name(QStringLiteral("\\bUFC\\W*6\\b"),
+	                                     QRegularExpression::CaseInsensitiveOption);
+	return info.title_id.trimmed().compare(QStringLiteral("PPSA23566"), Qt::CaseInsensitive) == 0 ||
+	       name.match(info.name).hasMatch();
+}
+
 QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_plan) {
 	QStringList args;
 	const bool  tuned = info.game_tuning_enabled && IsTunedGame(info);
+	// UFC 6's asynchronous launch path stalled on the splash screen in local testing, while
+	// the synchronous 60 Hz baseline reached the title/menu. Keep that compatibility preset
+	// separate from the selected frame-generation backend, factor and enable state.
+	const bool  ufc6_compatibility = tuned && IsUfc6(info);
 	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
@@ -73,9 +84,10 @@ QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_p
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	AddFlag(args, info.shader_cache_enabled || tuned, "--shader-cache");
-	AddFlag(args, info.async_shaders_enabled, "--async-shaders");
-	AddFlag(args, info.async_shaders_enabled && info.async_compute_enabled, "--async-compute");
-	AddFlag(args, info.async_pipelines_enabled, "--async-pipelines");
+	AddFlag(args, info.async_shaders_enabled && !ufc6_compatibility, "--async-shaders");
+	AddFlag(args, info.async_shaders_enabled && info.async_compute_enabled && !ufc6_compatibility,
+	        "--async-compute");
+	AddFlag(args, info.async_pipelines_enabled && !ufc6_compatibility, "--async-pipelines");
 	if (info.gpu_timestamp_scale != 100) {
 		args << "--gpu-timestamp-scale" << QString::number(info.gpu_timestamp_scale);
 	}
@@ -84,7 +96,7 @@ QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_p
 	if (!info.skip_shaders.isEmpty()) {
 		args << "--skip-shaders" << info.skip_shaders;
 	}
-	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
+	args << "--vblank-frequency" << QString::number(ufc6_compatibility ? 60 : info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
 	AddFlag(args, info.shader_validation_enabled, "--shader-validation");

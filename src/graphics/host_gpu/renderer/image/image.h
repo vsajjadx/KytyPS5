@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/ActivityProof.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -85,25 +86,27 @@ public:
 		}
 	}
 	void ResolveMaybeCpuHash(uint64_t hash) {
+		ActivityChanged();
 		m_maybe_cpu_dirty = false;
 		m_cpu_dirty       = hash != m_maybe_cpu_hash;
 	}
 
 	void RefreshComplete() {
+		ActivityChanged();
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept { ActivityChanged(); m_gpu_modified = true; }
+	void               ClearGpuModified() noexcept { ActivityChanged(); m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void               ClearBufferModified() noexcept { ActivityChanged(); m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
 		return info.data.address < address + size && address < info.data.End();
@@ -122,7 +125,12 @@ public:
 	}
 	// Resident image heaps sample an image without rediscovering it until one changes its
 	// contents, tracking, identity or layout.
+	static void ActivityChanged() noexcept {
+		if (ShaderRecompiler::IR::HostActivityProofEnabled()) ++activity_epoch;
+	}
+	static inline std::atomic<uint64_t> activity_epoch {1};
 	void HeapChanged() const noexcept {
+		ActivityChanged();
 		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
 			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
 		}

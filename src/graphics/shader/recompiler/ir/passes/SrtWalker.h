@@ -46,6 +46,11 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// Strict, nonblocking probes: false must cause no synchronization or cache mutation.
+	SrtMemoryReader read_activity_memory = nullptr;
+	bool (*read_activity_epoch)(void*, ActivityEpoch&) = nullptr;
+	bool (*validate_activity_targets)(void*, std::span<const std::pair<uint64_t, uint64_t>>) = nullptr;
+	uint32_t activity_push_data_cursor = 0;
 };
 
 class SrtReadCapture {

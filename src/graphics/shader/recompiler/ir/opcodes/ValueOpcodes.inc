@@ -361,3 +361,10 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+
+// Serialized ResourcePlan opcodes use these implicit IDs. Append new opcodes so
+// existing normal-plan wire IDs (including SelectU32=341) remain unchanged.
+// Table-call no-match: (call pc, loaded target lo, hi) -> GPU callable fault record.
+VALUE_OPCODE(CallTableMiss, Void, U32, U32, U32)
+// A call's saved return address (call pc + 4). Must be dead after linking (has_swap_pc guard).
+VALUE_OPCODE(CallReturnAddress, U64, U32)

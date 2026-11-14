@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
+#include "OfflineCachePlanDump.inc"
 
 #include <bit>
 #include <cstdio>
@@ -973,6 +974,513 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   }
 }
 
+// Exercise the normal capture path for shaders that cannot ever seed a binding proof. The
+// loaded plan and an explicitly requested rebuild must both preserve ordinary live SRT reads.
+void TestActivityCaptureEligibility() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t current = 0x12345678u;
+  for (const auto stage : {Libs::Graphics::ShaderType::Compute,
+                          Libs::Graphics::ShaderType::Pixel}) {
+    auto program = SrtProgram(reinterpret_cast<uint64_t>(&current));
+    program.stage = stage;
+    auto plan = Extract(program);
+    const auto bytes = SaveResourcePlan(plan);
+    plan.capture_activity_reads = true; // Also exercise the explicit deterministic-test request.
+    CompileSrtWalker(plan);
+    Check(!plan.capture_activity_reads,
+          "unsupported plan retained activity value/index capture after walker compilation");
+    for (const uint32_t value : {0x12345678u, 0x89abcdefu}) {
+      current = value;
+      std::vector<uint32_t> flat;
+      std::vector<std::pair<uint64_t, uint64_t>> reads;
+      Check(WalkSrt(plan, {}, flat, &reads) && flat == std::vector<uint32_t>{value} &&
+                plan.activity_observations.empty() &&
+                reads == std::vector<std::pair<uint64_t, uint64_t>>{
+                    {reinterpret_cast<uint64_t>(&current), sizeof(current)}},
+            "unsupported-plan gating lost fresh scalar values or ordinary read tracking");
+    }
+    Check(SaveResourcePlan(plan) == bytes,
+          "static eligibility or capture layout changed persisted shader-cache bytes");
+    ResourcePlan loaded;
+    Check(LoadResourcePlan(bytes, loaded) && !loaded.capture_activity_reads,
+          "cached unsupported plan enabled activity capture when rebuilding its walker");
+  }
+}
+
+void TestAuxiliaryGuardedActivity() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  const auto make_plan = [](bool empty_flag = false, bool duplicate_flag = false, bool sgpr_flag = false, int compound = 0) {
+    Program p;
+    p.stage = Libs::Graphics::ShaderType::Compute;
+    p.user_data_count = 2;
+    p.srt_plan_complete = p.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(p), &body = AddValueBlock(p),
+         &optional = AddValueBlock(p), &exit = AddValueBlock(p);
+    const auto emit = [](Block &b, ValueOpcode op, std::initializer_list<Value> args = {}) {
+      return Value(&b.AppendNewInst(op, args));
+    };
+    const auto constant_source = [&](uint32_t base, uint32_t bytes) {
+      DescriptorSource s;
+      s.dword_count = 4;
+      s.dwords = {Value(base), Value(0u), Value(bytes), Value(0u)};
+      return s;
+    };
+    p.descriptor_sources.push_back(constant_source(0x3000u, 4u));
+    p.descriptor_sources.emplace_back();
+    p.descriptor_sources.push_back(constant_source(0x5000u, empty_flag ? 0u : 4u));
+    p.descriptor_sources.emplace_back();
+    p.info.buffers = {{.source = 0u, .read = true, .scalar = true},
+                      {.source = 1u, .written = true},
+                      {.source = 2u, .read = true, .scalar = true},
+                      {.source = 3u, .written = true}};
+    const auto handle = [&](Block &b, const DescriptorSource &s) {
+      return emit(b, ValueOpcode::GetBufferResource,
+                  {s.dwords[0], s.dwords[1], s.dwords[2], s.dwords[3]});
+    };
+    p.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .resource = 0u});
+    const auto count = emit(entry, ValueOpcode::ReadConstBuffer,
+                            {handle(entry, p.descriptor_sources[0]), Value(0u)});
+    count.Instruction()->SetFlags(MemoryFlags{.index = 0u});
+    const auto lane = emit(entry, ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    entry.condition = emit(entry, ValueOpcode::LogicalNot,
+        {emit(entry, ValueOpcode::ULessThanEqual32, {count, lane})});
+    entry.terminator.kind = TerminatorKind::ConditionalBranch;
+    entry.terminator.true_block = &body; entry.terminator.false_block = &exit;
+    const auto table = emit(body, ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    const auto address = emit(body, ValueOpcode::GetAddressResource, {table, Value(0u)});
+    const auto descriptor = [&](Block &b, uint32_t source, uint32_t offset) {
+      auto &s = p.descriptor_sources[source]; s.dword_count = 4;
+      for (uint32_t word = 0; word < 4; ++word) {
+        const auto index = static_cast<uint32_t>(p.memory_info.size());
+        p.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+        const auto raw = emit(b, ValueOpcode::LoadAddressU32,
+                              {address, Value(offset + word * 4u), Value(0u), Value(true)});
+        raw.Instruction()->SetFlags(MemoryFlags{.index = index});
+        const auto slot = static_cast<uint32_t>(p.srt_reads.size());
+        p.srt_reads.push_back({raw, slot});
+        s.dwords[word] = emit(b, ValueOpcode::ReadConst,
+                             {emit(b, ValueOpcode::GetSrtResource), Value(slot)});
+      }
+    };
+    descriptor(body, 1u, 0u);
+    const auto store = [&](Block &b, uint32_t resource) {
+      const auto index = static_cast<uint32_t>(p.memory_info.size());
+      p.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = resource});
+      emit(b, ValueOpcode::StoreBufferU32,
+           {handle(b, p.descriptor_sources[resource]), Value(0u), Value(0u), Value(0u), lane, Value(true)})
+          .Instruction()->SetFlags(MemoryFlags{.index = index});
+    };
+    store(body, 1u);
+    if (sgpr_flag) {
+      body.condition = emit(body, ValueOpcode::INotEqual32,
+                            {emit(body, ValueOpcode::GetUserData, {Value(ScalarReg(1))}), Value(0u)});
+    } else {
+      const auto index = static_cast<uint32_t>(p.memory_info.size());
+      p.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .resource = 2u});
+      const auto flags = MemoryFlags{.index = index};
+      const auto buffer = handle(body, p.descriptor_sources[2]);
+      const auto flag = emit(body, ValueOpcode::ReadConstBuffer, {buffer, Value(0u)});
+      flag.Instruction()->SetFlags(flags);
+      Value other(0u);
+      if (duplicate_flag) {
+        other = emit(body, ValueOpcode::ReadConstBuffer, {buffer, Value(0u)});
+        other.Instruction()->SetFlags(flags);
+      }
+      body.condition = emit(body, ValueOpcode::INotEqual32, {flag, other});
+      if (compound != 0) {
+        const auto small_count = emit(body, ValueOpcode::ULessThanEqual32, {count, Value(4u)});
+        if (compound == 1)
+          body.condition = emit(body, ValueOpcode::LogicalAnd, {body.condition, small_count});
+        else if (compound == 2)
+          body.condition = emit(body, ValueOpcode::SelectU1, {body.condition, small_count, Value(false)});
+        else
+          body.condition = emit(body, ValueOpcode::LogicalAnd,
+              {body.condition, emit(body, ValueOpcode::SelectU1, {small_count, Value(true), Value(false)})});
+      }
+    }
+    body.terminator.kind = TerminatorKind::ConditionalBranch;
+    body.terminator.true_block = &optional; body.terminator.false_block = &exit;
+    descriptor(optional, 3u, 0x20u); store(optional, 3u);
+    optional.terminator.kind = TerminatorKind::Branch; optional.terminator.true_block = &exit;
+    exit.terminator.kind = TerminatorKind::Return;
+    auto plan = Extract(p); plan.capture_activity_reads = true; CompileSrtWalker(plan);
+    Check(plan.capture_activity_reads, "guarded fixture did not retain its eligible counter");
+    return plan;
+  };
+  struct State {
+    ActivityEpoch epoch {1, 1, 1, 1, 1, 1};
+    uint32_t count = 8, flag = 0;
+    std::array<uint32_t, 4> common {0x8000u, 0u, 64u, 0u};
+    std::array<uint32_t, 4> optional {0x9000u, 0u, 64u, 0u};
+    bool optional_readable = false, flag_current = true, table_current = true, targets_mapped = true;
+    bool change_epoch = false, change_guard = false;
+    uint32_t counters = 0, flags = 0, tables = 0, optional_tables = 0;
+    uint32_t flag_probes = 0, table_probes = 0, counter_probes = 0;
+  } state;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<State *>(data);
+    if (words.size() != 1u) return false;
+    if (address == 0x3000u) { ++s.counters; words[0] = s.count; return true; }
+    if (address == 0x5000u) { ++s.flags; s.flag_current = true; words[0] = s.flag; return true; }
+    if (address >= 0x2000u && address <= 0x200cu && (address & 3u) == 0u) {
+      ++s.tables; s.table_current = true; words[0] = s.common[(address - 0x2000u) / 4u]; return true;
+    }
+    if (address >= 0x2020u && address <= 0x202cu && (address & 3u) == 0u) {
+      ++s.optional_tables;
+      if (!s.optional_readable) return false;
+      words[0] = s.optional[(address - 0x2020u) / 4u]; return true;
+    }
+    return false;
+  };
+  FakeGuestMemory fake(read, &state);
+  std::array<uint32_t, 2> userdata {0x2000u, 0u};
+  SrtRuntime runtime {.user_data = userdata, .userdata = &state};
+  runtime.read_activity_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<State *>(data);
+    if (words.size() != 1u) return false;
+    if (address == 0x3000u) { ++s.counter_probes; return false; }
+    if (address == 0x5000u) {
+      ++s.flag_probes;
+      if (s.change_guard) { s.flag = 1u; s.change_guard = false; }
+      if (s.change_epoch) { ++s.epoch.buffers; s.change_epoch = false; }
+      if (!s.flag_current) return false;
+      words[0] = s.flag; return true;
+    }
+    if (address >= 0x2000u && address <= 0x200cu && (address & 3u) == 0u) {
+      ++s.table_probes;
+      if (!s.table_current) return false;
+      words[0] = s.common[(address - 0x2000u) / 4u]; return true;
+    }
+    if (address >= 0x2020u && address <= 0x202cu && s.optional_readable && (address & 3u) == 0u) {
+      ++s.table_probes; words[0] = s.optional[(address - 0x2020u) / 4u]; return true;
+    }
+    return false;
+  };
+  runtime.read_activity_epoch = +[](void *data, ActivityEpoch &epoch) {
+    epoch = static_cast<State *>(data)->epoch; return true;
+  };
+  runtime.validate_activity_targets = +[](void *data, std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+    return static_cast<State *>(data)->targets_mapped && ranges.size() >= 3u;
+  };
+  const std::array<std::pair<uint64_t, uint64_t>, 3> narrow_targets {{{0x3000u, 4u}, {0x5000u, 4u}, {0x8000u, 64u}}};
+  const std::array<std::pair<uint64_t, uint64_t>, 4> full_targets {{{0x3000u, 4u}, {0x5000u, 4u}, {0x8000u, 64u}, {0x9000u, 64u}}};
+  auto plan = make_plan(); ResourceSnapshot snapshot; ResourceSpecialization specialization;
+  const auto clear_counts = [&] { state.counters = state.flags = state.tables = state.optional_tables = 0u;
+    state.flag_probes = state.table_probes = state.counter_probes = 0u; };
+  const auto materialize = [&] { Check(MaterializeResources(plan, runtime, snapshot, specialization), "guarded materialization failed"); };
+  const auto seed = [&] {
+    snapshot.activity_cache.reset(); state = State{}; clear_counts(); materialize();
+    Check(ConfirmPreparedActivity(snapshot, state.epoch, 21u, narrow_targets),
+          "observed auxiliary false guard did not certify its complete counter-opaque resource/SRT subset");
+    Check(state.counters == 1u && state.flags == 1u && state.tables == 4u && state.optional_tables == 0u &&
+              state.flag_probes == 1u && state.counter_probes == 0u,
+          "guarded seed did not use only its original walk plus one strict auxiliary check");
+    clear_counts();
+  };
+  state.count = 0; materialize();
+  Check(state.counters == 1u && state.flags == 0u && state.tables == 0u && state.optional_tables == 0u &&
+            !ConfirmPreparedActivity(snapshot, state.epoch, 21u, narrow_targets),
+        "cold0 speculated into an unobserved auxiliary guard or inactive poisoned descriptor");
+  state.count = 8; materialize(); clear_counts(); state.count = 0; materialize();
+  Check(state.counters == 1u && state.flags == 0u && state.tables == 0u,
+        "uncommitted guarded snapshot authorized reuse");
+  seed(); const auto saved = snapshot.buffers; const auto persisted = SaveResourcePlan(plan);
+  for (const uint32_t count : {0u, 1u, 37u, 0u, 9u}) {
+    state.count = count; materialize();
+    Check(state.counters == 0u && state.flags == 0u && state.tables == 0u && state.optional_tables == 0u &&
+              state.counter_probes == 0u && state.flag_probes == 1u && snapshot.buffers == saved,
+          "guarded hit reread the counter, accessed its inactive descriptor, or lost strict auxiliary freshness");
+    Check(ConfirmPreparedActivity(snapshot, state.epoch, 21u, narrow_targets), "guarded hit lost native commit state");
+    clear_counts();
+  }
+  Check(ActivitySnapshotReuseCount(snapshot) == 5u && SaveResourcePlan(plan) == persisted,
+        "guarded hits changed count or serialized plan bytes");
+  state.count = 8; state.flag = 1; state.optional_readable = true; materialize();
+  Check(state.counters == 1u && state.flags == 1u && state.optional_tables == 4u &&
+            snapshot.buffers[3].dwords[0] == 0x9000u &&
+            ConfirmPreparedActivity(snapshot, state.epoch, 22u, full_targets),
+        "auxiliary0-to1 change reused the zero optional descriptor instead of fresh normal binding");
+  seed(); state.count = 8; state.flag = 1; state.flag_current = false; state.optional_readable = true; materialize();
+  Check(state.counters == 1u && state.flags == 1u && state.optional_tables == 4u && snapshot.buffers[3].dwords[0] == 0x9000u,
+        "GPU-dirty auxiliary flag bypassed the strict probe or used stale optional bindings");
+  for (const int invalidation : {0, 1, 2}) {
+    seed(); state.count = 0;
+    if (invalidation == 0) state.table_current = false;
+    if (invalidation == 1) ++state.epoch.mapping;
+    if (invalidation == 2) state.targets_mapped = false;
+    materialize();
+    Check(state.counters == 1u && state.flags == 0u && state.tables == 0u && state.optional_tables == 0u,
+          "guarded dirty-source/map/target failure did not retain cold0 fallback");
+  }
+  for (const bool epoch_race : {false, true}) {
+    snapshot.activity_cache.reset(); state = State{};
+    state.change_guard = !epoch_race; state.change_epoch = epoch_race;
+    materialize();
+    Check(!ConfirmPreparedActivity(snapshot, state.epoch, 21u, narrow_targets) && state.optional_tables == 0u,
+          "changed auxiliary bytes/epoch during seed check authorized an unverified certificate");
+  }
+  for (const int unsupported : {0, 1, 2}) {
+    auto rejected = make_plan(unsupported == 0, unsupported == 1, unsupported == 2);
+    ResourceSnapshot none; ResourceSpecialization spec; state = State{};
+    Check(MaterializeResources(rejected, runtime, none, spec) &&
+              !ConfirmPreparedActivity(none, state.epoch, 21u, narrow_targets),
+          "missing/OOB-zero, duplicate auxiliary observation or SGPR-only exclusion was accepted");
+  }
+  // FALSE can dominate UNKNOWN; TRUE must retain UNKNOWN. Ordinary count8 makes count<=4
+  // false, but future count1 could enable the optional path. Modes cover LogicalAnd,
+  // an auxiliary-selected Select, and an UNKNOWN-counter Select behind an observed guard.
+  for (const int compound : {1, 2, 3}) {
+    auto combined = make_plan(false, false, false, compound);
+    ResourceSnapshot candidate; ResourceSpecialization spec; state = State{};
+    Check(MaterializeResources(combined, runtime, candidate, spec) && state.flags == 1u &&
+              state.optional_tables == 0u && state.counter_probes == 0u &&
+              ConfirmPreparedActivity(candidate, state.epoch, 23u, narrow_targets),
+          "auxiliary FALSE did not safely dominate counter UNKNOWN in LogicalAnd/Select");
+    candidate.activity_cache.reset(); state = State{}; state.flag = 1u;
+    Check(MaterializeResources(combined, runtime, candidate, spec) && state.flags == 1u &&
+              state.optional_tables == 0u && state.counter_probes == 0u &&
+              !ConfirmPreparedActivity(candidate, state.epoch, 23u, narrow_targets),
+          "auxiliary TRUE incorrectly pruned a counter-UNKNOWN branch that future counts can reach");
+  }
+}
+
+void TestPreparedActivitySnapshots(bool force_original = false) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  const auto make_plan = [](bool nested = false, bool shared_counter = false) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_count = 1;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(program);
+    auto &body = AddValueBlock(program);
+    auto &exit = AddValueBlock(program);
+    const auto emit = [](Block &block, ValueOpcode op, std::initializer_list<Value> args) {
+      return Value(&block.AppendNewInst(op, args));
+    };
+    DescriptorSource counter;
+    counter.dwords = {Value(0x3000u), Value(0u), Value(4u), Value(0u)};
+    counter.dword_count = 4;
+    program.descriptor_sources.push_back(counter);
+    program.info.buffers.push_back({.source = 0, .read = true, .scalar = true});
+    program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .resource = 0});
+    const auto counter_handle = emit(entry, ValueOpcode::GetBufferResource,
+        {counter.dwords[0], counter.dwords[1], counter.dwords[2], counter.dwords[3]});
+    const auto count = emit(entry, ValueOpcode::ReadConstBuffer, {counter_handle, Value(0u)});
+    count.Instruction()->SetFlags(MemoryFlags{.index = 0, .pc = 0x18});
+    const auto lane = emit(entry, ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    entry.condition = emit(entry, ValueOpcode::LogicalNot,
+        {emit(entry, ValueOpcode::ULessThanEqual32, {count, lane})});
+    entry.terminator.kind = TerminatorKind::ConditionalBranch;
+    entry.terminator.true_block = &body;
+    entry.terminator.false_block = &exit;
+    body.terminator.kind = exit.terminator.kind = TerminatorKind::Return;
+    const auto table = emit(body, ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    auto base = table;
+    if (nested) {
+      const auto pointer = emit(body, ValueOpcode::GetAddressResource, {table, Value(0u)});
+      const auto index = static_cast<uint32_t>(program.memory_info.size());
+      program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+      base = emit(body, ValueOpcode::LoadAddressU32,
+          {pointer, Value(0u), Value(0u), Value(true)});
+      base.Instruction()->SetFlags(MemoryFlags{.index = index});
+    }
+    const auto address = emit(body, ValueOpcode::GetAddressResource, {base, Value(0u)});
+    DescriptorSource output;
+    output.dword_count = 4;
+    for (uint32_t word = 0; word < 4; ++word) {
+      const auto index = static_cast<uint32_t>(program.memory_info.size());
+      program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+      output.dwords[word] = emit(body, ValueOpcode::LoadAddressU32,
+          {address, Value(word * 4u), Value(0u), Value(true)});
+      output.dwords[word].Instruction()->SetFlags(MemoryFlags{.index = index});
+    }
+    if (shared_counter) output.dwords[0] = count;
+    program.descriptor_sources.push_back(output);
+    program.info.buffers.push_back({.source = 1, .written = true});
+    const auto handle = emit(body, ValueOpcode::GetBufferResource,
+        {output.dwords[0], output.dwords[1], output.dwords[2], output.dwords[3]});
+    const auto index = static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 1});
+    emit(body, ValueOpcode::StoreBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(0x1234u), Value(true)})
+        .Instruction()->SetFlags(MemoryFlags{.index = index});
+    auto plan = Extract(program);
+    plan.capture_activity_reads = true;
+    CompileSrtWalker(plan);
+    Check(plan.capture_activity_reads == (!nested && !shared_counter),
+          "static capture gate changed eligible flat or rejected nested/count-derived plans");
+    return plan;
+  };
+  struct State {
+    ActivityEpoch epoch {1, 1, 1, 1, 1, 1};
+    std::array<uint32_t, 4> descriptor {0x8000u, 0u, 64u, 0u};
+    uint32_t count = 8;
+    uint32_t counter_reads = 0;
+    uint32_t descriptor_reads = 0;
+    uint32_t strict_probes = 0;
+    uint32_t counter_probes = 0;
+    bool current = true;
+    bool mapped = true;
+    bool change_epoch_in_probe = false;
+    bool change_bytes_after_probe = false;
+  } state;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<State *>(data);
+    if (words.size() != 1) return false;
+    if (address == 0x3000u) { ++s.counter_reads; words[0] = s.count; return true; }
+    if (address == 0x1800u) { ++s.descriptor_reads; words[0] = 0x2000u; return true; }
+    if (address < 0x2000u || address >= 0x13000u || (address & 0xf0u) != 0u || (address & 3u))
+      return false;
+    ++s.descriptor_reads;
+    words[0] = s.descriptor[(address & 0xfu) / 4u];
+    return true;
+  };
+  FakeGuestMemory fake(read, &state);
+  std::array<uint32_t, 1> user_data {0x2000u};
+  SrtRuntime runtime {.user_data = user_data, .userdata = &state};
+  runtime.read_activity_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<State *>(data);
+    if (address == 0x3000u) { ++s.counter_probes; return false; }
+    ++s.strict_probes;
+    if (!s.current || words.size() != 1 || address < 0x2000u || address >= 0x13000u ||
+        (address & 0xf0u) != 0u || (address & 3u)) return false;
+    words[0] = s.descriptor[(address & 0xfu) / 4u];
+    if (s.change_epoch_in_probe) { ++s.epoch.images; s.change_epoch_in_probe = false; }
+    if (s.change_bytes_after_probe && (address & 0xfu) == 12u) s.descriptor[0] = 0x9000u;
+    return true;
+  };
+  runtime.read_activity_epoch = +[](void *data, ActivityEpoch &epoch) {
+    epoch = static_cast<State *>(data)->epoch; return epoch.context != 0;
+  };
+  runtime.validate_activity_targets = +[](void *data,
+      std::span<const std::pair<uint64_t, uint64_t>> targets) {
+    return static_cast<State *>(data)->mapped && targets.size() == 2;
+  };
+  std::vector<std::pair<uint64_t, uint64_t>> wrapper_reads;
+  SrtReadCapture wrapper(runtime, wrapper_reads);
+  const auto observed_runtime = wrapper.ObservedRuntime();
+  Check(observed_runtime.read_activity_memory == nullptr &&
+            observed_runtime.read_activity_epoch == nullptr &&
+            observed_runtime.validate_activity_targets == nullptr,
+        "observed runtime retained renderer hooks with a replaced callback cookie");
+  auto plan = make_plan();
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const std::array<std::pair<uint64_t, uint64_t>, 2> targets {{{0x3000u, 4u}, {0x8000u, 64u}}};
+  const auto materialize = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization), "activity fixture materialization failed");
+  };
+  const auto reset_counts = [&] {
+    state.counter_reads = state.descriptor_reads = state.strict_probes = state.counter_probes = 0;
+  };
+  const auto seed = [&] {
+    snapshot.activity_cache.reset();
+    state.descriptor = {0x8000u, 0u, 64u, 0u};
+    state.count = 8; state.current = state.mapped = true;
+    state.change_epoch_in_probe = state.change_bytes_after_probe = false;
+    user_data[0] = 0x2000u;
+    materialize();
+    Check(ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets),
+          "joint active snapshot did not produce a pending certificate");
+    reset_counts();
+  };
+  const auto persisted_before = SaveResourcePlan(plan);
+  state.count = 0;
+  materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0 &&
+            !ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets),
+        "first empty traversal read inactive descriptors or seeded a false certificate");
+  state.count = 8;
+  materialize(); // Successful analysis alone must not authorize later extra native bindings.
+  reset_counts(); state.count = 0; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0,
+        "materialization without native prepare/commit seeded a certificate");
+  snapshot.activity_cache.reset();
+  state.count = 8; materialize();
+  ++state.epoch.mapping;
+  Check(!ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets),
+        "mapping changed between analysis and native commit but pending proof was accepted");
+  seed();
+  const auto saved_buffers = snapshot.buffers;
+  if (force_original) runtime.read_activity_memory = nullptr;
+  for (const uint32_t fresh_count : {0u, 1u, 37u, 0u, 9u}) {
+    state.count = fresh_count;
+    materialize();
+    Check(state.counter_reads == 0 && state.descriptor_reads == 0 && state.counter_probes == 0 &&
+              snapshot.buffers == saved_buffers,
+          "certified snapshot reread/probed the counter or ran a second raw descriptor walk");
+    Check(ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets), "reused snapshot lost its commit certificate");
+  }
+  Check(ActivitySnapshotReuseCount(snapshot) == 5, "activity reuse count was not exact");
+  Check(SaveResourcePlan(plan) == persisted_before, "ephemeral activity certificate changed shader-cache plan bytes");
+  CompileSrtWalker(plan);
+  state.count = 0;
+  reset_counts(); materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0 &&
+            !ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets),
+        "rebuilt walker reused a certificate from its previous derived value graph");
+  for (int field = 0; field != 6; ++field) {
+    seed(); state.count = 0;
+    uint64_t *epoch[] = {&state.epoch.context, &state.epoch.mapping, &state.epoch.protection,
+                        &state.epoch.buffers, &state.epoch.images, &state.epoch.configuration};
+    ++*epoch[field]; materialize();
+    Check(state.counter_reads == 1 && state.descriptor_reads == 0,
+          "context/map/remap/protection/cache/config change reused an invalid certificate");
+  }
+  seed(); state.count = 0; state.current = false; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0,
+        "GPU-dirty/unreadable source table did not fall back before raw descriptor reads");
+  seed(); state.count = 0; state.mapped = false; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0,
+        "unmapped target reused a prior successful binding");
+  for (uint32_t word = 0; word != 4; ++word) {
+    seed(); state.count = 0; state.descriptor[word] ^= 1u; materialize();
+    Check(state.counter_reads == 1 && state.descriptor_reads == 0,
+          "changed descriptor word reused a stale certificate");
+  }
+  seed(); state.count = 0; ++runtime.activity_push_data_cursor; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0, "different input/layout variant reused a certificate");
+  runtime.activity_push_data_cursor = 0;
+  seed(); state.count = 0; user_data[0] = 0x2100u; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0, "different user-data pointer reused a certificate");
+  seed(); state.count = 0; state.change_epoch_in_probe = true; materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0, "epoch changed during proof probe but snapshot was reused");
+  seed(); state.count = 0; state.change_bytes_after_probe = true; materialize();
+  Check(state.counter_reads == 0 && state.descriptor_reads == 0 && snapshot.buffers == saved_buffers &&
+            state.descriptor[0] == 0x9000u,
+        "proof used a second read instead of the exact verified candidate snapshot");
+  state.change_bytes_after_probe = false;
+  // The bounded cache must evict an old pointer slot without rejecting the latest one.
+  snapshot.activity_cache.reset();
+  state = State{};
+  for (uint32_t slot = 0; slot != 129u; ++slot) {
+    user_data[0] = 0x4000u + slot * 0x100u;
+    materialize();
+    Check(ConfirmPreparedActivity(snapshot, state.epoch, 11u, targets), "finite slot did not certify");
+  }
+  state.count = 0;
+  user_data[0] = 0x4000u;
+  reset_counts(); materialize();
+  Check(state.counter_reads == 1 && state.descriptor_reads == 0, "bounded cache retained its evicted oldest slot");
+  user_data[0] = 0x4000u + 128u * 0x100u;
+  reset_counts(); materialize();
+  Check(state.counter_reads == 0 && state.descriptor_reads == 0, "bounded cache discarded its newest validated slot");
+  for (const bool nested : {false, true}) {
+    auto rejected = make_plan(nested, !nested);
+    ResourceSnapshot rejected_snapshot;
+    ResourceSpecialization rejected_specialization;
+    state = State{};
+    user_data[0] = nested ? 0x1800u : 0x2000u;
+    Check(MaterializeResources(rejected, runtime, rejected_snapshot, rejected_specialization) &&
+              !ConfirmPreparedActivity(rejected_snapshot, state.epoch, 11u, targets),
+          "nested pointer or count-derived descriptor was accepted by the finite flat proof");
+  }
+}
+
 void TestCyclicControlPredicatesRemainUnknown() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
@@ -1468,6 +1976,8 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+#include "LegacyValueOpcodePlanTests.inc"
+
 } // namespace
 
 namespace Common {
@@ -1478,7 +1988,30 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--legacy-opcodes-only") {
+    TestLegacyValueOpcodePlan(); return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "--activity-guarded-profile-only") {
+    TestAuxiliaryGuardedActivity();
+    std::puts("ResourceMaterializationTests: auxiliary guarded activity passed");
+    return 0;
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--offline-cache-plan")
+    return OfflineCachePlan::Run(argv[2], argv[3]);
+  if (argc > 1 && std::string_view(argv[1]) == "--activity-eligibility-only") {
+    TestActivityCaptureEligibility();
+    std::puts("ResourceMaterializationTests: activity capture eligibility passed");
+    return 0;
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "--activity-proof-only") {
+    TestPreparedActivitySnapshots(argc > 2 && std::string_view(argv[2]) == "--force-original");
+    std::puts("ResourceMaterializationTests: activity proof passed");
+    return 0;
+  }
+  TestActivityCaptureEligibility();
+  TestAuxiliaryGuardedActivity();
+  TestPreparedActivitySnapshots();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 
 #include <cstdlib>
 #include "graphics/host_gpu/frameStats.h"
@@ -16,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -28,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -282,18 +286,188 @@ std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
 	    : std::span<const uint32_t>{};
 }
 
-bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                               bool& failed) {
 	const auto revision = call_source->revision;
-	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+	failed = ShaderRecompiler::TryRefreshShaderSource(*call_source, runtime, call_failure) == nullptr;
+	if (failed) return false;
 	resource_plan.source_reads = call_source->reads;
 	return revision != call_source->revision;
 }
 
+// A table call that cannot be enumerated, read or validated fails only this dispatch: nothing
+// is cached as skipped, so a later valid table links normally. Logged at powers of two.
+void PipelineCache::NoteCallFailure(uint64_t hash, const std::string& reason) {
+	const auto count = ++m_call_failures[hash];
+	if (std::has_single_bit(count)) {
+		PipelineCacheLog("SHADER CALL TABLE FAILURE (dispatch skipped, not cached) shader=0x{:016x} "
+		                 "count={} {}",
+		                 hash, count, reason);
+	}
+}
+
+bool PipelineCache::HasAddressWrites(const ShaderRecompiler::IR::Program& program) {
+	using namespace ShaderRecompiler::IR;
+	// This runs AFTER resource tracking. A certified FlatLocal store can only select
+	// private scratch/LDS in StoreLocalFlat; it cannot address snapshotted guest code.
+	// Unknown indices and every other address kind retain the conservative rejection.
+	static const bool diagnose = [] {
+		const char* text = std::getenv("KYTY_CALL_TABLE_DIAG");
+		return text != nullptr && text[0] == '1' && text[1] == '\0';
+	}();
+	static thread_local uint32_t diagnostic_programs = 0;
+	const bool report = diagnose &&
+	                    (program.shader_hash == 0x1a04c58a9fbc2052ull ||
+	                     program.shader_hash == 0x5675719385b6afc7ull) && diagnostic_programs < 8u;
+	if (report) ++diagnostic_programs;
+	uint32_t writes = 0, local_writes = 0;
+	bool unbounded = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::Write) continue;
+			const auto flags = inst.Flags<MemoryFlags>();
+			const bool valid = flags.index < program.memory_info.size();
+			const auto* memory = valid ? &program.memory_info[flags.index] : nullptr;
+			const bool local = inst.GetOpcode() == ValueOpcode::StoreAddressU32 && memory != nullptr &&
+			                   memory->kind == ResourceKind::FlatLocal && memory->data_bits == 32u &&
+			                   memory->data_dwords == 1u && program.scratch_dwords != 0u;
+			unbounded |= !local;
+			local_writes += local ? 1u : 0u;
+			if (report && writes < 32u) {
+				PipelineCacheLog("CALL_LOCAL_WRITE_DIAG shader=0x{:016x} translation={} pc=0x{:x} "
+				                 "op={} memory_index={} kind={} bits={} words={} scratch={} uses_lds={} local_exempt={}",
+				                 program.shader_hash, diagnostic_programs, flags.pc,
+				                 static_cast<uint32_t>(inst.GetOpcode()), flags.index,
+				                 memory != nullptr ? static_cast<uint32_t>(memory->kind) : UINT32_MAX,
+				                 memory != nullptr ? memory->data_bits : 0u,
+				                 memory != nullptr ? memory->data_dwords : 0u,
+				                 program.scratch_dwords, program.info.uses_lds, local);
+				const char* reject = local ? "none" :
+				    inst.GetOpcode() != ValueOpcode::StoreAddressU32 ? "opcode" :
+				    memory == nullptr ? "memory_index" :
+				    memory->kind != ResourceKind::FlatLocal ? "kind" :
+				    memory->data_bits != 32u ? "bits" :
+				    memory->data_dwords != 1u ? "words" : "scratch_zero";
+				PipelineCacheLog("CALL_LOCAL_PROOF_DIAG pc=0x{:x} reject={} tracking_complete={} "
+				                 "srt_complete={} address_full={} nargs={}", flags.pc, reject,
+				                 program.resource_tracking_complete, program.srt_plan_complete,
+				                 memory != nullptr && memory->address_is_full, inst.NumArgs());
+				// Inspect only retained static IR for the first rejected store, never runtime values.
+				if (!local && writes == local_writes && inst.NumArgs() > 2u) {
+					auto high = inst.Arg(2).Resolve();
+					const auto active = inst.Arg(inst.NumArgs() - 1u).Resolve();
+					for (uint32_t depth = 0; depth < 4u; ++depth) {
+						const auto* producer = high.TryInstruction();
+						const bool immediate = high.IsImmediate() && high.GetType() == Type::U32;
+						const bool select = producer != nullptr && producer->GetOpcode() == ValueOpcode::SelectU32;
+						PipelineCacheLog("CALL_LOCAL_HIGH_DIAG pc=0x{:x} depth={} immediate={} value=0x{:08x} "
+						                 "op={} args={} select_same_active={}", flags.pc, depth, immediate,
+						                 immediate ? high.U32() : 0u,
+						                 producer != nullptr ? static_cast<uint32_t>(producer->GetOpcode()) : UINT32_MAX,
+						                 producer != nullptr ? producer->NumArgs() : 0u,
+						                 select && producer->Arg(0).Resolve() == active);
+						if (select) { high = producer->Arg(1).Resolve(); continue; }
+						if (producer != nullptr && producer->GetOpcode() == ValueOpcode::UMedTri32) {
+							for (uint32_t arg = 0; arg < producer->NumArgs(); ++arg) {
+								const auto value = producer->Arg(arg).Resolve();
+								const auto* input = value.TryInstruction();
+								const bool constant = value.IsImmediate() && value.GetType() == Type::U32;
+								PipelineCacheLog("CALL_LOCAL_MEDIAN_DIAG pc=0x{:x} arg={} immediate={} value=0x{:08x} op={}",
+								                 flags.pc, arg, constant, constant ? value.U32() : 0u,
+								                 input != nullptr ? static_cast<uint32_t>(input->GetOpcode()) : UINT32_MAX);
+							}
+						}
+						break;
+					}
+				}
+			}
+			++writes;
+		}
+	}
+	if (report) {
+		PipelineCacheLog("CALL_LOCAL_WRITE_SUMMARY shader=0x{:016x} translation={} writes={} local={} "
+		                 "unbounded={} truncated={}", program.shader_hash, diagnostic_programs,
+		                 writes, local_writes, unbounded, writes > 32u);
+	}
+	return unbounded;
+}
+
+std::string PipelineCache::CallCodeConflict(const Program& program, const ShaderModule& module) {
+	const auto& source    = *program.call_source;
+	const auto& resources = program.resources;
+	const auto& buffers   = module.info.info.buffers;
+	// Snapshotted callee code must provably not be written by this dispatch. Stores through
+	// computed addresses cannot be bounded: fail closed.
+	if (program.call_address_writes && !source.call_code_ranges.empty()) {
+		return "dispatch stores through flat/global addresses that may write snapshotted callee code";
+	}
+	// The loaded table pointer is compared at run time, so table writes in this dispatch are
+	// honored (or reported as misses) only if no other VA aliases the table's physical pages.
+	for (const auto [address, size]: source.call_table_ranges) {
+		if (!Libs::LibKernel::Memory::IsBackingUniquelyMapped(address, size)) {
+			return fmt::format("call table 0x{:x}+{} has another physical mapping", address, size);
+		}
+	}
+	for (const auto [address, size]: source.call_code_ranges) {
+		if (!Libs::LibKernel::Memory::IsBackingUniquelyMapped(address, size)) {
+			return fmt::format("callee code 0x{:x}+{} has another physical mapping", address, size);
+		}
+		for (size_t index = 0; index < buffers.size() && index < resources.buffers.size(); ++index) {
+			if (!buffers[index].written) continue;
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[index]);
+			const auto base       = descriptor.Base48();
+			const auto bytes      = descriptor.NumRecords() == UINT32_MAX ? UINT64_MAX - base
+			                                                              : descriptor.GetSize();
+			if (bytes != 0 && base < address + size && address < base + bytes) {
+				return fmt::format("callee code 0x{:x}+{} is writable through buffer {} of this dispatch",
+				                   address, size, index);
+			}
+		}
+		// Written storage images are checked after native preparation against their exact
+		// resolved owner ranges (RenderExecutor::ValidatePreparedCallClosure).
+	}
+	return {};
+}
+
+// KYTY_CALL_TABLE_DIAG=1 (default off): log each new table link's bounded summary.
+void PipelineCache::NoteCallDiagnostic(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CALL_TABLE_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (enabled && !source.call_diagnostic.empty()) {
+		PipelineCacheLog("CALL_TABLE_DIAG shader=0x{:016x} revision={} {}", hash, source.revision,
+		                 source.call_diagnostic);
+	}
+}
+
+namespace {
+
+bool HasTableCalls(const ShaderRecompiler::ShaderSource* source) {
+	return source != nullptr && std::ranges::any_of(source->calls, [](const auto& call) {
+		return call.kind == ShaderRecompiler::ShaderSource::Call::Kind::Table;
+	});
+}
+
+} // namespace
+
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+                                                 uint32_t push_data_cursor,
+                                                 bool& materialization_failed) {
+	materialization_failed = false;
+	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                               specialization)) {
+		// TABLE callees are refreshed from guest data. A resource failure rejects
+		// this dispatch; it is not an ordinary variant miss that may compile.
+		if constexpr (HasCalls) {
+			if (HasTableCalls(call_source.get())) {
+				materialization_failed = true;
+				return nullptr;
+			}
+		}
+		EXIT_IF(true); // Preserve the existing call-free / uniform-call contract.
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -581,6 +755,7 @@ void PipelineCache::DrainAsyncModules() {
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
+	ReadbackAttribution::Scope attribution_scope(params.hash, ReadbackAttribution::Phase::Program);
 	if (ShaderSkipped(params.hash)) {
 		input_info.stage = {};
 		return nullptr;
@@ -592,6 +767,21 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};
+	if (ShaderRecompiler::IR::HostActivityProofEnabled() && m_activity_context != nullptr) {
+		runtime.userdata = m_activity_context;
+		runtime.read_activity_memory = [](void* context, uint64_t address, std::span<uint32_t> words) {
+			return static_cast<RenderContext*>(context)->TryReadActivityCurrent(
+			    address, words.data(), words.size_bytes());
+		};
+		runtime.read_activity_epoch = [](void* context, ShaderRecompiler::IR::ActivityEpoch& epoch) {
+			return static_cast<RenderContext*>(context)->ReadActivityEpoch(epoch);
+		};
+		runtime.validate_activity_targets = [](void* context,
+		    std::span<const std::pair<uint64_t, uint64_t>> targets) {
+			return static_cast<RenderContext*>(context)->ValidateActivityTargets(targets);
+		};
+		runtime.activity_push_data_cursor = push_data_cursor;
+	}
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 		options.stage            = input_info.logical_stage;
@@ -619,21 +809,78 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
+	const auto bind = [&](const ShaderModule& module) -> const ShaderModule* {
+		if (const auto* source = entry->second.call_source.get();
+		    source != nullptr && (!source->call_code_ranges.empty() || !source->call_table_ranges.empty())) {
+			// Table callee code is a dispatch-time snapshot: it must be uniquely backed and not
+			// writable through this dispatch's buffer bindings. (Flat/global/image stores cannot
+			// be bounded here; see the report.) Otherwise this dispatch fails explicitly.
+			if (auto conflict = CallCodeConflict(entry->second, module); !conflict.empty()) {
+				NoteCallFailure(params.hash, conflict);
+				input_info.stage = {};
+				return nullptr;
+			}
+			if (m_activity_context != nullptr) m_activity_context->RequestFaultProcess();
+			// Owned closure inputs for the post-preparation check of this dispatch.
+			auto closure = std::make_shared<CallClosure>();
+			closure->shader_hash           = params.hash;
+			closure->source_revision       = source->revision;
+			closure->mapping_generation    = Libs::LibKernel::Memory::MappingGeneration();
+			closure->protection_generation = Libs::LibKernel::Memory::ProtectionGeneration();
+			closure->table_ranges          = source->call_table_ranges;
+			const auto& linked = *source->linked;
+			for (const auto& function: linked.functions) {
+				if (source->calls[function.site].kind != ShaderRecompiler::ShaderSource::Call::Kind::Table) continue;
+				const auto address = linked.site_targets[function.site][function.slot];
+				if (std::ranges::any_of(closure->code, [&](const auto& code) { return code.address == address; }))
+					continue;
+				const auto words = std::span(linked.code).subspan(function.offset, function.size);
+				closure->code.push_back({address, {words.begin(), words.end()}});
+			}
+			input_info.stage = {.module = &module, .resources = &entry->second.resources,
+			                    .call_closure = std::move(closure)};
+			module.info.bindings.AdvancePushData(push_data_cursor);
+			return &module;
+		}
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};
 	bool source_changed = false;
+	bool materialization_failed = false;
+	const auto resource_failure = [&] {
+		NoteCallFailure(params.hash, "table-linked resource materialization failed");
+		input_info.stage = {};
+	};
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
-			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			bool call_failed = false;
+			source_changed = cached.RefreshCallSource(runtime, call_failed);
+			if (call_failed) {
+				NoteCallFailure(params.hash, cached.call_failure);
+				input_info.stage = {};
+				return nullptr;
+			}
+			if (source_changed) NoteCallDiagnostic(params.hash, *cached.call_source);
+			// An unchanged previously rejected linked source must not materialize the
+			// preceding valid variant's resource plan before the late native guard.
+			if (!source_changed && cached.call_address_writes &&
+			    !cached.call_source->call_code_ranges.empty()) {
+				NoteCallFailure(params.hash,
+				                "dispatch stores through flat/global addresses that may write snapshotted callee code");
+				input_info.stage = {};
+				return nullptr;
+			}
+			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, materialization_failed);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.FindModule<false>(runtime, push_data_cursor, materialization_failed);
+		}
+		if (materialization_failed) {
+			resource_failure();
+			return nullptr;
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -667,29 +914,65 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
-		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
-		                                    ShaderRecompiler::StageName(options.stage), params.hash));
-		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (auto stashed = m_unlinked_call_sources.find(m_lookup_key);
+		    stashed != m_unlinked_call_sources.end()) {
+			source = std::move(*stashed->second);
+			m_unlinked_call_sources.erase(stashed);
+		} else {
+			DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
+			                                    ShaderRecompiler::StageName(options.stage), params.hash));
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		}
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
-			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
-			                 params.hash, source.unsupported_call_pc);
+			                 "reason=unsupported GPU-selected callable target ({}); rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc,
+			                 source.unsupported_call_reason != nullptr ? source.unsupported_call_reason : "unknown");
 			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
 			return nullptr;
 		}
 	}
 	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
+	bool call_address_writes = false;
 	ShaderRecompiler::TranslateResult translated;
 	if (current != nullptr) {
 		if (!current->calls.empty()) {
-			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+			if (entry == m_program_cache.end()) {
+				std::string failure;
+				if (ShaderRecompiler::TryRefreshShaderSource(*current, runtime, failure) == nullptr) {
+					NoteCallFailure(params.hash, failure);
+					m_unlinked_call_sources[m_lookup_key] =
+					    std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
+					input_info.stage = {};
+					return nullptr;
+				}
+				NoteCallDiagnostic(params.hash, *current);
+			}
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 			translated.program.source_reads = current->reads;
+			call_address_writes = HasAddressWrites(translated.program);
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
 		}
 	} else {
 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
+	}
+	// Classify AFTER tracking, but fail BEFORE any materialization, module-cache
+	// creation, QueueModule or SPIR-V compilation. Unknown/global stores may not
+	// even have a valid host resource plan or a supported physical-store emitter.
+	if (call_address_writes && current != nullptr && !current->call_code_ranges.empty()) {
+		NoteCallFailure(params.hash,
+		                "dispatch stores through flat/global addresses that may write snapshotted callee code");
+		input_info.stage = {};
+		if (entry == m_program_cache.end()) {
+			// Keep only refreshable source, never a skipped Program/module. A later
+			// target/code change is retried normally on the next dispatch.
+			m_unlinked_call_sources[m_lookup_key] =
+			    std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source));
+		} else {
+			entry->second.call_address_writes = true;
+		}
+		return nullptr;
 	}
 	if (entry == m_program_cache.end()) {
 		auto retained = !source.calls.empty()
@@ -700,12 +983,24 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		program.call_address_writes = call_address_writes;
+		if (!ShaderRecompiler::IR::MaterializeResources(
+		        program.resource_plan, runtime, program.resources, program.specialization)) {
+			if (HasTableCalls(program.call_source.get())) {
+				resource_failure();
+				return nullptr;
+			}
+			EXIT_IF(true); // Pure uniform calls retain their existing behavior.
+		}
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		entry->second.call_address_writes = call_address_writes;
+		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor, materialization_failed)) {
 			return bind(*module);
+		}
+		if (materialization_failed) {
+			resource_failure();
+			return nullptr;
 		}
 	}
 	if (async_module && !entry->second.call_source && !source_changed) {
@@ -722,8 +1017,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
-                             const std::filesystem::path&           shader_store)
-    : m_graphics(graphics), m_image_heap(image_heap),
+                             const std::filesystem::path&           shader_store,
+                             RenderContext*                        context)
+    : m_graphics(graphics), m_activity_context(context), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_async_shaders = Config::AsyncShadersEnabled();

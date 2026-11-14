@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -48,7 +49,8 @@ public:
 	// Draws and dispatches recorded into the command buffer that has not been submitted yet.
 	[[nodiscard]] uint32_t         CurrentSubmitWorkCount() const noexcept { return m_submit_work_count; }
 	void                           NoteRecordedWork() noexcept { m_submit_work_count++; }
-	// TEMP DIAG (KYTY_GPU_TIME): attribute GPU time since the previous item to `key`.
+	// Compatibility no-op: the legacy item key loses hash bit63. V2 reports only
+	// scheduler-owned command-buffer spans, enabled by exact KYTY_GPU_TIME_V2=1.
 	void                           NoteWorkTiming(uint64_t key);
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
@@ -86,6 +88,12 @@ private:
 	};
 
 	void BeginNext();
+	void BeginGpuTimingV2();
+	void EndGpuTimingV2();
+	void SubmittedGpuTimingV2(uint64_t tick);
+	void HarvestGpuTimingV2(bool final = false);
+	void DestroyGpuTimingV2AfterDrain();
+	struct GpuTimingV2;
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -98,6 +106,8 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
+	bool                         m_gpu_time_v2_checked = false;
+	std::unique_ptr<GpuTimingV2>  m_gpu_time_v2;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

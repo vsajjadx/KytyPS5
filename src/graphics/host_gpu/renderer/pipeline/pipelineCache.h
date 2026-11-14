@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -184,11 +185,14 @@ private:
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
+class RenderContext;
+
 class PipelineCache {
 public:
 	// Without a shader store path nothing is kept across runs.
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	              const std::filesystem::path& shader_store = {},
+	              RenderContext* context = nullptr);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
@@ -215,6 +219,8 @@ public:
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);
 	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// Fails ONE dispatch of a table-call program (logged at powers of two; never cached).
+	void NoteCallFailure(uint64_t hash, const std::string& reason);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -234,10 +240,15 @@ private:
 		std::vector<PendingModule> pending;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
-		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// False in `failed` links this dispatch; true fails only this dispatch (reason in call_failure).
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime, bool& failed);
+		std::string call_failure;
+		// Linked program stores through computed addresses (flat/global): unbounded writes.
+		bool call_address_writes = false;
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t                                push_data_cursor,
+		                         bool&                                   materialization_failed);
 	};
 
 	struct ProgramKey {
@@ -261,8 +272,17 @@ private:
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
 	GraphicContext&                        m_graphics;
+	RenderContext*                         m_activity_context = nullptr;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	// Decoded call sources whose first link failed; reused instead of re-decoding next dispatch.
+	std::unordered_map<ProgramKey, std::unique_ptr<ShaderRecompiler::ShaderSource>, ProgramKeyHash>
+	    m_unlinked_call_sources;
+	std::unordered_map<uint64_t, uint64_t> m_call_failures;
+
+	void NoteCallDiagnostic(uint64_t hash, const ShaderRecompiler::ShaderSource& source);
+	static std::string CallCodeConflict(const Program& program, const ShaderModule& module);
+	static bool        HasAddressWrites(const ShaderRecompiler::IR::Program& program);
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;

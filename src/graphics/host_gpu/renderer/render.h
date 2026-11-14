@@ -151,6 +151,9 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// Diagnostic only (KYTY_READBACK_ATTRIBUTION): called right after a native draw/dispatch was
+	// recorded; reports each bound stage's possible buffer writers at the current command tick.
+	void NoteRecordedWriters(std::span<PreparedBindings* const> stages);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -190,6 +193,18 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
+	// Table-call closure after native preparation: exact written-image owner ranges vs callee
+	// code, unchanged mapping/protection/code. False (reported) means: do not dispatch.
+	// Identity proven by the pre-Commit pass and required unchanged by the post-Commit pass.
+	struct CallClosureCheck {
+		const CallClosure*         closure = nullptr; // the stage's owned closure object
+		std::vector<uint64_t>      owner_serials;     // per written image (0: null descriptor)
+		std::vector<vk::ImageView> views;             // per written image, the committed view
+	};
+	[[nodiscard]] bool        ValidatePreparedCallClosure(const ShaderStageRuntime& stage,
+	                                                      const PreparedBindings&   bindings,
+	                                                      CallClosureCheck&         check,
+	                                                      bool                      after_commit);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,

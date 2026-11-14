@@ -64,6 +64,16 @@ bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePl
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Re-derives immutable eligibility before compiling a walker. The cached counter and capture
+// layout are ephemeral; runtime freshness and successful native-prepare checks remain separate.
+void DeriveActivityPlan(ResourcePlan& plan);
+
+// Called only after all native descriptors for this joint snapshot prepared/committed.
+bool ConfirmPreparedActivity(const ResourceSnapshot& snapshot, const ActivityEpoch& epoch,
+                             uint64_t module,
+                             std::span<const std::pair<uint64_t, uint64_t>> targets);
+uint64_t ActivitySnapshotReuseCount(const ResourceSnapshot& snapshot);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

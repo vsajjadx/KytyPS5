@@ -3,6 +3,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include "graphics/shader/recompiler/ir/ActivityProof.h"
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	// Ephemeral, GPU-thread-only certificates; absent from shader-store records.
+	mutable std::shared_ptr<ActivityCache> activity_cache;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

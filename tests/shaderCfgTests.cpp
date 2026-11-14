@@ -13509,6 +13509,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+#include "ShaderTableCallCfgTests.inc"
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -13652,6 +13653,7 @@ int main() {
   TestNewShaderRecompilerSetpcLongBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestTableSelectedLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

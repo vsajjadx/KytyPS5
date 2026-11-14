@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/ir/ActivityProof.h"
+#include "graphics/shader/recompiler/ir/ActivityDiagnostics.h"
 #include "graphics/host_gpu/frameStats.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -22,6 +25,11 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <numeric>
+#include <map>
+#include <mutex>
+#include <cstdio>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -36,8 +44,10 @@ uint64_t DownloadWindowSize() {
 	static const uint64_t size = [] {
 		const char* request = std::getenv("KYTY_DOWNLOAD_WINDOW_KIB");
 		const bool wide = request != nullptr && std::strcmp(request, "2048") == 0;
-		const bool valid = wide || (request != nullptr && std::strcmp(request, "512") == 0);
-		const uint64_t effective = wide ? 2 * MiB : 512 * 1024;
+		// Opt-in experiment only: exactly "128" (no numeric/prefix parsing); default stays 512.
+		const bool narrow = request != nullptr && std::strcmp(request, "128") == 0;
+		const bool valid = wide || narrow || (request != nullptr && std::strcmp(request, "512") == 0);
+		const uint64_t effective = wide ? 2 * MiB : narrow ? 128 * 1024 : 512 * 1024;
 		if (request != nullptr) {
 			std::printf("KYTY_DOWNLOAD_WINDOW_KIB: effective=%llu KiB%s\n",
 			            static_cast<unsigned long long>(effective / 1024),
@@ -48,6 +58,158 @@ uint64_t DownloadWindowSize() {
 	}();
 	return size;
 }
+
+
+// Default-off readback attribution. Tracks only ranges which have actually caused
+// a synchronous download. A generation means a conservative GPU-dirty mark, not
+// proof that a shader changed the bytes. No diagnostic lock is held across a wait.
+struct ReadbackMark {
+    uint64_t generation = 0, shader = 0, tick = 0, begin = 0, end = 0;
+    uint32_t resource = UINT32_MAX;
+    ReadbackAttribution::Phase phase = ReadbackAttribution::Phase::Unknown;
+};
+struct ReadbackWatch {
+    ReadbackMark mark;
+    uint64_t previous_generation = 0, previous_tick = 0, marks = 0;
+    ReadbackAttribution::PostRecord post; // record that claimed a pre-mark generation (diagnostic)
+};
+struct ReadbackCapture {
+    uint64_t generation = 0, max_size = 0;
+    uint64_t record_sequence = 0; // independent of mark generations
+    std::map<std::pair<uint64_t, uint64_t>, ReadbackWatch> watches;
+};
+struct ReadbackCaptures {
+    std::mutex mutex;
+    std::unordered_map<const BufferCache*, ReadbackCapture> caches;
+};
+ReadbackCaptures& ReadbackCaptureState() {
+    static ReadbackCaptures state;
+    return state;
+}
+void ResetReadbackCapture(const BufferCache* cache) {
+    if (!ReadbackAttribution::Enabled()) return;
+    auto& state = ReadbackCaptureState();
+    std::lock_guard lock(state.mutex);
+    state.caches.erase(cache);
+}
+void CaptureGpuWrite(const BufferCache* cache, uint64_t address, uint64_t size, uint64_t tick) {
+    if (!ReadbackAttribution::Enabled()) return;
+    auto& state = ReadbackCaptureState();
+    std::lock_guard lock(state.mutex);
+    auto& capture = state.caches[cache];
+    const auto generation = ++capture.generation;
+    if (capture.watches.empty()) return;
+    const auto first = address > capture.max_size ? address - capture.max_size : 0;
+    const auto end = address + size; // ObtainBuffer already validated this guest range.
+    for (auto it = capture.watches.lower_bound({first, 0});
+         it != capture.watches.end() && it->first.first < end; ++it) {
+        const auto [begin, bytes] = it->first;
+        if (begin + bytes <= address) continue;
+        auto& watch = it->second;
+        const auto& context = ReadbackAttribution::current;
+        watch.mark = {generation, context.shader, tick, address, end, context.resource, context.phase};
+        ++watch.marks;
+    }
+}
+struct ReadbackObservation {
+    ReadbackAttribution::Context reader;
+    ReadbackMark writer;
+    uint64_t previous_generation = 0, previous_tick = 0, marks = 0;
+    uint64_t watch_address = 0, watch_size = 0;
+    bool tracked = false;
+    ReadbackAttribution::PostRecord post;
+    ReadbackAttribution::PostStatus post_status = ReadbackAttribution::PostStatus::Untracked;
+};
+[[maybe_unused]] ReadbackObservation ObserveReadback(const BufferCache* cache, uint64_t tick) {
+    ReadbackObservation result;
+    if (!ReadbackAttribution::Enabled()) return result;
+    result.reader = ReadbackAttribution::current;
+    const bool logical_fault = result.reader.fault_size != 0 && !result.reader.request_write;
+    const auto address = logical_fault ? result.reader.fault_address : result.reader.request_address;
+    const uint64_t size = logical_fault ? result.reader.fault_size : result.reader.request_size;
+    result.watch_address = address;
+    result.watch_size = size;
+    // Keep profiling memory bounded. Large/capped/first-seen ranges remain
+    // explicitly unknown; they are still timed and never change runtime behavior.
+    if (size == 0 || size > 1024 * 1024 || size > UINT64_MAX - address) return result;
+    auto& state = ReadbackCaptureState();
+    std::lock_guard lock(state.mutex);
+    auto& capture = state.caches[cache];
+    auto found = capture.watches.find({address, size});
+    if (found == capture.watches.end()) {
+        if (capture.watches.size() >= 4096) return result;
+        found = capture.watches.emplace(std::pair {address, size}, ReadbackWatch {}).first;
+        capture.max_size = std::max(capture.max_size, size);
+    }
+    auto& watch = found->second;
+    result.tracked = true;
+    result.writer = watch.mark;
+    result.previous_generation = watch.previous_generation;
+    result.previous_tick = watch.previous_tick;
+    result.marks = watch.marks;
+    result.post = watch.post;
+    result.post_status = ReadbackAttribution::ClassifyPostRecord(true, watch.mark.generation, watch.post);
+    watch.previous_generation = watch.mark.generation;
+    watch.previous_tick = tick;
+    watch.marks = 0;
+    return result;
+}
+void NoteRecordedWriterCapture(const BufferCache* cache, const ReadbackAttribution::RecordedWriter& writer,
+                               uint64_t sequence, uint64_t tick) {
+    if (!ReadbackAttribution::Enabled()) return;
+    auto& state = ReadbackCaptureState();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.caches.find(cache);
+    if (found == state.caches.end()) return; // no watches yet: nothing to correlate, nothing created
+    auto& capture = found->second;
+    ReadbackAttribution::NoteRecordedWriterInWatches(capture.watches, capture.max_size, writer, sequence, tick);
+}
+uint64_t NextRecordedSequence(const BufferCache* cache) {
+    if (!ReadbackAttribution::Enabled()) return 0;
+    auto& state = ReadbackCaptureState();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.caches.find(cache);
+    return found == state.caches.end() ? 0 : ++found->second.record_sequence;
+}
+#if defined(TRACY_ENABLE)
+[[gnu::noinline]] void TraceReadback(tracy::ScopedZone& zone, const ReadbackObservation& event,
+                                   uint64_t window_address, uint64_t window_size,
+                                   uint64_t copied_bytes, uint64_t packed_bytes,
+                                   uint64_t copy_count, uint64_t tick) {
+    if (!zone.IsActive()) return;
+    char text[2048];
+    const auto& r = event.reader;
+    const auto& w = event.writer;
+    const int size = std::snprintf(text, sizeof(text),
+        "v=1 phase=%s shader=%016llx req=%016llx size=%llu gpu=%u write=%u "
+        "faultpc=%016llx faultaddr=%016llx watch=%016llx watch_size=%llu window=%016llx window_size=%llu "
+        "copy_bytes=%llu packed_bytes=%llu copies=%llu consumer_tick=%llu tracked=%u "
+        "writer_gen=%llu previous_gen=%llu marks=%llu writer=%016llx writer_phase=%s "
+        "writer_resource=%u mark_tick=%llu mark_begin=%016llx mark_end=%016llx previous_read_tick=%llu",
+        ReadbackAttribution::PhaseName(r.phase), static_cast<unsigned long long>(r.shader),
+        static_cast<unsigned long long>(r.request_address), static_cast<unsigned long long>(r.request_size),
+        r.origin_gpu ? 1u : 0u, r.request_write ? 1u : 0u,
+        static_cast<unsigned long long>(r.fault_pc), static_cast<unsigned long long>(r.fault_address),
+        static_cast<unsigned long long>(event.watch_address), static_cast<unsigned long long>(event.watch_size),
+        static_cast<unsigned long long>(window_address), static_cast<unsigned long long>(window_size),
+        static_cast<unsigned long long>(copied_bytes), static_cast<unsigned long long>(packed_bytes),
+        static_cast<unsigned long long>(copy_count),
+        static_cast<unsigned long long>(tick), event.tracked ? 1u : 0u,
+        static_cast<unsigned long long>(w.generation), static_cast<unsigned long long>(event.previous_generation),
+        static_cast<unsigned long long>(event.marks), static_cast<unsigned long long>(w.shader),
+        ReadbackAttribution::PhaseName(w.phase), w.resource, static_cast<unsigned long long>(w.tick),
+        static_cast<unsigned long long>(w.begin), static_cast<unsigned long long>(w.end),
+        static_cast<unsigned long long>(event.previous_tick));
+    int total = size;
+    if (size > 0 && static_cast<size_t>(size) < sizeof(text)) {
+        const int post = ReadbackAttribution::FormatPostRecord(text + size, sizeof(text) - static_cast<size_t>(size),
+                                                               event.post_status, event.post);
+        total = post > 0 ? size + post : -1;
+    }
+    if (total > 0 && static_cast<size_t>(total) < sizeof(text)) zone.Text(text, static_cast<size_t>(total));
+    else zone.Text("v=1 error=metadata_truncated", 28);
+}
+#endif
 
 // TEMP DIAG: who marked a range GPU-written that the SRT walker later reads.
 struct WriterDiag {
@@ -201,6 +363,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	if (ShaderRecompiler::IR::HostActivityProofEnabled()) ++m_activity_epoch;
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
@@ -282,6 +445,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+#if defined(TRACY_ENABLE)
+	ZoneNamedN(attribution_zone, "ReadbackAttribution::SyncReadback",
+	           !async && ReadbackAttribution::Enabled() && tracy::ProfilerAvailable());
+#endif
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto download = m_download_buffer.MapDownload(total_size, 64);
@@ -316,6 +483,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+#if defined(TRACY_ENABLE)
+	[[maybe_unused]] const auto copy_count = copies.size();
+	[[maybe_unused]] uint64_t attribution_copy_bytes = 0;
+	if (ReadbackAttribution::Enabled()) {
+		for (const auto& copy: copies) attribution_copy_bytes += copy.size;
+	}
+#endif
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
 	                download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
@@ -351,6 +525,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	} else {
 		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::BufferDownloadSync);
 		const auto tick = m_scheduler.CurrentTick();
+#if defined(TRACY_ENABLE)
+		if (attribution_zone.IsActive()) {
+			const auto observation = ObserveReadback(this, tick);
+			attribution_zone.Value(observation.reader.shader);
+			TraceReadback(attribution_zone, observation, vaddr, size, attribution_copy_bytes, total_size, copy_count, tick);
+		}
+#endif
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
@@ -370,6 +551,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	ResetReadbackCapture(this);
 	(void)DownloadWindowSize(); // Resolve and report an opt-in experiment once at startup.
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -402,6 +584,7 @@ void BufferCache::UpdateGcThresholds(uint64_t total_budget) {
 }
 
 BufferCache::~BufferCache() {
+	ResetReadbackCapture(this);
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -415,6 +598,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (ShaderRecompiler::IR::HostActivityProofEnabled()) ++m_activity_epoch;
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size, true);
@@ -452,7 +636,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 	};
 	bool downloaded_any = false;
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &downloaded_any] {
+	auto read_command = [this, vaddr, size, is_write, &downloaded_any] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -476,7 +660,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			QueueBdaSync(vaddr, size, true);
 		}
-	});
+	};
+	if (ReadbackAttribution::Enabled()) {
+		const auto attribution = ReadbackAttribution::Request(vaddr, size, is_write, GuestGpu::IsGpuThread());
+		m_scheduler.Context().GetGpu().SendCommandSync([read_command = std::move(read_command), attribution] {
+			ReadbackAttribution::Scope attribution_scope(attribution);
+			read_command();
+		});
+	} else {
+		m_scheduler.Context().GetGpu().SendCommandSync(std::move(read_command));
+	}
+
 	note_guest_wait(downloaded_any);
 }
 
@@ -649,9 +843,158 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
 }
 
+namespace {
+uintptr_t PreparedUploadThreadToken() {
+	static thread_local uint8_t token;
+	return reinterpret_cast<uintptr_t>(&token);
+}
+} // namespace
+
+bool BufferCache::IsPreparedUploadThread() const {
+	return m_prepared_upload_thread.load(std::memory_order_relaxed) == PreparedUploadThreadToken();
+}
+
+void BufferCache::CheckPreparedUploadThread() {
+	const auto thread = PreparedUploadThreadToken();
+	auto owner = m_prepared_upload_thread.load(std::memory_order_relaxed);
+	if (owner == 0) {
+		m_prepared_upload_thread.compare_exchange_strong(owner, thread, std::memory_order_relaxed);
+		if (owner == 0) owner = thread;
+	}
+	// Production uses the GPU command lane. Standalone native fixtures may own an
+	// isolated context on their test lane, but never mutate its arena from two lanes.
+	EXIT_IF(owner != thread);
+}
+
+BufferCache::PreparedUploadScope::PreparedUploadScope(BufferCache& cache)
+    : m_cache(cache), m_previous(nullptr) {
+	m_cache.CheckPreparedUploadThread();
+	m_previous = cache.m_prepared_upload_scope;
+	m_cache.m_prepared_upload_scope = this;
+}
+
+BufferCache::PreparedUploadScope::~PreparedUploadScope() {
+	m_cache.CheckPreparedUploadThread();
+	EXIT_IF(m_cache.m_prepared_upload_scope != this);
+	m_cache.m_prepared_upload_scope = m_previous;
+	// This runs after recording the consumer, including its final command-buffer restart.
+	// Early-return paths have no pending consumer but may safely retain the same tick.
+	if (!m_uploads.buffers.empty()) {
+		m_cache.m_retired_prepared_uploads.push_back(
+		    {m_cache.m_scheduler.CurrentTick(), std::move(m_uploads.buffers)});
+	}
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ReservePreparedUpload(
+    PreparedUpload& uploads, uint64_t size, uint64_t alignment) {
+	EXIT_IF(size == 0);
+	CheckPreparedUploadThread();
+	ReleaseCompletedPreparedUploads();
+	const auto atom = std::max<uint64_t>(
+	    m_graphics.physical_device_properties.limits.nonCoherentAtomSize, 1);
+	// Isolate every host-written reservation by an atom even on coherent memory. Reusing
+	// another part of a chunk must never flush an atom still being read by the GPU.
+	const auto divisor = std::gcd(alignment, atom);
+	EXIT_IF(alignment != 0 && alignment / divisor > UINT64_MAX / atom);
+	alignment = alignment == 0 ? atom : alignment / divisor * atom;
+	const auto mapped_size = Common::AlignUp(size, atom);
+	EXIT_IF(mapped_size < size);
+	auto offset = Common::AlignUp(m_prepared_upload_offset, alignment);
+	if (!m_prepared_upload_buffer || offset < m_prepared_upload_offset ||
+	    offset > m_prepared_upload_buffer->Size() ||
+	    mapped_size > m_prepared_upload_buffer->Size() - offset) {
+		m_prepared_upload_buffer.reset();
+		// A pool-only reference means all preparation owners and GPU-tick callbacks
+		// released this backing. Never wait for a consumer which is not recorded yet.
+		for (const auto& buffer: m_prepared_upload_pool) {
+			if (buffer.use_count() == 1 && buffer->Size() >= mapped_size) {
+				m_prepared_upload_buffer = buffer;
+				break;
+			}
+		}
+		const auto capacity = std::max<uint64_t>(MiB, mapped_size);
+		if (!m_prepared_upload_buffer &&
+		    capacity > 64 * MiB - m_prepared_upload_pool_bytes) {
+			// Drain only work already recorded. Pending preparations keep their own
+			// references, so completing this prefix cannot recycle unconsumed bytes.
+			// Extra backing after this retry is bounded by the live preparation itself.
+			m_scheduler.Wait(m_scheduler.CurrentTick());
+			// Release only upload leases: unrelated deferred cache deletions must
+			// retain the scheduler's normal next-operation-boundary timing.
+			ReleaseCompletedPreparedUploads();
+			for (const auto& buffer: m_prepared_upload_pool) {
+				if (buffer.use_count() == 1 && buffer->Size() >= mapped_size) {
+					m_prepared_upload_buffer = buffer;
+					break;
+				}
+			}
+		}
+		if (!m_prepared_upload_buffer) {
+			m_prepared_upload_buffer = std::make_shared<Buffer>(
+			    m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+			    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, capacity);
+			if (capacity <= 64 * MiB - m_prepared_upload_pool_bytes) {
+				m_prepared_upload_pool.push_back(m_prepared_upload_buffer);
+				m_prepared_upload_pool_bytes += capacity;
+			}
+		}
+		m_prepared_upload_offset = 0;
+		offset = 0;
+	}
+	if (std::ranges::find(uploads.buffers, m_prepared_upload_buffer) == uploads.buffers.end()) {
+		uploads.buffers.push_back(m_prepared_upload_buffer);
+	}
+	// A stage may keep its own descriptor preparation as well as the enclosing draw
+	// scope. The scope's final tick is sampled only after the actual consumer records.
+	if (m_prepared_upload_scope != nullptr && &uploads != &m_prepared_upload_scope->m_uploads) {
+		auto& scope = m_prepared_upload_scope->m_uploads.buffers;
+		if (std::ranges::find(scope, m_prepared_upload_buffer) == scope.end()) {
+			scope.push_back(m_prepared_upload_buffer);
+		}
+	}
+	m_prepared_upload_offset = offset + mapped_size;
+	return {m_prepared_upload_buffer.get(), offset};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::UploadPrepared(
+    PreparedUpload& uploads, const void* source, uint64_t size, uint64_t alignment) {
+	EXIT_IF(source == nullptr);
+	auto result = ReservePreparedUpload(uploads, size, alignment);
+	std::memcpy(result.first->Mapped().data() + result.second, source, static_cast<size_t>(size));
+	result.first->Flush(result.second, size);
+	return result;
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::UploadPrepared(
+    const void* source, uint64_t size, uint64_t alignment) {
+	CheckPreparedUploadThread();
+	EXIT_IF(m_prepared_upload_scope == nullptr);
+	return UploadPrepared(m_prepared_upload_scope->m_uploads, source, size, alignment);
+}
+
+void BufferCache::RetainPreparedUploads(const PreparedUpload& uploads) {
+	if (!uploads.buffers.empty()) {
+		CheckPreparedUploadThread();
+		m_retired_prepared_uploads.push_back({m_scheduler.CurrentTick(), uploads.buffers});
+	}
+}
+
+void BufferCache::ReleaseCompletedPreparedUploads() {
+	while (!m_retired_prepared_uploads.empty() &&
+	       m_scheduler.IsFree(m_retired_prepared_uploads.front().tick)) {
+		m_retired_prepared_uploads.pop_front();
+	}
+	// Uncached overflow has no pool reference. Once only the active-page reference
+	// remains, all preparations/consumers completed and its memory can be returned.
+	if (m_prepared_upload_buffer && m_prepared_upload_buffer.use_count() == 1) {
+		m_prepared_upload_buffer.reset();
+		m_prepared_upload_offset = 0;
+	}
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id, bool allow_stream) {
+                                                       BufferId id, bool allow_stream, PreparedUpload* uploads) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	if (allow_stream && !is_written && size <= CACHING_PAGESIZE &&
@@ -659,6 +1002,23 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		// Only the arena's owner lane may consult the scope pointer. Other existing
+		// unscoped cache callers retain their original ring path.
+		auto* scope = IsPreparedUploadThread() ? m_prepared_upload_scope : nullptr;
+		if (size != 0 && (uploads != nullptr || scope != nullptr)) {
+			auto& retained = uploads != nullptr ? *uploads : scope->m_uploads;
+			const auto prepared_alignment = std::max<uint64_t>({alignment,
+			    m_graphics.physical_device_properties.limits.minStorageBufferOffsetAlignment,
+			    m_graphics.physical_device_properties.limits.minTexelBufferOffsetAlignment});
+			auto result = ReservePreparedUpload(retained, size, prepared_alignment);
+			if (!LibKernel::Memory::CopySparseMemory(
+			        vaddr, result.first->Mapped().data() + result.second, size)) {
+				EXIT("BufferCache: failed to read sparse prepared buffer memory\n");
+			}
+			result.first->Flush(result.second, size);
+			retained.sources.push_back({vaddr, size, result.first->Handle(), result.second});
+			return result;
+		}
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
@@ -677,6 +1037,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (ReadbackAttribution::Enabled()) CaptureGpuWrite(this, vaddr, size, m_scheduler.CurrentTick());
 		NoteGpuWriter(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
@@ -805,6 +1166,140 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+bool BufferCache::BindingOwnerRange(uint64_t address, uint64_t size, vk::Buffer handle,
+                                   bool written, uint64_t& begin, uint64_t& length,
+                                   const PreparedUpload* uploads) const {
+	if (!GuestRange {address, size}.Valid() || size == 0u || handle == nullptr) return false;
+	if (!written && uploads != nullptr) {
+		for (const auto& source: uploads->sources) {
+			if (source.buffer == handle && source.address == address && source.size == size) {
+				begin = address; length = size;
+				return true;
+			}
+		}
+	}
+	if (!written && handle == m_stream_buffer.Handle()) {
+		// ObtainBuffer's read-only stream copies exactly this source span.
+		begin = address; length = size;
+		return true;
+	}
+	auto owner = m_buffers.upper_bound(address);
+	if (owner == m_buffers.begin()) return false;
+	--owner;
+	const auto& buffer = m_slot_buffers[owner->second];
+	if (buffer.Handle() != handle || !buffer.IsInBounds(address, size)) return false;
+	begin = buffer.CpuAddress(); length = buffer.Size();
+	return true;
+}
+
+bool BufferCache::BindingActivityRange(uint64_t address, uint64_t size,
+                                       const vk::DescriptorBufferInfo& binding, bool written,
+                                       uint64_t& begin, uint64_t& length,
+                                       const PreparedUpload* uploads,
+                                       ActivityBindingFailure* failure) const {
+	using Reason = ActivityBindingFailure::Reason;
+	using PreparedReason = ActivityBindingFailure::PreparedReason;
+	if (failure) *failure = {}; // Fresh diagnostic only; no guard/cache state changes.
+	const auto reject = [&](Reason reason) { if (failure) failure->reason = reason; return false; };
+	const auto prepared_reject = [&](PreparedReason reason, uint64_t offset = 0) {
+		if (failure && static_cast<uint32_t>(reason) > static_cast<uint32_t>(failure->prepared_reason)) {
+			failure->prepared_reason = reason; failure->prepared_offset = offset;
+			if (reason != PreparedReason::NoMatchingSource) failure->fields |= 2u;
+		}
+	};
+	// Capture-only: keeps the FIRST reported image of the first rejecting query of each kind.
+	const auto note_overlap = [&](ActivityBindingFailure::ImageOverlap& out, uint32_t kind,
+	                              const TextureCache::RegionOverlapDiagnostic& first_image,
+	                              uint64_t query_begin, uint64_t query_size,
+	                              uint64_t native_begin, uint64_t native_size) {
+		if (!failure || !first_image.valid || out.kind != 0u) return;
+		out.kind = kind; out.image_id = first_image.image_id; out.serial = first_image.serial;
+		out.data_begin = first_image.data_begin; out.data_size = first_image.data_size;
+		out.query_begin = query_begin; out.query_size = query_size;
+		const auto relation = ShaderRecompiler::IR::ActivityDiagnosticClassifyOverlap(
+		    true, address, size, true, native_begin, native_size, query_begin, query_size,
+		    first_image.data_begin, first_image.data_size);
+		out.relation = relation.bits; out.overlap_class = relation.cls;
+		failure->fields |= kind == 1u ? 64u : 128u;
+	};
+	// Same original short-circuit predicates, order and number of queries.
+	if (!GuestRange {address, size}.Valid()) return reject(Reason::InvalidGuestRange);
+	if (size == 0u) return reject(Reason::ZeroSize);
+	if (binding.buffer == nullptr) return reject(Reason::NullHandle);
+	if (binding.range == 0u) return reject(Reason::ZeroNativeRange);
+	if (binding.range == vk::WholeSize) return reject(Reason::WholeNativeRange);
+	const auto alignment = m_graphics.StorageMinAlignment();
+	if (failure) { failure->alignment = alignment; failure->fields |= 1u; }
+	if (alignment == 0u) return reject(Reason::ZeroAlignment);
+	if (!written && uploads != nullptr) {
+		prepared_reject(PreparedReason::NoMatchingSource);
+		for (const auto& source: uploads->sources) {
+			if (source.buffer != binding.buffer || source.address != address || source.size != size) continue;
+			if (source.offset != binding.offset) { prepared_reject(PreparedReason::NativeOffset, source.offset); continue; }
+			if (source.offset % alignment != 0u) { prepared_reject(PreparedReason::NativeAlignment, source.offset); continue; }
+			if (binding.range != size) { prepared_reject(PreparedReason::NativeRange, source.offset); continue; }
+			prepared_reject(PreparedReason::NoOwnedBuffer, source.offset);
+			for (const auto& buffer: uploads->buffers) {
+				if (!buffer || buffer->Handle() != binding.buffer) continue;
+				if (binding.offset > buffer->Size() || binding.range > buffer->Size() - binding.offset) {
+					prepared_reject(PreparedReason::OwnedBounds, source.offset); continue;
+				}
+				TextureCache::RegionOverlapDiagnostic first_image {};
+				if (m_texture_cache.IsRegionRegistered(address, size, failure ? &first_image : nullptr)) {
+					// Prepared native view is the exact source.
+					if (failure) note_overlap(failure->prepared_overlap, 1u, first_image, address, size, address, size);
+					prepared_reject(PreparedReason::ImageOverlap, source.offset); continue;
+				}
+				begin = address; length = size;
+				return true;
+			}
+		}
+	}
+	if (binding.buffer == m_stream_buffer.Handle()) return reject(Reason::UntrackedRing);
+	auto owner = m_buffers.upper_bound(address);
+	if (owner == m_buffers.begin()) return reject(Reason::NoOwner);
+	--owner;
+	const auto& buffer = m_slot_buffers[owner->second];
+	if (failure) { failure->owner_begin = buffer.CpuAddress(); failure->owner_size = buffer.Size(); failure->fields |= 4u; }
+	if (buffer.Handle() != binding.buffer) return reject(Reason::OwnerHandle);
+	if (!buffer.IsInBounds(address, size)) return reject(Reason::SourceOutsideOwner);
+	const auto offset = buffer.Offset(address);
+	const auto aligned_offset = Common::AlignDown(offset, alignment);
+	const auto adjustment = offset - aligned_offset;
+	if (failure) { failure->expected_offset = aligned_offset; failure->prefix = adjustment; failure->fields |= 8u; }
+	if (adjustment >= 256u) return reject(Reason::PrefixTooLarge);
+	if (size > UINT64_MAX - adjustment) return reject(Reason::SizeOverflow);
+	if (failure) { failure->expected_range = size + adjustment; failure->fields |= 16u; }
+	if (binding.offset != aligned_offset) return reject(Reason::NativeOffset);
+	if (binding.range != size + adjustment) return reject(Reason::NativeRange);
+	if (binding.offset > buffer.Size() || binding.range > buffer.Size() - binding.offset)
+		return reject(Reason::NativeOutsideOwner);
+	const auto native_begin = address - adjustment;
+	const auto native_end = address + size;
+	if (native_end > UINT64_MAX - (TRACKER_PAGE_SIZE - 1u)) return reject(Reason::RoundOverflow);
+	const auto first = Common::AlignDown(native_begin, TRACKER_PAGE_SIZE);
+	const auto last = Common::AlignUp(native_end, TRACKER_PAGE_SIZE);
+	if (failure) { failure->footprint_begin = first; failure->footprint_size = last - first; failure->fields |= 32u; }
+	if (!buffer.IsInBounds(first, last - first)) return reject(Reason::FootprintOutsideOwner);
+	TextureCache::RegionOverlapDiagnostic first_image {};
+	if (m_texture_cache.IsRegionRegistered(first, last - first, failure ? &first_image : nullptr)) {
+		// Native guest view is [address - prefix, address + size).
+		if (failure) note_overlap(failure->persistent_overlap, 2u, first_image, first, last - first, native_begin, native_end - native_begin);
+		return reject(Reason::FootprintImageOverlap);
+	}
+	begin = first; length = last - first;
+	return true;
+}
+
+uint64_t BufferCache::NextRecordedWorkSequence() const {
+	return NextRecordedSequence(this);
+}
+
+void BufferCache::NoteRecordedWriter(const ReadbackAttribution::RecordedWriter& writer, uint64_t sequence,
+                                     uint64_t tick) const {
+	NoteRecordedWriterCapture(this, writer, sequence, tick);
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
@@ -944,6 +1439,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	if (IsPreparedUploadThread()) ReleaseCompletedPreparedUploads();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

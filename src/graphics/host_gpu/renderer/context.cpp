@@ -45,6 +45,26 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		return;
 	}
 	EndRendering();
+	// A new dynamic-rendering scope has no implicit external attachment dependency.
+	// Keep the unchanged active-scope fast path above; only new scopes order their
+	// attachment loads/stores after earlier color and depth/stencil writes.
+	if (state.num_color_attachments != 0 || state.depth_stencil_attachment.has_depth ||
+	    state.depth_stencil_attachment.has_stencil) {
+		vk::MemoryBarrier2 attachment_dependency {};
+		attachment_dependency.srcStageMask = attachment_dependency.dstStageMask =
+		    vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+		    vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		    vk::PipelineStageFlagBits2::eLateFragmentTests;
+		attachment_dependency.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+		                                      vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		attachment_dependency.dstAccessMask = attachment_dependency.srcAccessMask |
+		                                      vk::AccessFlagBits2::eColorAttachmentRead |
+		                                      vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers = &attachment_dependency;
+		Handle().pipelineBarrier2(dependency);
+	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {

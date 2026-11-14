@@ -46,6 +46,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	BufferCache::PreparedUpload           uploads;
 };
 
 [[nodiscard]] vk::DescriptorType

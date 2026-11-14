@@ -1,10 +1,9 @@
 #include <vector>
-#include <unordered_map>
 #include <cstdlib>
 #include <array>
 #include <chrono>
-#include <deque>
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuSubmitTiming.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/frameStats.h"
@@ -16,6 +15,10 @@
 
 #include <algorithm>
 #include <optional>
+#include <cmath>
+#include <cinttypes>
+#include <new>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -41,6 +44,185 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 } // namespace
+
+struct CommandScheduler::GpuTimingV2 {
+	static constexpr size_t Capacity = 128;
+	using Leases = GpuSubmitTiming::LeasePool<Capacity>;
+	struct Sample { uint64_t tick = 0, ns = 0; uint32_t work = 0; };
+	GpuTimingV2(uintptr_t owner, uint32_t bits, double period)
+	    : domain(owner), leases(owner, true), valid_bits(bits), period_ns(period) {}
+	uintptr_t domain;
+	Leases leases;
+	vk::QueryPool pool = nullptr;
+	uint32_t valid_bits;
+	double period_ns;
+	size_t active = Leases::Invalid, cursor = 0;
+	bool faulted = false;
+	uint64_t submitted = 0, measured = 0, skipped = 0, not_ready = 0, errors = 0, ambiguous = 0;
+	std::array<std::chrono::steady_clock::time_point, Capacity> begun {};
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+	uint64_t window_count = 0, minimum = UINT64_MAX, maximum = 0, report_sequence = 0;
+	double sum_ns = 0;
+	std::array<Sample, 8> largest {};
+	size_t largest_count = 0;
+
+	void SampleSpan(uint64_t tick, uint32_t work, uint64_t ns) {
+		++measured; ++window_count;
+		sum_ns += static_cast<double>(ns);
+		minimum = std::min(minimum, ns); maximum = std::max(maximum, ns);
+		if (largest_count == largest.size() && ns <= largest.back().ns) return;
+		auto index = std::min(largest_count, largest.size() - 1u);
+		while (index != 0u && largest[index - 1u].ns < ns) {
+			largest[index] = largest[index - 1u]; --index;
+		}
+		largest[index] = {tick, ns, work};
+		if (largest_count < largest.size()) ++largest_count;
+	}
+	void Report(bool final) {
+		const auto now = std::chrono::steady_clock::now();
+		if (!final && now - window < std::chrono::seconds(2)) return;
+		std::fprintf(stderr, "GPUSUBMIT_V2 v=2 domain=%" PRIxPTR " report=%" PRIu64
+		    " metric=command_buffer_span aggregation=harvest_window final=%u valid_bits=%u"
+		    " period_ns=%.9g measured=%" PRIu64 " measured_total=%" PRIu64
+		    " submitted_total=%" PRIu64 " skipped_total=%" PRIu64 " pending=%zu"
+		    " dropped_capacity_total=%" PRIu64 " not_ready_attempts_total=%" PRIu64
+		    " query_errors_total=%" PRIu64 " ambiguous_total=%" PRIu64
+		    " span_sum_ns=%.0f min_ns=%" PRIu64 " max_ns=%" PRIu64
+		    " shader_cost=unknown utilization=unknown\n",
+		    domain, ++report_sequence, final ? 1u : 0u, valid_bits, period_ns,
+		    window_count, measured, submitted, skipped, leases.Pending(), leases.Dropped(),
+		    not_ready, errors, ambiguous, sum_ns, window_count ? minimum : 0u, maximum);
+		for (size_t i = 0; i < largest_count; ++i) {
+			const auto& sample = largest[i];
+			std::fprintf(stderr, "GPUSUBMIT_V2_SAMPLE v=2 domain=%" PRIxPTR
+			    " report=%" PRIu64 " sample=largest_window_span rank=%zu tick=%" PRIu64
+			    " span_ns=%" PRIu64 " work_items=%u\n",
+			    domain, report_sequence, i, sample.tick, sample.ns, sample.work);
+		}
+		window = now; window_count = 0; minimum = UINT64_MAX; maximum = 0;
+		sum_ns = 0; largest_count = 0;
+	}
+};
+
+void CommandScheduler::BeginGpuTimingV2() {
+	if (!m_gpu_time_v2_checked) {
+		m_gpu_time_v2_checked = true;
+		// Immutable opt-in only. The legacy KYTY_GPU_TIME flag is never consulted.
+		if (!GpuSubmitTiming::EnabledFor(std::getenv("KYTY_GPU_TIME_V2"),
+		                                this == &m_context.GetCommandScheduler())) return;
+		if (!m_graphics.physical_device || !m_graphics.device) return;
+		const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
+		uint32_t family_count = 0;
+		m_graphics.physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::array<vk::QueueFamilyProperties, 256> families {};
+		if (family_count == 0u || family_count > families.size() ||
+		    m_graphics.queue_family >= family_count || !std::isfinite(period) || period <= 0) {
+			std::fputs("GPUSUBMIT_V2 v=2 status=disabled reason=unsupported_queue_or_period\n", stderr);
+			return;
+		}
+		m_graphics.physical_device.getQueueFamilyProperties(&family_count, families.data());
+		if (m_graphics.queue_family >= family_count ||
+		    !GpuSubmitTiming::ValidTimestampBits(families[m_graphics.queue_family].timestampValidBits)) {
+			std::fputs("GPUSUBMIT_V2 v=2 status=disabled reason=timestamp_valid_bits\n", stderr);
+			return;
+		}
+		auto timing = std::unique_ptr<GpuTimingV2>(new (std::nothrow) GpuTimingV2(
+		    reinterpret_cast<uintptr_t>(this), families[m_graphics.queue_family].timestampValidBits, period));
+		if (!timing) return;
+		vk::QueryPoolCreateInfo info {};
+		info.queryType = vk::QueryType::eTimestamp;
+		info.queryCount = static_cast<uint32_t>(GpuTimingV2::Capacity * 2u);
+		const auto result = m_graphics.device.createQueryPool(&info, nullptr, &timing->pool);
+		if (result != vk::Result::eSuccess || !timing->pool) {
+			std::fprintf(stderr, "GPUSUBMIT_V2 v=2 status=disabled reason=create_query_pool result=%d\n",
+			             static_cast<int>(result));
+			return;
+		}
+		m_gpu_time_v2 = std::move(timing);
+		std::fputs("GPUSUBMIT_V2 v=2 status=enabled role=renderer old_flag_ignored=1\n", stderr);
+	}
+	if (!m_gpu_time_v2) return;
+	HarvestGpuTimingV2();
+	auto& timing = *m_gpu_time_v2;
+	if (timing.faulted) return;
+	if (timing.active != GpuTimingV2::Leases::Invalid) {
+		timing.faulted = true; ++timing.errors; return;
+	}
+	timing.active = timing.leases.Acquire(timing.domain);
+	if (timing.active == GpuTimingV2::Leases::Invalid) return;
+	timing.begun[timing.active] = std::chrono::steady_clock::now();
+	const auto first = static_cast<uint32_t>(timing.active * 2u);
+	// BeginCommand has begun a new command buffer outside rendering. No host reset.
+	m_command.m_buffer.resetQueryPool(timing.pool, first, 2u);
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timing.pool, first);
+}
+
+void CommandScheduler::EndGpuTimingV2() {
+	if (!m_gpu_time_v2 || m_gpu_time_v2->active == GpuTimingV2::Leases::Invalid) return;
+	auto& timing = *m_gpu_time_v2;
+	// End() already closes rendering at this point; doing so before the final stamp
+	// includes attachment stores in the span. No work/submit counter is changed.
+	m_command.EndRendering();
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing.pool,
+	                                  static_cast<uint32_t>(timing.active * 2u + 1u));
+}
+
+void CommandScheduler::SubmittedGpuTimingV2(uint64_t tick) {
+	if (!m_gpu_time_v2) return;
+	auto& timing = *m_gpu_time_v2;
+	++timing.submitted;
+	if (timing.active == GpuTimingV2::Leases::Invalid) ++timing.skipped;
+	else if (!timing.leases.Submitted(timing.active, timing.domain, tick, m_submit_work_count)) {
+		timing.faulted = true; ++timing.errors;
+	}
+	timing.active = GpuTimingV2::Leases::Invalid;
+	HarvestGpuTimingV2();
+}
+
+void CommandScheduler::HarvestGpuTimingV2(bool final) {
+	if (!m_gpu_time_v2) return;
+	auto& timing = *m_gpu_time_v2;
+	// Cached completed ticks only: no Refresh, wait, flush, or extra submission.
+	const auto completed = m_master.KnownGpuTick();
+	const size_t budget = final ? GpuTimingV2::Capacity : 8u;
+	size_t attempted = 0;
+	for (size_t visited = 0; !timing.faulted && visited < GpuTimingV2::Capacity && attempted < budget; ++visited) {
+		const auto index = timing.cursor;
+		timing.cursor = (timing.cursor + 1u) % GpuTimingV2::Capacity;
+		if (!timing.leases.Ready(index, timing.domain, completed)) continue;
+		++attempted;
+		struct QueryResult { uint64_t value = 0, available = 0; };
+		std::array<QueryResult, 2> results {};
+		const auto result = m_graphics.device.getQueryPoolResults(timing.pool,
+		    static_cast<uint32_t>(index * 2u), 2u, sizeof(results), results.data(), sizeof(QueryResult),
+		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+		if (result == vk::Result::eNotReady ||
+		    (result == vk::Result::eSuccess && (!results[0].available || !results[1].available))) {
+			++timing.not_ready; continue; // Keep the lease; never read/reset another use's data.
+		}
+		if (result != vk::Result::eSuccess) {
+			timing.faulted = true; ++timing.errors; break;
+		}
+		const auto* slot = timing.leases.Get(index);
+		const double host_age_ns = std::chrono::duration<double, std::nano>(
+		    std::chrono::steady_clock::now() - timing.begun[index]).count();
+		const auto ns = GpuSubmitTiming::SpanNanoseconds(results[0].value, results[1].value,
+		    timing.valid_bits, timing.period_ns, host_age_ns);
+		if (ns) timing.SampleSpan(slot->tick, slot->work_count, *ns);
+		else ++timing.ambiguous;
+		(void)timing.leases.Harvested(index, timing.domain, completed, true);
+	}
+	timing.Report(final);
+}
+
+void CommandScheduler::DestroyGpuTimingV2AfterDrain() {
+	if (!m_gpu_time_v2) return;
+	HarvestGpuTimingV2(true);
+	// Shutdown has already waited for every successful submit and joined completion
+	// work. There is no diagnostic wait, and no presenter/device-global pool.
+	m_graphics.device.destroyQueryPool(m_gpu_time_v2->pool, nullptr);
+	m_gpu_time_v2.reset();
+}
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -145,6 +327,7 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	DestroyGpuTimingV2AfterDrain();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -312,42 +495,11 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	g_deferred_callback_scheduler = previous;
 }
 
-// TEMP DIAG (KYTY_GPU_TIME): GPU execution time of every command buffer.
-namespace {
-struct GpuTimer {
-	bool                                      enabled = std::getenv("KYTY_GPU_TIME") != nullptr;
-	vk::QueryPool                             pool    = nullptr;
-	uint32_t                                  next    = 0;
-	uint32_t                                  current = UINT32_MAX;
-	std::deque<std::pair<uint64_t, uint32_t>> pending;
-	uint64_t                                  busy_ns = 0, submits = 0;
-	uint64_t                                  first_start = 0, last_end = 0;
-	std::chrono::steady_clock::time_point     window = std::chrono::steady_clock::now();
-	static constexpr uint32_t                 Slots  = 8192;
-	// Per-item stamps: each command buffer owns a 1024-slot range of a 64-range ring.
-	static constexpr uint32_t                 ItemRange = 1024, ItemRanges = 64;
-	vk::QueryPool                             items = nullptr;
-	uint32_t                                  item_range = 0, item_count = 0;
-	std::vector<uint64_t>                     item_keys;
-	struct Pending { uint32_t range; std::vector<uint64_t> keys; };
-	std::deque<Pending>                       item_pending;
-	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> per_key; // ns, count
-};
-GpuTimer& Timer() {
-	static GpuTimer timer;
-	return timer;
-}
-} // namespace
-
 void CommandScheduler::NoteWorkTiming(uint64_t key) {
-	auto& timer = Timer();
-	if (!timer.enabled || timer.current == UINT32_MAX || timer.item_count >= GpuTimer::ItemRange) {
-		return;
-	}
-	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.items,
-	                                  timer.item_range * GpuTimer::ItemRange + timer.item_count);
-	timer.item_count++;
-	timer.item_keys.push_back(key);
+	// Kept for caller compatibility only. Legacy keys sacrifice hash bit63 and
+	// item-to-item intervals are not shader costs. Neither legacy flag nor key
+	// enables a query. V2 command-buffer timing has its own exact-one flag.
+	(void)key;
 }
 
 bool CommandScheduler::IsFree(uint64_t tick) {
@@ -371,31 +523,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
-	if (auto& timer = Timer(); timer.enabled) {
-		if (!timer.pool) {
-			vk::QueryPoolCreateInfo info {};
-			info.queryType  = vk::QueryType::eTimestamp;
-			info.queryCount = GpuTimer::Slots * 2u;
-			timer.pool      = m_graphics.device.createQueryPool(info).value;
-			m_graphics.device.resetQueryPool(timer.pool, 0, GpuTimer::Slots * 2u);
-		}
-		if (!timer.items) {
-			vk::QueryPoolCreateInfo info {};
-			info.queryType  = vk::QueryType::eTimestamp;
-			info.queryCount = GpuTimer::ItemRange * GpuTimer::ItemRanges;
-			timer.items     = m_graphics.device.createQueryPool(info).value;
-		}
-		timer.item_range = (timer.item_range + 1u) % GpuTimer::ItemRanges;
-		timer.item_count = 0;
-		timer.item_keys.clear();
-		m_command.m_buffer.resetQueryPool(timer.items, timer.item_range * GpuTimer::ItemRange,
-		                                  GpuTimer::ItemRange);
-		timer.current = timer.next;
-		timer.next    = (timer.next + 1u) % GpuTimer::Slots;
-		m_command.m_buffer.resetQueryPool(timer.pool, timer.current * 2u, 2u);
-		m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timer.pool,
-		                                  timer.current * 2u);
-	}
+	BeginGpuTimingV2();
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -404,12 +532,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
 	m_context.GetBufferCache().FlushReadChecks();
-	auto& timer = Timer();
-	if (timer.enabled && timer.current != UINT32_MAX) {
-		m_command.EndRendering();
-		m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timer.pool,
-		                                  timer.current * 2u + 1u);
-	}
+	EndGpuTimingV2();
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -474,78 +597,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
-	if (timer.enabled && timer.current != UINT32_MAX) {
-		timer.pending.emplace_back(tick, timer.current);
-		timer.item_pending.push_back({timer.item_range, timer.item_keys});
-		timer.current = UINT32_MAX;
-		const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
-		while (!timer.pending.empty() && IsFree(timer.pending.front().first)) {
-			{
-				auto& item = timer.item_pending.front();
-				std::array<uint64_t, 2> cb {};
-				(void)m_graphics.device.getQueryPoolResults(
-				    timer.pool, timer.pending.front().second * 2u, 2u, sizeof(cb), cb.data(),
-				    sizeof(uint64_t), vk::QueryResultFlagBits::e64);
-				if (!item.keys.empty()) {
-					std::vector<uint64_t> stamps(item.keys.size());
-					if (m_graphics.device.getQueryPoolResults(
-					        timer.items, item.range * GpuTimer::ItemRange,
-					        static_cast<uint32_t>(stamps.size()), stamps.size() * sizeof(uint64_t),
-					        stamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
-					    vk::Result::eSuccess) {
-						uint64_t prev = cb[0];
-						for (size_t i = 0; i < stamps.size(); i++) {
-							if (stamps[i] >= prev) {
-								auto& k = timer.per_key[item.keys[i]];
-								k.first += static_cast<uint64_t>((stamps[i] - prev) * period);
-								k.second++;
-								prev = stamps[i];
-							}
-						}
-					}
-				}
-				timer.item_pending.pop_front();
-			}
-			std::array<uint64_t, 2> stamps {};
-			if (m_graphics.device.getQueryPoolResults(timer.pool, timer.pending.front().second * 2u, 2u,
-			                                          sizeof(stamps), stamps.data(), sizeof(uint64_t),
-			                                          vk::QueryResultFlagBits::e64) ==
-			        vk::Result::eSuccess &&
-			    stamps[1] >= stamps[0]) {
-				const auto start = static_cast<uint64_t>(stamps[0] * period);
-				const auto end   = static_cast<uint64_t>(stamps[1] * period);
-				// Count overlapping command buffers once.
-				const auto from = std::max(start, timer.last_end);
-				if (end > from) timer.busy_ns += end - from;
-				if (timer.first_start == 0) timer.first_start = start;
-				timer.last_end = std::max(timer.last_end, end);
-				timer.submits++;
-			}
-			timer.pending.pop_front();
-		}
-		const auto now = std::chrono::steady_clock::now();
-		if (now - timer.window >= std::chrono::seconds(2)) {
-			const double wall_ms = std::chrono::duration<double, std::milli>(now - timer.window).count();
-			std::printf("GPUTIME: GPU busy %.0f ms of %.0f ms (%.0f%%), %llu command buffers\n",
-			            timer.busy_ns / 1e6, wall_ms, 100.0 * timer.busy_ns / 1e6 / wall_ms,
-			            static_cast<unsigned long long>(timer.submits));
-			std::fflush(stdout);
-			std::vector<std::pair<uint64_t, uint64_t>> top;
-			for (auto& [k, v]: timer.per_key) top.emplace_back(v.first, k);
-			std::sort(top.rbegin(), top.rend());
-			for (size_t i = 0; i < top.size() && i < 20; i++) {
-				const auto& v = timer.per_key[top[i].second];
-				std::printf("GPUTIME:   %7.2f ms  %5llu x  %s %016llx\n", v.first / 1e6,
-				            static_cast<unsigned long long>(v.second),
-				            (top[i].second >> 63u) ? "draw(ps/vs)" : "dispatch   ",
-				            static_cast<unsigned long long>(top[i].second & ~(1ull << 63u)));
-			}
-			timer.per_key.clear();
-			timer.window  = now;
-			timer.busy_ns = 0;
-			timer.submits = 0;
-		}
-	}
+	SubmittedGpuTimingV2(tick);
 	m_command.m_buffer = nullptr;
 	return tick;
 }

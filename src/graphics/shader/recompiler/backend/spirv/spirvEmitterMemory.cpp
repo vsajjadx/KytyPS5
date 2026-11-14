@@ -182,6 +182,51 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
+} // namespace (reopened below)
+
+// The last eight DWORDs of the fault buffer hold the table-call miss record (FaultManager owns
+// the layout): [0] miss count, [1] call pc, [2..3] loaded pair, [4..5] shader hash. The page
+// bitmap scan never reaches it; OpArrayLength keeps the shader independent of the bitmap size.
+void EmitCallTableMiss(EmitterState& state, uint32_t pc, uint32_t lo, uint32_t hi) {
+	const auto length = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), length, state.fault_buffer_variable, 0u);
+	const auto record = Binary(state, spv::OpISub, TypeU32(state), length, ConstantU32(state, 8u));
+	const auto word = [&](uint32_t offset) {
+		return FaultElementPointer(
+		    state, Binary(state, spv::OpIAdd, TypeU32(state), record, ConstantU32(state, offset)));
+	};
+	// Every miss counts; only the invocation that took the count from zero writes the tuple, so
+	// the record is one coherent {pc, target, shader} (never fields from different misses). The
+	// host copies and clears the trailer in order, so a later pass cannot replay it.
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), previous, word(0),
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
+	const auto first = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u));
+	const auto hash  = state.program.shader_hash;
+	(void)EmitValueOrZeroIfCondition(state, first, [&] {
+		state.builder.AddFunction(spv::OpStore, word(1), pc);
+		state.builder.AddFunction(spv::OpStore, word(2), lo);
+		state.builder.AddFunction(spv::OpStore, word(3), hi);
+		state.builder.AddFunction(spv::OpStore, word(4), ConstantU32(state, static_cast<uint32_t>(hash)));
+		state.builder.AddFunction(spv::OpStore, word(5), ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+		return ConstantU32(state, 0u);
+	});
+}
+
+uint32_t EmitCallReturnAddress(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.Fail(inst, "is a call return address that escaped linking");
+}
+
+bool UsesCallTableMiss(const IR::Program& program) {
+	for (const auto* block: program.blocks)
+		for (const auto& inst: *block)
+			if (inst.GetOpcode() == IR::ValueOpcode::CallTableMiss) return true;
+	return false;
+}
+
+namespace {
+
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);

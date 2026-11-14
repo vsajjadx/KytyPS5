@@ -199,9 +199,15 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
-	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
-	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	// A call's saved return address is a linker-resolved CFG edge, never guest data: give it a
+	// dedicated op so only it (not caller S_GETPC data pointers) is forbidden from escaping.
+	const auto address =
+	    inst.opcode == Decoder::Opcode::S_SWAPPC_B64
+	        ? IR::U64(ir.Emit(IR::ValueOpcode::CallReturnAddress,
+	                          {IR::Value(static_cast<uint32_t>(inst.pc) + 4u)}))
+	        : IR::U64(ir.Emit(IR::ValueOpcode::IAdd64,
+	                          {IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase)),
+	                           IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}
@@ -227,6 +233,41 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	const auto words = ExtractU64(address);
 	WriteOperand(inst.dst, words[0]);
 	WriteOperand(high, words[1]);
+}
+
+void Translator::S_CALL_SELECT_B64(const Decoder::Instruction& inst) {
+	// Linker-generated candidate of a table-selected S_SWAPPC_B64: a pure compare of the loaded
+	// target pair (SWAPPC ignores its low two bits) against one linked callee. It writes nothing
+	// (no SCC/VCC/EXEC, no pair). Uniform scalar branch: no subgroup vote.
+	EXIT_IF(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg >= 105u ||
+	        inst.word_count != 3u);
+	const auto lo      = ReadU32(inst.src0);
+	const auto hi      = ReadU32(OffsetOperand(inst.src0, 1));
+	const auto aligned = ir.BitwiseAnd(lo, IR::U32(IR::Value(~3u)));
+	instruction_branch_condition =
+	    ir.LogicalAnd(ir.IEqual(aligned, IR::U32(IR::Value(inst.raw[1]))),
+	                  ir.IEqual(hi, IR::U32(IR::Value(inst.raw[2]))));
+}
+
+void Translator::S_CALL_ENTER_B64(const Decoder::Instruction& inst) {
+	// Taken edge of a table call: the pair receives the return address (call pc + 4).
+	EXIT_IF(inst.dst.kind != Decoder::OperandKind::Sgpr || inst.dst.reg >= 105u ||
+	        inst.word_count != 3u);
+	const auto address = IR::U64(ir.Emit(IR::ValueOpcode::CallReturnAddress,
+	                                     {IR::Value(static_cast<uint32_t>(inst.offset) + 4u)}));
+	const auto words   = ExtractU64(address);
+	WriteRawU32(inst.dst, words[0]);
+	WriteRawU32(OffsetOperand(inst.dst, 1), words[1]);
+}
+
+void Translator::S_CALL_TABLE_MISS_B64(const Decoder::Instruction& inst) {
+	// No candidate named the loaded pair: record it (with the call PC) as a GPU callable fault.
+	// The pair is left unchanged; execution continues after the call.
+	EXIT_IF(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg >= 105u ||
+	        inst.word_count != 3u);
+	const auto lo = ReadU32(inst.src0);
+	const auto hi = ReadU32(OffsetOperand(inst.src0, 1));
+	ir.Emit(IR::ValueOpcode::CallTableMiss, {IR::Value(inst.raw[1]), lo, hi});
 }
 
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {

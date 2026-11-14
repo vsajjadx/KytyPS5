@@ -75,7 +75,16 @@ public:
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
-	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	// Capture-only: the FIRST image the existing walk reports (its registered info.data), copied
+	// under m_lock from the callback's ImageId/Image. Never enumerates further or mutates.
+	struct RegionOverlapDiagnostic {
+		bool     valid      = false;
+		uint32_t image_id   = UINT32_MAX; // ImageId::index (slot, reusable); serial is stable
+		uint64_t serial     = 0;
+		uint64_t data_begin = 0, data_size = 0;
+	};
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size,
+	                                      RegionOverlapDiagnostic* first = nullptr);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

@@ -1,4 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
+#include "graphics/shader/recompiler/ir/ActivityDiagnostics.h"
 
 #include "common/assert.h"
 #if defined(TRACY_ENABLE)
@@ -11,6 +13,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -1597,11 +1600,475 @@ static bool MaterializeFail(int line, const ResourcePlan& program) {
 	return false;
 }
 
+struct ActivityCertificate {
+	uint64_t diagnostic_shader = 0;
+	uint64_t plan = 0;
+	uint64_t shader_base = 0;
+	uint64_t module = 0;
+	uint32_t push_data_cursor = 0;
+	ActivityEpoch epoch;
+	ActivityEpoch materialization_epoch;
+	ResourceSnapshot snapshot;
+	ResourceSpecialization specialization;
+	std::vector<ActivityObservation> observations;
+	std::vector<std::pair<uint64_t, uint64_t>> targets;
+};
+
+struct ActivityCache {
+	std::vector<ActivityCertificate> entries;
+	std::optional<ActivityCertificate> pending;
+	uint64_t hits = 0;
+	uint64_t misses = 0;
+};
+
+namespace {
+
+constexpr size_t ActivityCertificateLimit = 128;
+constexpr size_t ActivityObservationLimit = 512;
+
+bool ActivitySourceValue(const ResourcePlan& plan, Value value,
+                         std::unordered_set<const Inst*>& visited) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return value.GetType() == Type::U32 || value.GetType() == Type::U1;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return false;
+	if (!visited.insert(inst).second) return true;
+	const auto op = inst->GetOpcode();
+	if (op == ValueOpcode::Phi || op == ValueOpcode::ReadConst ||
+	    op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadBufferU32 ||
+	    !ValidateRuntimeValue(plan, value, RuntimeValueType::Integer)) return false;
+	if (op == ValueOpcode::GetUserData) return true;
+	if (op == ValueOpcode::GetShaderBase) return true;
+	if (op == ValueOpcode::LoadAddressU32) {
+		const auto flags = inst->Flags<MemoryFlags>();
+		if (flags.index >= plan.memory_info.size() || inst->NumArgs() != 4u ||
+		    inst->Arg(2).Resolve() != Value(0u) || inst->Arg(3).Resolve() != Value(true) ||
+		    !inst->Arg(1).Resolve().IsImmediate()) return false;
+		const auto& mem = plan.memory_info[flags.index];
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (mem.kind != ResourceKind::ScalarAddress || mem.data_bits != 32u ||
+		    mem.data_dwords != 1u || handle == nullptr ||
+		    handle->GetOpcode() != ValueOpcode::GetAddressResource || handle->NumArgs() != 2u)
+			return false;
+		// No memory-derived pointer, selected pointer, lane value or nested table.
+		for (size_t word = 0; word < 2u; ++word) {
+			const auto base = handle->Arg(word).Resolve();
+			const auto* input = base.TryInstruction();
+			if (!base.IsImmediate() && (input == nullptr || input->GetOpcode() != ValueOpcode::GetUserData))
+				return false;
+		}
+	}
+	for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+		if (!ActivitySourceValue(plan, inst->Arg(arg), visited)) return false;
+	return true;
+}
+
+std::optional<uint32_t> ActivityCounter(const ResourcePlan& plan) {
+	if (plan.stage != ShaderType::Compute || plan.control_flow.empty() ||
+	    plan.info.uses_dma || plan.info.uses_image_heap || !plan.info.address_bases.empty() ||
+	    !plan.source_reads.empty() || plan.uniform_fill.fill.kind != UniformFillKind::None ||
+	    plan.uniform_fill.fill.words != 0u) return {};
+	for (uint32_t block = 0; block < plan.control_flow.size(); ++block)
+		for (const auto successor: plan.control_flow[block].successors)
+			if (successor <= block) return {}; // No host traversal/loop proof in this experiment.
+	std::optional<uint32_t> counter;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() != ValueOpcode::ULessThanEqual32) continue;
+		const auto* read = inst.Arg(0).Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+		    ValidateRuntimeValue(plan, inst.Arg(1), RuntimeValueType::Integer)) continue;
+		const auto flags = read->Flags<MemoryFlags>();
+		if (flags.index >= plan.memory_info.size() || read->NumArgs() != 2u ||
+		    !read->Arg(1).Resolve().IsImmediate()) return {};
+		const auto& mem = plan.memory_info[flags.index];
+		if (mem.kind != ResourceKind::ScalarBuffer || mem.planning_only || mem.data_bits != 32u ||
+		    mem.data_dwords != 1u || mem.resource >= plan.info.buffers.size() ||
+		    plan.info.buffers[mem.resource].written) return {};
+		if (counter && *counter != flags.index) return {};
+		counter = flags.index;
+	}
+	if (!counter) return {};
+	std::unordered_set<const Inst*> source_values;
+	for (const auto& source: plan.descriptor_sources) {
+		if (source.indirect_descriptor) return {};
+		for (uint32_t word = 0; word < source.dword_count; ++word)
+			if (!ActivitySourceValue(plan, source.dwords[word], source_values)) return {};
+	}
+	for (const auto& read: plan.srt_reads)
+		if (!ActivitySourceValue(plan, read.value, source_values)) return {};
+	return counter;
+}
+
+bool ActivityRuntime(const SrtRuntime& runtime) {
+	return runtime.read_activity_memory != nullptr && runtime.read_activity_epoch != nullptr &&
+	       runtime.validate_activity_targets != nullptr;
+}
+
+bool ReuseActivitySnapshot(const ResourcePlan& plan, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const auto note = [&](ActivityDiagnosticReason reason) { ActivityDiagnosticNote(plan.shader_hash, reason); };
+	if (!ActivityRuntime(runtime)) { note(ActivityDiagnosticReason::RuntimeUnavailable); return false; }
+	if (!snapshot.activity_cache) { note(ActivityDiagnosticReason::NoCache); return false; }
+	if (plan.activity_serial == 0u) { note(ActivityDiagnosticReason::NoSerial); return false; }
+	auto cache = snapshot.activity_cache;
+	cache->pending.reset();
+	ActivityEpoch before;
+	if (!runtime.read_activity_epoch(runtime.userdata, before)) { note(ActivityDiagnosticReason::ReadEpochUnavailable); return false; }
+	const bool identity_diag = ActivityDiagnosticsEnabled(plan.shader_hash);
+	bool call_identity_matched = false;
+	for (const auto& entry: cache->entries) {
+		if (identity_diag) ActivityDiagnosticIdentityAttempt(plan.shader_hash);
+		uint32_t identity_reason=0;
+		uint64_t word_index=UINT64_MAX,cached_word=0,current_word=0;
+		const auto equal_userdata = [&] {
+			if (!identity_diag) return std::ranges::equal(entry.snapshot.user_data,runtime.user_data);
+			return ActivityDiagnosticEqualUserdata(entry.snapshot.user_data,runtime.user_data,
+			    identity_reason,word_index,cached_word,current_word);
+		};
+		if(entry.plan!=plan.activity_serial) identity_reason=1;
+		else if(entry.shader_base!=runtime.shader_base) identity_reason=2;
+		else if(entry.push_data_cursor!=runtime.activity_push_data_cursor) identity_reason=3;
+		else if(!equal_userdata() && identity_reason==0) identity_reason=5;
+		if(identity_reason!=0){
+			if(identity_diag){
+				ActivityDiagnosticIdentityMetadata m;
+				m.module=entry.module;m.cached_plan=entry.plan;m.current_plan=plan.activity_serial;
+				m.cached_base=entry.shader_base;m.current_base=runtime.shader_base;
+				m.cached_cursor=entry.push_data_cursor;m.current_cursor=runtime.activity_push_data_cursor;
+				m.cached_words=entry.snapshot.user_data.size();m.current_words=runtime.user_data.size();
+				m.word_index=word_index;m.cached_word=cached_word;m.current_word=current_word;
+				m.cache_entries=cache->entries.size();m.reason=identity_reason;
+				ActivityDiagnosticIdentityFailure(plan.shader_hash,m);
+			}
+			note(ActivityDiagnosticReason::IdentityMismatch);continue;
+		}
+		if(identity_diag) ActivityDiagnosticIdentityMatch(plan.shader_hash,!call_identity_matched);
+		call_identity_matched=true;
+		if (entry.epoch != before) {
+			ActivityDiagnosticEpoch(plan.shader_hash, entry.epoch, before); continue;
+		}
+		bool same = true;
+		for (const auto& observed: entry.observations) {
+			uint32_t current = 0;
+			if (!runtime.read_activity_memory(runtime.userdata, observed.address, {&current, 1u})) {
+				note(ActivityDiagnosticReason::StrictSourceUnavailable); same = false; break;
+			}
+			if (current != observed.value) {
+				note(ActivityDiagnosticReason::StrictSourceChanged); same = false; break;
+			}
+		}
+		ActivityEpoch after;
+		if (!same) continue;
+		if (!runtime.validate_activity_targets(runtime.userdata, entry.targets)) { note(ActivityDiagnosticReason::TargetsRejected); continue; }
+		if (!runtime.read_activity_epoch(runtime.userdata, after)) { note(ActivityDiagnosticReason::ReadEpochUnavailable); continue; }
+		if (after != before) { note(ActivityDiagnosticReason::ProbeEpochChanged); ActivityDiagnosticEpoch(plan.shader_hash, before, after); continue; }
+		// Consume the SAME exact snapshot whose input bytes were verified; no second raw walk.
+		snapshot = entry.snapshot;
+		snapshot.activity_cache = cache;
+		specialization = entry.specialization;
+		cache->pending = entry;
+		cache->pending->materialization_epoch = after;
+		note(ActivityDiagnosticReason::ReuseHit);
+		++cache->hits;
+		if ((cache->hits & 1023u) == 1u)
+			std::fprintf(stderr, "ACTIVITY_PROOF shader=%016llx hits=%llu misses=%llu entries=%zu\n",
+			             static_cast<unsigned long long>(plan.shader_hash),
+			             static_cast<unsigned long long>(cache->hits),
+			             static_cast<unsigned long long>(cache->misses), cache->entries.size());
+		return true;
+	}
+	++cache->misses;
+	return false;
+}
+
+// A conservative may-reach proof. It reads only the ORIGINAL walk's observations;
+// it never executes a walker, follows an inactive descriptor, or probes guest memory.
+struct ActivityCoverage {
+	std::vector<uint8_t> sources, images, reads;
+	std::vector<ActivityObservation> guards;
+};
+
+class GuardedActivityCoverage {
+public:
+	explicit GuardedActivityCoverage(const ResourcePlan& plan): m_plan(plan) {}
+	std::optional<ActivityCoverage> Run() {
+		if (m_plan.control_flow.empty() || m_plan.control_flow.size() > 128u ||
+		    m_plan.descriptor_sources.size() > 128u || m_plan.info.images.size() > 128u ||
+		    m_plan.srt_reads.size() > 512u) return {};
+		std::vector<uint8_t> reached(m_plan.control_flow.size(), 0u);
+		reached[0] = 1u;
+		for (uint32_t block = 0; block < reached.size(); ++block) {
+			if (!reached[block]) continue;
+			const auto& flow = m_plan.control_flow[block];
+			std::optional<uint32_t> condition;
+			if (flow.successors.size() == 2u) condition = Evaluate(flow.condition);
+			for (size_t edge = 0; edge < flow.successors.size(); ++edge) {
+				const auto next = flow.successors[edge];
+				if (next <= block || next >= reached.size()) return {};
+				if (!condition || flow.successors.size() != 2u || edge == (*condition != 0u ? 0u : 1u))
+					reached[next] = 1u;
+			}
+		}
+		if (m_invalid || m_result.guards.empty()) return {};
+		const auto required = [&](size_t count, const auto& lists, std::vector<uint8_t>& mask) {
+			mask.assign(count, 0u);
+			std::vector<uint8_t> listed(count, 0u);
+			for (size_t block = 0; block < reached.size(); ++block)
+				for (const auto item: lists(m_plan.control_flow[block])) {
+					if (item >= count) return false;
+					listed[item] = 1u;
+					mask[item] |= reached[block];
+				}
+			// Never infer deadness merely because a retained item has no block list.
+			for (size_t item = 0; item < count; ++item) if (!listed[item]) mask[item] = 1u;
+			return true;
+		};
+		if (!required(m_plan.descriptor_sources.size(), [](const auto& b) -> const auto& { return b.sources; }, m_result.sources) ||
+		    !required(m_plan.info.images.size(), [](const auto& b) -> const auto& { return b.images; }, m_result.images) ||
+		    !required(m_plan.srt_reads.size(), [](const auto& b) -> const auto& { return b.srt_reads; }, m_result.reads)) return {};
+		for (uint32_t source = 0; source < m_result.sources.size(); ++source)
+			if (m_result.sources[source] && !WalkedActive(m_plan, source)) return {};
+		for (uint32_t image = 0; image < m_result.images.size(); ++image)
+			if (m_result.images[image] && !WalkedImageActive(m_plan, image)) return {};
+		return std::move(m_result);
+	}
+private:
+	std::optional<uint32_t> AuxiliaryRead(const Inst& inst) {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		if (index == m_plan.activity_counter) return {}; // All possible future counter values.
+		if (index >= m_plan.memory_info.size() || inst.NumArgs() != 2u ||
+		    !inst.Arg(1).Resolve().IsImmediate() || inst.Arg(1).Resolve().GetType() != Type::U32) {
+			m_invalid = true; return {};
+		}
+		const auto& mem = m_plan.memory_info[index];
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (mem.kind != ResourceKind::ScalarBuffer || mem.planning_only || mem.data_bits != 32u ||
+		    mem.data_dwords != 1u || mem.resource >= m_plan.info.buffers.size() ||
+		    m_plan.info.buffers[mem.resource].written || handle == nullptr ||
+		    handle->GetOpcode() != ValueOpcode::GetBufferResource || handle->NumArgs() != 4u) {
+			m_invalid = true; return {};
+		}
+		std::unordered_set<const Inst*> visited;
+		for (uint32_t word = 0; word < 4u; ++word)
+			if (!ActivitySourceValue(m_plan, handle->Arg(word), visited)) { m_invalid = true; return {}; }
+		// A memory-index tag must identify exactly this retained read, not another context.
+		for (const auto& other: m_plan.value_storage)
+			if (&other != &inst && other.GetOpcode() == ValueOpcode::ReadConstBuffer &&
+			    other.Flags<MemoryFlags>().index == index) { m_invalid = true; return {}; }
+		const ActivityObservation* capture = nullptr;
+		for (const auto& observed: m_plan.activity_observations) {
+			if (observed.memory_index != index) continue;
+			if (capture != nullptr) { m_invalid = true; return {}; }
+			capture = &observed;
+		}
+		// Bounds-generated zero has no load observation. It needs a separate proof, not a guess.
+		if (capture == nullptr || m_result.guards.size() >= 16u) { m_invalid = true; return {}; }
+		m_result.guards.push_back(*capture);
+		return capture->value;
+	}
+	std::optional<uint32_t> Evaluate(Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::U1) return value.U1() ? 1u : 0u;
+			if (value.GetType() == Type::U32) return value.U32();
+			return {};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return {};
+		if (const auto found = m_values.find(inst); found != m_values.end()) return found->second;
+		if (m_values.size() >= 256u) { m_invalid = true; return {}; }
+		// Mark in progress as UNKNOWN: a cyclic/unsupported value cannot justify exclusion.
+		m_values.emplace(inst, std::nullopt);
+		std::optional<uint32_t> result;
+		const auto arg = [&](size_t i) { return i < inst->NumArgs() ? Evaluate(inst->Arg(i)) : std::optional<uint32_t>{}; };
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ReadConstBuffer: result = AuxiliaryRead(*inst); break;
+			case ValueOpcode::ConditionRef: result = arg(0); break;
+			case ValueOpcode::LogicalNot:
+				if (const auto a = arg(0)) result = *a == 0u ? 1u : 0u;
+				break;
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const bool conjunction = inst->GetOpcode() == ValueOpcode::LogicalAnd;
+				const auto a = arg(0);
+				if (a && ((*a == 0u) == conjunction)) { result = conjunction ? 0u : 1u; break; }
+				const auto b = arg(1);
+				if (b && ((*b == 0u) == conjunction)) result = conjunction ? 0u : 1u;
+				else if (a && b) result = conjunction ? 1u : 0u;
+				break;
+			}
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::ULessThanEqual32: {
+				const auto a = arg(0), b = arg(1);
+				if (a && b) {
+					switch (inst->GetOpcode()) {
+						case ValueOpcode::IEqual32: result = *a == *b; break;
+						case ValueOpcode::INotEqual32: result = *a != *b; break;
+						case ValueOpcode::ULessThan32: result = *a < *b; break;
+						default: result = *a <= *b; break;
+					}
+				}
+				break;
+			}
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32:
+				if (const auto choose = arg(0)) result = arg(*choose != 0u ? 1u : 2u);
+				break;
+			default: break; // SGPR-only decisions, Phi, varying values and raw reads stay UNKNOWN.
+		}
+		m_values[inst] = result;
+		return result;
+	}
+	const ResourcePlan& m_plan;
+	ActivityCoverage m_result;
+	std::unordered_map<const Inst*, std::optional<uint32_t>> m_values;
+	bool m_invalid = false;
+};
+
+void PrepareActivityCertificate(const ResourcePlan& plan, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot,
+                                const ResourceSpecialization& specialization) {
+	const auto note = [&](ActivityDiagnosticReason reason) { ActivityDiagnosticNote(plan.shader_hash, reason); };
+	if (!plan.capture_activity_reads) { note(ActivityDiagnosticReason::CaptureDisabled); return; }
+	if (!ActivityRuntime(runtime)) { note(ActivityDiagnosticReason::RuntimeUnavailable); return; }
+	if (snapshot.activity_cache) snapshot.activity_cache->pending.reset();
+	const auto counter = plan.activity_counter;
+	if (counter == UINT32_MAX || plan.activity_observations.empty() ||
+	    plan.activity_observations.size() > ActivityObservationLimit) { note(ActivityDiagnosticReason::ObservationsEmptyOrLarge); return; }
+	// Keep the original complete-joint proof first. The narrower route can exclude a retained
+	// item only when it is unreachable for EVERY counter value under strictly guarded aux data.
+	uint32_t first_inactive = UINT32_MAX;
+	for (uint32_t source = 0; source < plan.descriptor_sources.size(); ++source)
+		if (!WalkedActive(plan, source)) { first_inactive = source; break; }
+	bool images_joint = true;
+	for (uint32_t image = 0; image < plan.info.images.size(); ++image)
+		images_joint &= WalkedImageActive(plan, image);
+	std::optional<ActivityCoverage> coverage;
+	if (first_inactive != UINT32_MAX || !images_joint) {
+		coverage = GuardedActivityCoverage(plan).Run();
+		if (!coverage) {
+			if (first_inactive != UINT32_MAX) {
+				ActivityDiagnosticSourceFailure(plan, first_inactive);
+				note(ActivityDiagnosticReason::NoJointSource);
+			} else note(ActivityDiagnosticReason::NoJointImage);
+			return;
+		}
+	}
+	std::unordered_set<uint32_t> observed_indices;
+	for (const auto& read: plan.activity_observations) observed_indices.insert(read.memory_index);
+	if (!observed_indices.contains(counter)) { note(ActivityDiagnosticReason::CounterNotObserved); return; }
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); ++slot) {
+		if (coverage && !coverage->reads[slot]) continue;
+		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		if (inst == nullptr || !observed_indices.contains(inst->Flags<MemoryFlags>().index)) { note(ActivityDiagnosticReason::FlatReadNotObserved); return; }
+	}
+	std::optional<ActivityEpoch> guarded_epoch;
+	if (coverage) {
+		ActivityEpoch before, after;
+		if (!runtime.read_activity_epoch(runtime.userdata, before)) { note(ActivityDiagnosticReason::PrepareEpochUnavailable); return; }
+		for (const auto& guard: coverage->guards) {
+			uint32_t current = 0;
+			if (!runtime.read_activity_memory(runtime.userdata, guard.address, {&current, 1u})) {
+				note(ActivityDiagnosticReason::StrictSourceUnavailable); return;
+			}
+			if (current != guard.value) { note(ActivityDiagnosticReason::StrictSourceChanged); return; }
+		}
+		if (!runtime.read_activity_epoch(runtime.userdata, after) || after != before) {
+			note(ActivityDiagnosticReason::ProbeEpochChanged); return;
+		}
+		guarded_epoch = after;
+	}
+	// All host-required sources are flat immutable-address reads. The excluded counter cannot
+	// supply a descriptor, pointer, flattened shader constant, selector/table bound or fill.
+	static std::atomic<uint64_t> next_serial {1u};
+	if (plan.activity_serial == 0u) plan.activity_serial = next_serial.fetch_add(1u);
+	ActivityCertificate entry;
+	if (guarded_epoch) entry.materialization_epoch = *guarded_epoch;
+	else if (!runtime.read_activity_epoch(runtime.userdata, entry.materialization_epoch)) { note(ActivityDiagnosticReason::PrepareEpochUnavailable); return; }
+	entry.diagnostic_shader = plan.shader_hash;
+	entry.plan = plan.activity_serial;
+	entry.shader_base = runtime.shader_base;
+	entry.push_data_cursor = runtime.activity_push_data_cursor;
+	entry.snapshot = snapshot;
+	entry.snapshot.activity_cache.reset();
+	entry.specialization = specialization;
+	for (const auto& observed: plan.activity_observations)
+		if (observed.memory_index != counter) entry.observations.push_back(observed);
+	if (entry.observations.empty()) { note(ActivityDiagnosticReason::NoOtherObservations); return; }
+	if (!snapshot.activity_cache) snapshot.activity_cache = std::make_shared<ActivityCache>();
+	auto& cache = *snapshot.activity_cache;
+	cache.pending = std::move(entry);
+	note(ActivityDiagnosticReason::PendingReady);
+}
+
+} // namespace
+
+void DeriveActivityPlan(ResourcePlan& plan) {
+	// Preserve explicit capture requests used by deterministic tests. Native plans request this
+	// only through the process opt-in, and unsupported plans retain the ordinary 8-byte capture.
+	const bool requested = plan.capture_activity_reads || HostActivityProofEnabled();
+	plan.activity_counter = UINT32_MAX;
+	plan.capture_activity_reads = false;
+	// A rebuilt value graph must obtain a new joint native-prepare certificate before reuse.
+	plan.activity_serial = 0;
+	plan.activity_observations.clear();
+	if (!requested || !plan.srt_plan_complete || !plan.resource_tracking_complete) return;
+	if (const auto counter = ActivityCounter(plan)) {
+		plan.activity_counter = *counter;
+		plan.capture_activity_reads = true;
+	}
+}
+
+bool ConfirmPreparedActivity(const ResourceSnapshot& snapshot, const ActivityEpoch& epoch,
+                             uint64_t module,
+                             std::span<const std::pair<uint64_t, uint64_t>> targets) {
+	if (!snapshot.activity_cache || !snapshot.activity_cache->pending) return false;
+	const auto diagnostic_shader = snapshot.activity_cache->pending->diagnostic_shader;
+	if (epoch.context == 0u || module == 0u || targets.size() > 128u) {
+		ActivityDiagnosticNote(diagnostic_shader, ActivityDiagnosticReason::ConfirmInputInvalid); return false;
+	}
+	auto& cache = *snapshot.activity_cache;
+	const auto& input_epoch = cache.pending->materialization_epoch;
+	if (epoch.context != input_epoch.context || epoch.mapping != input_epoch.mapping ||
+	    epoch.protection != input_epoch.protection || epoch.configuration != input_epoch.configuration) {
+		ActivityDiagnosticNote(diagnostic_shader, ActivityDiagnosticReason::ConfirmInputEpochChanged);
+		ActivityDiagnosticEpoch(diagnostic_shader, input_epoch, epoch);
+		cache.pending.reset();
+		return false;
+	}
+	auto entry = std::move(*cache.pending);
+	cache.pending.reset();
+	entry.epoch = epoch;
+	entry.module = module;
+	entry.targets.assign(targets.begin(), targets.end());
+	std::erase_if(cache.entries, [&](const auto& old) {
+		return old.plan == entry.plan && old.shader_base == entry.shader_base &&
+		       old.push_data_cursor == entry.push_data_cursor &&
+		       old.snapshot.user_data == entry.snapshot.user_data;
+	});
+	if (cache.entries.size() == ActivityCertificateLimit) cache.entries.erase(cache.entries.begin());
+	cache.entries.push_back(std::move(entry));
+	ActivityDiagnosticNote(diagnostic_shader, ActivityDiagnosticReason::Confirmed);
+	return true;
+}
+
+uint64_t ActivitySnapshotReuseCount(const ResourceSnapshot& snapshot) {
+	return snapshot.activity_cache ? snapshot.activity_cache->hits : 0u;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	ActivityDiagnosticMaterialization diagnostic(program.shader_hash, program.capture_activity_reads && program.activity_counter != UINT32_MAX);
+	ReadbackAttribution::Scope attribution_scope(program.shader_hash, ReadbackAttribution::Phase::Materialize);
 #if defined(TRACY_ENABLE)
-	KYTY_PROFILER_BLOCK("MaterializeResources");
+	ZoneNamedN(attribution_zone, "MaterializeResources", tracy::ProfilerAvailable());
+	if (ReadbackAttribution::Enabled()) attribution_zone.Value(program.shader_hash);
 #endif
+	if (program.srt_plan_complete && program.resource_tracking_complete && program.source_reads.empty() &&
+	    ReuseActivitySnapshot(program, runtime, snapshot, specialization)) return true;
+	if (snapshot.activity_cache) snapshot.activity_cache->pending.reset();
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return MaterializeFail(__LINE__, program);
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1804,7 +2271,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) return false;
+	PrepareActivityCertificate(program, runtime, snapshot, specialization);
+	return true;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
@@ -2151,7 +2620,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys,
+	       activity_serial, activity_counter, capture_activity_reads, activity_observations] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

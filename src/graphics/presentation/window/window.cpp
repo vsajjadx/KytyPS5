@@ -25,6 +25,7 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -32,6 +33,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -200,7 +202,7 @@ static void GameEventTerminate(WindowLoopState& game) {
 }
 
 static void ToggleDesktopFullscreen() {
-	if (g_window == nullptr || g_window->window == nullptr) {
+	if (g_window == nullptr || g_window->window == nullptr || g_window->menu_test_background) {
 		return;
 	}
 
@@ -758,6 +760,77 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+namespace {
+
+struct MenuTestCommand {
+	uint64_t sequence = 0;
+	SDL_Keycode key = SDLK_UNKNOWN;
+	const char* name = nullptr;
+	bool legacy_cross = false;
+};
+
+MenuTestCommand ReadMenuTestCommand(const std::filesystem::path& path, bool legacy_cross) {
+	std::ifstream request(path, std::ios::binary);
+	char line[64] {};
+	if (!request.getline(line, sizeof(line))) return {};
+	const auto length = static_cast<size_t>(request.gcount()) - (request.eof() ? 0u : 1u);
+	if (request.peek() != std::char_traits<char>::eof()) return {}; // Exactly one bounded line.
+	std::string_view text(line, length);
+	const auto trim = [](std::string_view& value) {
+		while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r'))
+			value.remove_prefix(1);
+		while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r'))
+			value.remove_suffix(1);
+	};
+	trim(text);
+	uint64_t sequence = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), sequence);
+	if (error != std::errc {} || sequence == 0) return {};
+	if (end != text.data() + text.size() && *end != ' ' && *end != '\t' && *end != '\r') return {};
+	text.remove_prefix(static_cast<size_t>(end - text.data()));
+	trim(text);
+	if (legacy_cross) {
+		return text.empty() ? MenuTestCommand {sequence, SDLK_J, "Cross", true} : MenuTestCommand {};
+	}
+	static constexpr struct { std::string_view name; SDL_Keycode key; } keys[] = {
+	    {"Cross", SDLK_J}, {"Down", SDLK_DOWN}, {"Up", SDLK_UP},
+	    {"Left", SDLK_LEFT}, {"Right", SDLK_RIGHT}, {"Circle", SDLK_L}, {"Options", SDLK_RETURN},
+	};
+	for (const auto& key: keys) {
+		if (text == key.name) return {sequence, key.key, key.name.data(), false};
+	}
+	return {};
+}
+
+// One held key, released on normal exit and C++ exception unwinding as well as timeout.
+struct MenuTestPulse {
+	MenuTestCommand command;
+	uint64_t release_at = 0;
+	~MenuTestPulse() { Release(); }
+	void Start(MenuTestCommand next, uint64_t now) {
+		command = next; // Arm cleanup before the down call.
+		release_at = now + 300;
+		HostInputKey(command.key, true);
+		std::printf("MENU_TEST: %s pressed sequence=%llu key=%s hold_ms=300\n",
+		            command.legacy_cross ? "cross" : "action",
+		            static_cast<unsigned long long>(command.sequence), command.name);
+		std::fflush(stdout);
+	}
+	void Release() {
+		if (command.key == SDLK_UNKNOWN) return;
+		const auto previous = command;
+		command = {};
+		release_at = 0;
+		HostInputKey(previous.key, false);
+		std::printf("MENU_TEST: %s released sequence=%llu key=%s\n",
+		            previous.legacy_cross ? "cross" : "action",
+		            static_cast<unsigned long long>(previous.sequence), previous.name);
+		std::fflush(stdout);
+	}
+};
+
+} // namespace
+
 void WindowContext::Run() {
 	Common::Timer timer;
 
@@ -770,31 +843,41 @@ void WindowContext::Run() {
 	// Test-only in-process pad input. Each new sequence number requests one pulse;
 	// there is no timed repetition that could accidentally select a menu item.
 	const char* menu_test_dir = std::getenv("KYTY_MENU_TEST");
-	uint64_t cross_sequence = 0;
-	uint64_t cross_release = 0;
+	uint64_t menu_sequence = 0; // Shared by action.txt and the legacy cross.txt.
+	MenuTestPulse menu_pulse;
 	uint64_t command_poll = 0;
 
 	while (!loop.need_exit) {
 		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
 		if (menu_test_dir != nullptr && menu_test_dir[0] != '\0') {
-			if (cross_release != 0 && now >= cross_release) {
-				HostInputKey(SDLK_J, false);
-				cross_release = 0;
-				std::printf("MENU_TEST: cross released\n");
-				std::fflush(stdout);
+			if (menu_pulse.release_at != 0 && now >= menu_pulse.release_at) {
+				menu_pulse.Release();
+				command_poll = now + 100; // Let the guest observe a released state between pulses.
 			}
 			if (now >= command_poll) {
 				command_poll = now + 100;
-				std::ifstream request(std::filesystem::path(menu_test_dir) / "cross.txt");
-				uint64_t sequence = 0;
-				if ((request >> sequence) && sequence > cross_sequence && cross_release == 0) {
-					cross_sequence = sequence;
-					HostInputKey(SDLK_J, true);
-					cross_release = now + 300;
-					std::printf("MENU_TEST: cross pressed sequence=%llu\n",
-					            static_cast<unsigned long long>(sequence));
+				const auto folder = std::filesystem::path(menu_test_dir);
+				// A positive bounded sequence uses the same one-line parser as legacy cross requests.
+				// Quit takes priority over input and follows the ordinary SDL_QUIT save path.
+				const auto quit = ReadMenuTestCommand(folder / "quit.txt", true);
+				if (quit.sequence != 0) {
+					menu_pulse.Release();
+					std::printf("MENU_TEST: quit requested sequence=%llu\n",
+					            static_cast<unsigned long long>(quit.sequence));
 					std::fflush(stdout);
+					GameEventQuit(loop);
+					break;
+				}
+				if (menu_pulse.command.key == SDLK_UNKNOWN) {
+					auto command = ReadMenuTestCommand(folder / "cross.txt", true);
+					const auto action = ReadMenuTestCommand(folder / "action.txt", false);
+					// No queue: the newest valid request wins; action wins equal sequence numbers.
+					if (action.sequence >= command.sequence) command = action;
+					if (command.sequence > menu_sequence) {
+						menu_sequence = command.sequence;
+						menu_pulse.Start(command, now);
+					}
 				}
 			}
 		}
@@ -815,7 +898,6 @@ void WindowContext::Run() {
 		}
 		ProcessEvent(timer.GetTimeS());
 	}
-	if (cross_release != 0) HostInputKey(SDLK_J, false);
 }
 
 static void WindowCreate(WindowContext& context) {
@@ -838,7 +920,14 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	context.menu_test_background = WindowContext::MenuTestBackgroundEnabled(
+	    std::getenv("KYTY_MENU_TEST"), std::getenv("KYTY_MENU_TEST_BACKGROUND"));
+	uint32_t window_flags = WindowContext::InitialWindowFlags(
+	    Config::FullscreenEnabled(), context.menu_test_background);
+	if (context.menu_test_background) {
+		std::printf("MENU_TEST: background=hidden fullscreen=disabled quit_file=quit.txt\n");
+		std::fflush(stdout);
+	}
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
@@ -877,9 +966,16 @@ static void WindowCreate(WindowContext& context) {
 	context.UpdateIcon();
 }
 
-uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
+bool WindowContext::MenuTestBackgroundEnabled(const char* directory, const char* option) noexcept {
+	return directory != nullptr && directory[0] != '\0' &&
+	       option != nullptr && option[0] == '1' && option[1] == '\0';
+}
+
+uint32_t WindowContext::InitialWindowFlags(bool fullscreen, bool background) noexcept {
 	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (fullscreen) {
+	if (background) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	} else if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
 	return flags;

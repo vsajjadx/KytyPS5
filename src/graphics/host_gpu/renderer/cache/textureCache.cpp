@@ -209,12 +209,14 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	Image::ActivityChanged();
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	RegisterImage(id);
 	return id;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
+	Image::ActivityChanged();
 	auto& image = m_slot_images[id];
 	const auto& data  = image.info.data;
 	if (image.registered || data.Empty()) {
@@ -234,6 +236,7 @@ void TextureCache::RegisterImage(ImageId id) {
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
+	Image::ActivityChanged();
 	auto& image = m_slot_images[id];
 	image.HeapChanged();
 	UntrackImage(id);
@@ -1244,6 +1247,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	Image::ActivityChanged();
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -1360,6 +1364,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 }
 
 void TextureCache::UpdateImage(ImageId id) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1367,6 +1372,7 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
@@ -1398,6 +1404,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1434,6 +1441,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1448,6 +1456,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1484,6 +1493,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
@@ -1509,6 +1519,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
+	Image::ActivityChanged();
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
@@ -1886,6 +1897,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 8> targets;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { targets.push_back(id); });
@@ -2001,11 +2013,13 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
+	Image::ActivityChanged();
 	found->second.clear_mask.set();
 	return true;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
@@ -2015,17 +2029,26 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	return true;
 }
 
-bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size,
+                                      RegionOverlapDiagnostic* first) {
 	std::scoped_lock lock {m_lock};
 	bool             registered = false;
-	ForEachImageInRegion(address, size, [&](ImageId, Image&) {
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
 		registered = true;
+		if (first != nullptr) { // Capture-only copy; same single stop point as before.
+			first->valid      = true;
+			first->image_id   = id.index;
+			first->serial     = image.serial;
+			first->data_begin = image.info.data.address;
+			first->data_size  = image.info.data.size;
+		}
 		return true;
 	});
 	return registered;
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
@@ -2041,6 +2064,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	Image::ActivityChanged();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -2149,6 +2173,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	Image::ActivityChanged();
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;
 	}
@@ -2156,6 +2181,7 @@ void TextureCache::ProcessDownloadImages() {
 }
 
 bool TextureCache::WriteBackImages() {
+	Image::ActivityChanged();
 	return m_readback_storage_images && DownloadQueuedImages();
 }
 

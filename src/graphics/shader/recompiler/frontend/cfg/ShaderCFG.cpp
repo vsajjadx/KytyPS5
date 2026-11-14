@@ -65,7 +65,8 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_CBRANCH_EXECZ: return BranchCondition::ExecZero;
 		case Opcode::S_CBRANCH_EXECNZ: return BranchCondition::ExecNonZero;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
-		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
+		case Opcode::S_SUBVECTOR_LOOP_END:
+		case Opcode::S_CALL_SELECT_B64: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
 }
@@ -1611,7 +1612,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 	SortUnique(graph.code_table_load_pcs);
 
 	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
-		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
+		    return (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX) ||
+		           inst.opcode == Opcode::S_CALL_SELECT_B64;
 		})) {
 		// Linked leaf bodies follow the caller in native PC order. Visit them in
 		// execution order so returning to the caller does not manufacture goto loops.

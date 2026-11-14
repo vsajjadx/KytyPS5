@@ -131,6 +131,11 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+uint64_t               ProtectionGeneration() noexcept;
+uint64_t               MappingGeneration() noexcept;
+void                   NoteActivityMappingChange() noexcept;
+// Conservative activity-proof guard: reject another virtual view of the same managed backing.
+bool                   IsBackingUniquelyMapped(uint64_t vaddr, uint64_t size) noexcept;
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

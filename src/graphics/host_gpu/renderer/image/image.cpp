@@ -124,6 +124,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	ActivityChanged();
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {

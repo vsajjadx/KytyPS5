@@ -4,6 +4,7 @@
 #include "common/common.h"
 
 #include <magic_enum.hpp>
+#include <string>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -759,6 +760,15 @@ enum class Opcode {
 	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
+	// Linker-generated, never decoded: one closed-set candidate of a table-selected S_SWAPPC_B64.
+	// raw = {marker, target lo, target hi}; offset = the call's PC; branch_target = the callee copy.
+	S_CALL_SELECT_B64,
+	// Linker-generated, never decoded: the no-match path of a table call. Records an observable
+	// GPU callable fault (IR CallTableMiss) for the loaded pair in src0. raw = {marker, call pc, 0}.
+	S_CALL_TABLE_MISS_B64,
+	// Linker-generated, never decoded: first instruction of a table callee copy; writes the call's
+	// return address (offset = call pc) into dst, exactly as the replaced SWAPPC would.
+	S_CALL_ENTER_B64,
 	COUNT
 };
 
@@ -904,6 +914,24 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 Program DecodeFrontProgram(std::span<const uint32_t> front);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
+// While alive on this thread, malformed operands and unknown families are recorded here instead
+// of terminating the process (DecodeInstruction then returns a partially decoded instruction).
+// Only for untrusted, GPU-selected code that may fail a single dispatch.
+class SoftDecodeScope {
+public:
+	SoftDecodeScope();
+	~SoftDecodeScope();
+	SoftDecodeScope(const SoftDecodeScope&)            = delete;
+	SoftDecodeScope& operator=(const SoftDecodeScope&) = delete;
+	[[nodiscard]] bool               Failed() const noexcept { return !m_reason.empty(); }
+	[[nodiscard]] const std::string& Reason() const noexcept { return m_reason; }
+	// True (with the reason kept) when a soft scope is active on this thread.
+	static bool Record(std::string reason);
+
+private:
+	SoftDecodeScope* m_previous;
+	std::string      m_reason;
+};
 bool IsDirectBranch(Opcode opcode);
 bool IsDsWriteOpcode(Opcode opcode);
 

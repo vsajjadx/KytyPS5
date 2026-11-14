@@ -18,6 +18,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <atomic>
 #include <shared_mutex>
 #include <vector>
 
@@ -57,6 +58,17 @@ public:
 	// GPU thread only: reads `size` bytes of a protected page straight from guest backing when
 	// no pending GPU write or image write-back covers them, so no download or sync is needed.
 	[[nodiscard]] bool TryReadCpuCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept;
+	[[nodiscard]] bool TryReadActivityCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept;
+	[[nodiscard]] bool ReadActivityEpoch(ShaderRecompiler::IR::ActivityEpoch& epoch) const noexcept;
+	// Optional observational output from the ORIGINAL first failing guard. No resource reads.
+	struct ActivityTargetFailure {
+		enum class Reason : uint32_t { None, WrongThread, EmptyTargets, ZeroSize, GpuUnmapped, PhysicalNotUnique };
+		uint64_t index = UINT64_MAX, address = 0, size = 0;
+		Reason reason = Reason::None;
+	};
+	[[nodiscard]] bool ValidateActivityTargets(
+	    std::span<const std::pair<uint64_t, uint64_t>> targets,
+	    ActivityTargetFailure* failure = nullptr) const noexcept;
 	// GPU thread only. A dword the GPU keeps rewriting with the same value (buffer headers,
 	// sizes) is served from its last download for a few reads before it is downloaded again.
 	[[nodiscard]] bool TryPredictGpuRead(uint64_t vaddr, uint32_t& value) noexcept;
@@ -67,6 +79,8 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Schedules the next fault-buffer pass (BDA faults and table-call miss records).
+	void               RequestFaultProcess() noexcept { m_fault_process_pending = true; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -83,6 +97,7 @@ private:
 	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&           m_graphics;
+	const uint64_t            m_activity_context_id;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;

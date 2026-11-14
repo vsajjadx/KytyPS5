@@ -8,6 +8,8 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <memory>
+#include <utility>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,9 +37,26 @@ enum class ShaderType {
 
 struct ShaderModule;
 
+// Immutable, owned inputs of a table-selected shader call's closure proof for ONE dispatch,
+// captured at program bind and revalidated after native preparation (never a borrowed pointer).
+struct CallClosure {
+	struct Code {
+		uint64_t              address = 0;
+		std::vector<uint32_t> words; // exact linked callee words (the snapshot executed)
+	};
+	uint64_t                                   shader_hash           = 0;
+	uint64_t                                   source_revision       = 0;
+	uint64_t                                   mapping_generation    = 0;
+	uint64_t                                   protection_generation = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> table_ranges;
+	std::vector<Code>                          code;
+};
+
 struct ShaderStageRuntime {
 	const ShaderModule*                           module    = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
+	// Set only for programs with table-selected calls; validated before the guest dispatch.
+	std::shared_ptr<const CallClosure>            call_closure;
 
 	[[nodiscard]] explicit operator bool() const {
 		return module != nullptr && resources != nullptr;

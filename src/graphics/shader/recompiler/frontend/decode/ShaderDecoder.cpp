@@ -175,7 +175,8 @@ bool IsConditionalBranch(Opcode opcode) {
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
-		case Opcode::S_SUBVECTOR_LOOP_END: return true;
+		case Opcode::S_SUBVECTOR_LOOP_END:
+		case Opcode::S_CALL_SELECT_B64: return true;
 		default: return false;
 	}
 }
@@ -248,7 +249,9 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			if (SoftDecodeScope::Record(fmt::format("unsupported scalar source operand 0x{:08x}", code))) return;
+			EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
@@ -268,7 +271,9 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			if (SoftDecodeScope::Record(fmt::format("unsupported scalar destination operand 0x{:08x}", code))) return;
+			EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
@@ -362,8 +367,31 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
+			if (SoftDecodeScope::Record(fmt::format("unknown instruction family, raw=0x{:08x}", code[word_index]))) {
+				inst.opcode     = Opcode::UNSUPPORTED;
+				inst.word_count = 1;
+				return;
+			}
 			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
 	}
+}
+
+namespace {
+thread_local SoftDecodeScope* g_soft_decode = nullptr;
+} // namespace
+
+SoftDecodeScope::SoftDecodeScope(): m_previous(g_soft_decode) {
+	g_soft_decode = this;
+}
+
+SoftDecodeScope::~SoftDecodeScope() {
+	g_soft_decode = m_previous;
+}
+
+bool SoftDecodeScope::Record(std::string reason) {
+	if (g_soft_decode == nullptr) return false;
+	if (g_soft_decode->m_reason.empty()) g_soft_decode->m_reason = std::move(reason);
+	return true;
 }
 
 Program DecodeFrontProgram(std::span<const uint32_t> front) {

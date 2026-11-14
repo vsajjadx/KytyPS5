@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
@@ -15,10 +16,15 @@
 
 namespace Libs::Graphics {
 
+namespace {
+std::atomic<uint64_t> g_activity_contexts {1};
+}
+
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_activity_context_id(g_activity_contexts.fetch_add(1u)),
+      m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
+      m_pipeline_cache(graphics, &m_image_heap, shader_store, this), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
@@ -77,6 +83,49 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+	}
+	return true;
+}
+
+bool RenderContext::TryReadActivityCurrent(uint64_t vaddr, void* data, uint64_t size) noexcept {
+	// Never honor KYTY_STALE_WALKER or prediction in a binding-validity certificate.
+	if (!GuestGpu::IsGpuThread() || !IsMapped(vaddr, size) ||
+	    !LibKernel::Memory::IsBackingUniquelyMapped(vaddr, size) ||
+	    m_buffer_cache.IsRangeGpuWritten(vaddr, size) ||
+	    m_texture_cache.IsRegionRegistered(vaddr, size) ||
+	    m_texture_cache.WriteBackTick(vaddr, size) != 0u) return false;
+	return LibKernel::Memory::TryReadBacking(vaddr, data, size);
+}
+
+bool RenderContext::ReadActivityEpoch(ShaderRecompiler::IR::ActivityEpoch& epoch) const noexcept {
+	if (!GuestGpu::IsGpuThread() || !ShaderRecompiler::IR::HostActivityProofEnabled()) return false;
+	const auto protection = LibKernel::Memory::ProtectionGeneration();
+	const auto configuration = Config::Revision();
+	if (protection == 0u || configuration == 0u) return false;
+	epoch = {m_activity_context_id, LibKernel::Memory::MappingGeneration(), protection,
+	         m_buffer_cache.BindingEpoch(), Image::activity_epoch.load(), configuration};
+	return true;
+}
+
+bool RenderContext::ValidateActivityTargets(
+    std::span<const std::pair<uint64_t, uint64_t>> targets,
+    ActivityTargetFailure* failure) const noexcept {
+	using Reason = ActivityTargetFailure::Reason;
+	const auto reject = [&](Reason reason, uint64_t index = UINT64_MAX, uint64_t address = 0,
+	                        uint64_t size = 0) {
+		if (failure != nullptr) *failure = {index, address, size, reason};
+		return false;
+	};
+	// Preserve the original short-circuit order and exactly one evaluation of each guard.
+	if (!GuestGpu::IsGpuThread()) return reject(Reason::WrongThread);
+	if (targets.empty()) return reject(Reason::EmptyTargets);
+	uint64_t index = 0;
+	for (const auto [address, size]: targets) {
+		if (size == 0u) return reject(Reason::ZeroSize, index, address, size);
+		if (!IsMapped(address, size)) return reject(Reason::GpuUnmapped, index, address, size);
+		if (!LibKernel::Memory::IsBackingUniquelyMapped(address, size))
+			return reject(Reason::PhysicalNotUnique, index, address, size);
+		++index;
 	}
 	return true;
 }
@@ -221,6 +270,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	LibKernel::Memory::NoteActivityMappingChange();
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
@@ -246,6 +296,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		LibKernel::Memory::NoteActivityMappingChange();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

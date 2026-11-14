@@ -4,11 +4,25 @@
 #include "common/debugCounters.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 
 namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
+static std::atomic<uint64_t> g_revision {1};
+static std::atomic<uint32_t> g_loading {0};
+namespace {
+struct RevisionMutation {
+	RevisionMutation() { ++g_loading; ++g_revision; }
+	~RevisionMutation() { ++g_revision; --g_loading; }
+};
+}
+uint64_t Revision() {
+	if (g_loading.load() != 0u) return 0u;
+	const auto revision = g_revision.load();
+	return g_loading.load() == 0u ? revision : 0u;
+}
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
@@ -28,6 +42,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
+	RevisionMutation revision_mutation;
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 }

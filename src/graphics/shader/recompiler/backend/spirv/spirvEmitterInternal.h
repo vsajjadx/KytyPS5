@@ -171,6 +171,9 @@ struct EmitterState {
 
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
+// True when the program records table-call misses into the fault buffer trailer (defined in
+// spirvEmitterMemory.cpp; module setup binds the fault buffer for it).
+bool UsesCallTableMiss(const IR::Program& program);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);

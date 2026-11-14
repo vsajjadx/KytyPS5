@@ -256,7 +256,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || UsesCallTableMiss(state.program);
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -25,6 +26,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/ActivityDiagnostics.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
@@ -46,6 +48,41 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// A plain sampled view may resolve to an existing color-target owner retaining CMASK.
+// The REQUESTED descriptor has no metadata, so FindImage's MaterializeColorClear
+// returns before consuming CMASK bytes. Certify only this finite, exact owner shape;
+// normal discovery, refresh and final native rebinding still run on every dispatch.
+[[nodiscard]] bool IsPlainCmaskActivityOwner(
+    const ShaderRecompiler::IR::ImageResource& resource, const TextureBinding& binding,
+    const Image& image) {
+	const auto& requested = binding.desc.info;
+	const auto& native = image.info;
+	const auto& view = binding.desc.view_info;
+	const auto& meta = native.metadata.range;
+	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+	       resource.read && !resource.written && !resource.atomic && !resource.heap &&
+	       !resource.depth_compare && binding.desc.type == TextureCache::BindingType::Texture &&
+	       !binding.desc.heap && image.registered && image.usage.render_target &&
+	       !image.IsCpuDirty() && !image.IsBufferModified() &&
+	       native.metadata.kind == ImageMetadataKind::Cmask &&
+	       native.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !native.metadata.stencil_compressed && requested.metadata.kind == ImageMetadataKind::None &&
+	       requested.metadata.range.Empty() &&
+	       requested.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !requested.metadata.stencil_compressed &&
+	       native.data.Valid() && requested.data == native.data && meta.Valid() &&
+	       meta.address % 0x1000u == 0u && meta.size % 0x1000u == 0u &&
+	       (meta.End() <= native.data.address || native.data.End() <= meta.address) &&
+	       native.type == Prospero::ImageType::kColor2D && requested.type == native.type &&
+	       native.extent == requested.extent && native.samples == 1u && requested.samples == 1u &&
+	       image.backing.samples == 1u && native.resources.levels == 1u && native.resources.layers == 1u &&
+	       requested.resources.levels == 1u && requested.resources.layers == 1u &&
+	       native.pixel_format == requested.pixel_format && native.pixel_format == view.format &&
+	       native.pixel_format == image.backing.format && view.type == vk::ImageViewType::e2D &&
+	       view.aspect == vk::ImageAspectFlagBits::eColor && view.base_level == 0u &&
+	       view.level_count == 1u && view.base_layer == 0u && view.layer_count == 1u;
+}
 
 // Scalar resource reads are folded into the pipeline specialization when it is compiled, so a
 // write to the same guest range by the same dispatch could in principle leave stale constants
@@ -140,7 +177,8 @@ static bool kDisableNarrowWrites() {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    BufferCache::PreparedUpload& uploads) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -175,7 +213,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written && !narrow,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
-	    !resource.written);
+	    !resource.written, &uploads);
 	if (narrow && resource.fixed_write_end != 0u) {
 		// The full range above must retain its persistent owner: a streaming upload is
 		// read-only guest data and cannot receive writes that later readbacks must see.
@@ -793,12 +831,13 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
-static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
+static vk::DescriptorBufferInfo NativeUpload(RenderContext& context,
+                                             BufferCache::PreparedUpload& uploads,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
-	return {buffer.Handle(), offset, data.size_bytes()};
+	const auto [buffer, offset] = context.GetBufferCache().UploadPrepared(
+	    uploads, data.data(), data.size_bytes(), 256);
+	return {buffer->Handle(), offset, data.size_bytes()};
 }
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
@@ -825,6 +864,11 @@ void RenderExecutor::ResetBindings() {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
 	m_bound_images.clear();
+	// Commit retained the GPU tick. Discard old preparation references now so an
+	// inactive shader stage cannot keep upload chunks pinned indefinitely.
+	for (auto& stage: m_graphics_bindings.vertex) stage.uploads = {};
+	m_graphics_bindings.pixel.uploads = {};
+	m_compute_bindings.uploads = {};
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
@@ -833,6 +877,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
+	prepared.uploads = {};
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -926,9 +971,46 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
+void RenderExecutor::NoteRecordedWriters(std::span<PreparedBindings* const> stages) {
+	if (!ReadbackAttribution::Enabled()) return; // off: no collection, formatting or allocation
+	auto& cache = m_context.GetBufferCache();
+	// NoteRecordedWork only counts work; no submit happens between the native command and here,
+	// so this is the tick of the command buffer that holds it (not a submit/complete time).
+	const uint64_t tick     = m_context.GetCommandScheduler().CurrentTick();
+	const uint64_t sequence = cache.NextRecordedWorkSequence();
+	for (const auto* stage: stages) {
+		if (stage == nullptr || stage->runtime == nullptr) continue;
+		const auto& program = stage->runtime->module->info;
+		for (const auto& resource: program.info.buffers) {
+			const auto index = resource.descriptor_index;
+			if (!resource.written || index == UINT32_MAX || index >= stage->buffer_sources.size() ||
+			    index >= stage->buffers.size()) continue;
+			const auto& source = stage->buffer_sources[index];
+			const auto& native = stage->buffers[index];
+			if (source.address == 0 || source.size == 0 || !native.buffer) continue; // null: writes dropped
+			ReadbackAttribution::RecordedWriter writer;
+			writer.shader     = program.shader_hash;
+			writer.module     = stage->runtime->module->id; // already-final bound module identity
+			writer.stage      = static_cast<uint32_t>(program.stage);
+			writer.resource   = resource.source;
+			writer.descriptor = index;
+			writer.source_id  = source.id.index; // label only; never resolved
+			writer.begin      = source.address;
+			writer.size       = source.size;
+			const auto handle = static_cast<VkBuffer>(native.buffer);
+			static_assert(sizeof(handle) <= sizeof(writer.native_handle));
+			std::memcpy(&writer.native_handle, &handle, sizeof(handle));
+			writer.native_offset = native.offset;
+			writer.native_range  = native.range;
+			cache.NoteRecordedWriter(writer, sequence, tick);
+		}
+	}
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& program  = prepared.runtime->module->info;
+	ReadbackAttribution::Scope attribution_scope(program.shader_hash, ReadbackAttribution::Phase::Bindings);
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 
@@ -941,21 +1023,22 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[dword] |= offset << shift;
 	};
 	for (const auto& resource: program.info.buffers) {
+		ReadbackAttribution::Scope resource_scope(ReadbackAttribution::Resource(resource.source));
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		                                              resource, buffer_offset, prepared.uploads);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt = NativeUpload(m_context, prepared.uploads, snapshot.flattened_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		prepared.shader_data_buffer = NativeUpload(m_context, prepared.uploads, prepared.shader_data);
 	}
 }
 
@@ -1039,7 +1122,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto                           vk_buffer              = buffer.Handle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -1058,6 +1140,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
+	// Uploading image-heap slots can wrap the stream and restart command recording.
+	// Capture the native buffer only after that allocation-capable work is complete.
+	const auto vk_buffer = buffer.Handle();
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	size_t image_cursor = 0;
@@ -1217,6 +1302,234 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                             0, nullptr);
 		}
 	}
+	if (ShaderRecompiler::IR::HostActivityProofEnabled()) {
+		for (const auto* prepared: prepared_bindings) {
+			const auto& runtime = *prepared->runtime;
+			const auto& info = runtime.module->info;
+			const auto& snapshot = *runtime.resources;
+			using Reason = ShaderRecompiler::IR::ActivityDiagnosticReason;
+			const auto note = [&](Reason reason) { ShaderRecompiler::IR::ActivityDiagnosticNote(info.shader_hash, reason); };
+			if (info.stage != ShaderType::Compute || !snapshot.activity_cache ||
+			    info.info.uses_dma || info.info.uses_image_heap) { note(Reason::NativeNoCache); continue; }
+			std::vector<std::pair<uint64_t, uint64_t>> targets;
+			bool valid = snapshot.buffers.size() == info.info.buffers.size() &&
+			             snapshot.images.size() == info.info.images.size();
+			Reason invalid_reason = valid ? Reason::NativeBufferRejected : Reason::NativeLayoutRejected;
+			for (uint32_t index = 0; valid && index < info.info.buffers.size(); ++index) {
+				const auto& resource = info.info.buffers[index];
+				const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[index]);
+				static_assert(static_cast<uint32_t>(BufferCache::ActivityBindingFailure::Reason::Count)==ShaderRecompiler::IR::ActivityDiagnosticBindingReasonCount);
+				static_assert(static_cast<uint32_t>(BufferCache::ActivityBindingFailure::PreparedReason::Count)==ShaderRecompiler::IR::ActivityDiagnosticPreparedReasonCount);
+				const bool buffer_diag = ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash);
+				const auto note_buffer = [&](uint32_t reason,const BufferCache::ActivityBindingFailure* failure=nullptr) {
+					if(!buffer_diag)return;
+					ShaderRecompiler::IR::ActivityDiagnosticBufferMetadata m;
+					m.module=runtime.module->id;m.index=index;m.source=resource.source;m.descriptor_index=resource.descriptor_index;m.reason=reason;
+					m.descriptor_address=descriptor.Base48();m.descriptor_size=descriptor.GetSize();
+					m.resource_flags=(resource.written?1u:0u)|(resource.read?2u:0u)|(resource.scalar?4u:0u)|(resource.formatted?8u:0u);
+					m.prepared_sources=prepared->uploads.sources.size();m.prepared_buffers=prepared->uploads.buffers.size();
+					if(resource.descriptor_index<prepared->buffer_sources.size()){
+						const auto& s=prepared->buffer_sources[resource.descriptor_index];m.address=s.address;m.size=s.size;m.fields|=1u;
+					}
+					if(resource.descriptor_index<prepared->buffers.size()){
+						const auto& b=prepared->buffers[resource.descriptor_index];m.native_offset=b.offset;m.native_range=b.range;m.fields|=2u;
+						const auto handle=static_cast<VkBuffer>(b.buffer);static_assert(sizeof(handle)<=sizeof(m.native_handle));
+						std::memcpy(&m.native_handle,&handle,sizeof(handle));
+					}
+					if(failure){m.fields|=4u;m.binding_fields=failure->fields;m.prefix=failure->prefix;m.binding_reason=static_cast<uint32_t>(failure->reason);m.prepared_reason=static_cast<uint32_t>(failure->prepared_reason);
+						m.alignment=failure->alignment;m.owner_begin=failure->owner_begin;m.owner_size=failure->owner_size;
+						m.expected_offset=failure->expected_offset;m.expected_range=failure->expected_range;
+						m.footprint_begin=failure->footprint_begin;m.footprint_size=failure->footprint_size;m.prepared_offset=failure->prepared_offset;
+						const auto copy_overlap=[](ShaderRecompiler::IR::ActivityDiagnosticOverlapMetadata& o,const BufferCache::ActivityBindingFailure::ImageOverlap& x){
+							o.kind=x.kind;o.image_id=x.image_id;o.serial=x.serial;o.data_begin=x.data_begin;o.data_size=x.data_size;
+							o.query_begin=x.query_begin;o.query_size=x.query_size;o.relation=x.relation;o.overlap_class=x.overlap_class;
+						};
+						copy_overlap(m.prepared_overlap,failure->prepared_overlap);copy_overlap(m.persistent_overlap,failure->persistent_overlap);
+					}
+					ShaderRecompiler::IR::ActivityDiagnosticBufferFailure(info.shader_hash,m);
+				};
+				if (descriptor.NumRecords() == UINT32_MAX) { note_buffer(1); valid = false; break; }
+				if (descriptor.Base48() == 0u || descriptor.GetSize() == 0u) continue;
+				if (resource.descriptor_index == UINT32_MAX ||
+				    resource.descriptor_index >= prepared->buffer_sources.size()) { note_buffer(2); valid = false; break; }
+				const auto& source = prepared->buffer_sources[resource.descriptor_index];
+				if (source.address != descriptor.Base48()) { note_buffer(3); valid = false; break; }
+				if (source.size < descriptor.GetSize()) { note_buffer(4); valid = false; break; }
+				targets.emplace_back(source.address, source.size);
+				if (resource.descriptor_index >= prepared->buffers.size()) { note_buffer(5); valid = false; break; }
+				uint64_t owner_begin = 0, owner_size = 0;
+				BufferCache::ActivityBindingFailure binding_failure;
+				if (!m_context.GetBufferCache().BindingActivityRange(
+				        source.address, source.size, prepared->buffers[resource.descriptor_index],
+				        resource.written, owner_begin, owner_size, &prepared->uploads,
+				        buffer_diag ? &binding_failure : nullptr)) { note_buffer(6,&binding_failure); valid = false; break; }
+				targets.emplace_back(owner_begin, owner_size);
+			}
+			for (uint32_t index = 0; valid && index < info.info.images.size(); ++index) {
+				invalid_reason = Reason::NativeImageRejected;
+				const auto& resource = info.info.images[index];
+				const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[index]);
+				using ImageReason = ShaderRecompiler::IR::ActivityDiagnosticImageReason;
+				const auto note_image = [&](ImageReason reason, const Image* native = nullptr) {
+					if (!ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash)) return;
+					ShaderRecompiler::IR::ActivityDiagnosticNativeImageMetadata m;
+					m.reason = reason; m.module = runtime.module->id; m.index = index;
+					m.source = resource.source; m.descriptor_index = resource.descriptor_index;
+					m.first_use_pc = resource.first_use_pc;
+					m.resource_class = static_cast<uint32_t>(resource.resource_class);
+					m.resource_flags = (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
+					    (resource.heap ? 4u : 0u) | (resource.depth_compare ? 8u : 0u) |
+					    (resource.atomic ? 16u : 0u) | (resource.r128 ? 32u : 0u);
+					m.descriptor_flags = (descriptor.IsNull() ? 1u : 0u) | (descriptor.MipStatsCntEn() ? 2u : 0u);
+					if (index < prepared->images.size()) {
+						const auto& b = prepared->images[index];
+						m.native_id = b.image_id.index; m.binding_type = static_cast<uint32_t>(b.desc.type);
+						const auto raw_view = static_cast<VkImageView>(b.image_view);
+						static_assert(sizeof(raw_view) <= sizeof(m.view_handle));
+						std::memcpy(&m.view_handle, &raw_view, sizeof(raw_view));
+						m.requested_begin = b.desc.info.data.address; m.requested_size = b.desc.info.data.size;
+						m.requested_meta_begin = b.desc.info.metadata.range.address;
+						m.requested_meta_size = b.desc.info.metadata.range.size;
+						m.requested_stencil_begin = b.desc.info.stencil.address;
+						m.requested_stencil_size = b.desc.info.stencil.size;
+						m.requested_format = static_cast<uint32_t>(b.desc.info.pixel_format);
+						m.requested_metadata = static_cast<uint32_t>(b.desc.info.metadata.kind);
+						m.view_type = static_cast<uint32_t>(b.desc.view_info.type);
+						m.view_format = static_cast<uint32_t>(b.desc.view_info.format);
+						m.view_aspect = static_cast<uint32_t>(b.desc.view_info.aspect);
+						m.base_level = b.desc.view_info.base_level; m.level_count = b.desc.view_info.level_count;
+						m.base_layer = b.desc.view_info.base_layer; m.layer_count = b.desc.view_info.layer_count;
+						m.image_flags = (b.image_id ? 1u : 0u) | (b.image_view != nullptr ? 2u : 0u) |
+						    (b.desc.info.IsDepth() ? 4u : 0u) | (!b.desc.info.stencil.Empty() ? 8u : 0u);
+					}
+					if (native != nullptr) {
+						m.serial = native->serial;
+						m.native_begin = native->info.data.address; m.native_size = native->info.data.size;
+						m.native_meta_begin = native->info.metadata.range.address;
+						m.native_meta_size = native->info.metadata.range.size;
+						m.native_stencil_begin = native->info.stencil.address;
+						m.native_stencil_size = native->info.stencil.size;
+						m.native_format = static_cast<uint32_t>(native->info.pixel_format);
+						m.native_metadata = static_cast<uint32_t>(native->info.metadata.kind);
+						m.image_flags |= (native->registered ? 16u : 0u) | (native->info.IsDepth() ? 32u : 0u) |
+						    (native->depth_id ? 64u : 0u) | (!native->stencil_ids.empty() ? 128u : 0u) |
+						    (!native->info.stencil.Empty() ? 256u : 0u);
+					}
+					ShaderRecompiler::IR::ActivityDiagnosticNativeImageFailure(info.shader_hash, m);
+				};
+				if (resource.written || resource.heap || resource.depth_compare || descriptor.MipStatsCntEn()) {
+					if (ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash))
+						note_image(resource.written ? ImageReason::Written : resource.heap ? ImageReason::Heap :
+						           resource.depth_compare ? ImageReason::DepthCompare : ImageReason::MipStats);
+					valid = false; break;
+				}
+				if (descriptor.IsNull()) continue;
+				const auto& binding = prepared->images[index];
+				if (!binding.image_id || binding.image_view == nullptr) {
+					if (ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash))
+						note_image(!binding.image_id ? ImageReason::MissingImage : ImageReason::MissingView);
+					valid = false; break;
+				}
+				const auto& image = m_context.GetTextureCache().m_slot_images[binding.image_id];
+				const bool plain_cmask_owner = IsPlainCmaskActivityOwner(resource, binding, image);
+				// Keep DCC/HTile, metadata-bearing requests, depth/stencil and heaps excluded.
+				if (!image.registered || image.info.IsDepth() || binding.desc.info.IsDepth() ||
+				    image.depth_id || !image.stencil_ids.empty() ||
+				    (image.info.metadata.kind != ImageMetadataKind::None && !plain_cmask_owner) ||
+				    binding.desc.info.metadata.kind != ImageMetadataKind::None ||
+				    !image.info.stencil.Empty() || !binding.desc.info.stencil.Empty()) {
+					if (ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash))
+						note_image(!image.registered ? ImageReason::Unregistered :
+					           image.info.IsDepth() ? ImageReason::NativeDepth :
+					           binding.desc.info.IsDepth() ? ImageReason::RequestedDepth :
+					           image.depth_id ? ImageReason::DepthAssociation :
+					           !image.stencil_ids.empty() ? ImageReason::StencilAssociation :
+					           image.info.metadata.kind != ImageMetadataKind::None ? ImageReason::NativeMetadata :
+					           binding.desc.info.metadata.kind != ImageMetadataKind::None ? ImageReason::RequestedMetadata :
+					           !image.info.stencil.Empty() ? ImageReason::NativeStencilRange :
+					           ImageReason::RequestedStencilRange, &image);
+					valid = false; break;
+				}
+				targets.emplace_back(binding.desc.info.data.address, binding.desc.info.data.size);
+				targets.emplace_back(image.info.data.address, image.info.data.size);
+				if (plain_cmask_owner) {
+					// Include the FULL owner metadata range in mapped/physical-uniqueness checks
+					// now and on reuse. Its content is never cached or interpreted by this proof.
+					targets.emplace_back(image.info.metadata.range.address, image.info.metadata.range.size);
+				}
+			}
+			ShaderRecompiler::IR::ActivityEpoch epoch, after;
+			if (!valid) { note(invalid_reason); continue; }
+			if (!m_context.ReadActivityEpoch(epoch)) { note(Reason::NativeEpochUnavailable); continue; }
+			const bool target_diag = ShaderRecompiler::IR::ActivityDiagnosticsEnabled(info.shader_hash);
+			RenderContext::ActivityTargetFailure target_failure;
+			if (!m_context.ValidateActivityTargets(targets, target_diag ? &target_failure : nullptr)) {
+				if (target_diag) {
+					using TargetReason = ShaderRecompiler::IR::ActivityDiagnosticTargetReason;
+					using Category = ShaderRecompiler::IR::ActivityDiagnosticTargetCategory;
+					ShaderRecompiler::IR::ActivityDiagnosticNativeTargetMetadata metadata;
+					metadata.module = runtime.module->id; metadata.target_index = target_failure.index;
+					metadata.address = target_failure.address; metadata.size = target_failure.size;
+					switch (target_failure.reason) {
+					case RenderContext::ActivityTargetFailure::Reason::WrongThread: metadata.reason = TargetReason::WrongThread; break;
+					case RenderContext::ActivityTargetFailure::Reason::EmptyTargets: metadata.reason = TargetReason::EmptyTargets; break;
+					case RenderContext::ActivityTargetFailure::Reason::ZeroSize: metadata.reason = TargetReason::ZeroSize; break;
+					case RenderContext::ActivityTargetFailure::Reason::GpuUnmapped: metadata.reason = TargetReason::GpuUnmapped; break;
+					case RenderContext::ActivityTargetFailure::Reason::PhysicalNotUnique: metadata.reason = TargetReason::PhysicalNotUnique; break;
+					default: break;
+					}
+					if (metadata.target_index < targets.size()) {
+						// Reconstruct ONLY the append order from already validated prepared metadata.
+						// No mapping/uniqueness recheck, binding-owner requery, raw memory read or helper probe.
+						uint64_t cursor = 0;
+						for (uint32_t i = 0; i < info.info.buffers.size(); ++i) {
+							const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+							if (descriptor.Base48() == 0u || descriptor.GetSize() == 0u) continue;
+							if (metadata.target_index == cursor || metadata.target_index == cursor + 1u) {
+								metadata.category = metadata.target_index == cursor ? Category::RequestedBuffer : Category::OwnerBuffer;
+								metadata.resource_index = i; metadata.source = info.info.buffers[i].source;
+								metadata.descriptor_index = info.info.buffers[i].descriptor_index;
+								break;
+							}
+							cursor += 2u;
+						}
+						if (metadata.category == Category::Unknown) {
+							for (uint32_t i = 0; i < info.info.images.size(); ++i) {
+								const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+								if (descriptor.IsNull()) continue;
+								const auto& binding = prepared->images[i];
+								const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+								if (image == nullptr) break; // Unknown category is explicit; never invent an owner.
+								// Earlier valid guard admits native metadata ONLY through plain-CMASK owner.
+								const bool cmask = image->info.metadata.kind == ImageMetadataKind::Cmask;
+								const uint64_t added = cmask ? 3u : 2u;
+								if (cursor <= metadata.target_index && metadata.target_index - cursor < added) {
+									const auto offset = metadata.target_index - cursor;
+									metadata.category = offset == 0u ? Category::RequestedImage :
+									                    offset == 1u ? Category::NativeImage : Category::NativeCmask;
+									metadata.resource_index = i; metadata.source = info.info.images[i].source;
+									metadata.descriptor_index = info.info.images[i].descriptor_index;
+									break;
+								}
+								cursor += added;
+							}
+						}
+					}
+					ShaderRecompiler::IR::ActivityDiagnosticNativeTargetFailure(info.shader_hash, metadata);
+				}
+				note(Reason::NativeTargetsRejected); continue;
+			}
+			if (!m_context.ReadActivityEpoch(after)) { note(Reason::NativeEpochUnavailable); continue; }
+			if (after != epoch) { note(Reason::NativeEpochChanged); ShaderRecompiler::IR::ActivityDiagnosticEpoch(info.shader_hash, epoch, after); continue; }
+			if (!ShaderRecompiler::IR::ConfirmPreparedActivity(snapshot, epoch, runtime.module->id, targets)) note(Reason::NativeConfirmRejected);
+		}
+	}
+	// All allocation-capable discovery has finished. The following draw/dispatch uses
+	// this current command tick; also keep the preparation's own references until reuse.
+	for (const auto* prepared: prepared_bindings) {
+		m_context.GetBufferCache().RetainPreparedUploads(prepared->uploads);
+	}
+
 }
 
 } // namespace Libs::Graphics

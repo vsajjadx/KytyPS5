@@ -74,6 +74,9 @@ static uint64_t                 g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY
 static uint64_t                 g_cpu_table_memory     = INCLUDED_TABLE_MEMORY;
 static uint64_t                 g_gpu_table_memory     = INCLUDED_TABLE_MEMORY;
 static Graphics::RenderContext* g_gpu_resources        = nullptr;
+static std::atomic<uint64_t> g_activity_mapping {1};
+uint64_t MappingGeneration() noexcept { return g_activity_mapping.load(); }
+void NoteActivityMappingChange() noexcept { ++g_activity_mapping; }
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
 #endif
@@ -88,6 +91,8 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+	// Also invalidate for a CPU-only physical alias, before GPU-range filtering.
+	NoteActivityMappingChange();
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
 #endif
@@ -98,6 +103,8 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+	// Also invalidate for a CPU-only physical alias, before GPU-range filtering.
+	NoteActivityMappingChange();
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
 #endif
@@ -798,6 +805,52 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+}
+
+namespace {
+std::atomic<uint64_t> g_activity_protection {1};
+std::atomic<uint32_t> g_activity_protecting {0};
+struct ActivityProtectionMutation {
+	ActivityProtectionMutation() { ++g_activity_protecting; ++g_activity_protection; }
+	~ActivityProtectionMutation() { ++g_activity_protection; --g_activity_protecting; }
+};
+}
+uint64_t ProtectionGeneration() noexcept {
+	if (g_activity_protecting.load() != 0u) return 0u;
+	const auto generation = g_activity_protection.load();
+	return g_activity_protecting.load() == 0u ? generation : 0u;
+}
+
+bool IsBackingUniquelyMapped(uint64_t vaddr, uint64_t size) noexcept {
+	if (vaddr == 0u || size == 0u || size > UINT64_MAX - vaddr) return false;
+	std::shared_lock state(g_memory_state_mutex);
+	if (g_virtual_ranges == nullptr || g_physical_memory == nullptr) return false;
+	VirtualRanges::Range range;
+	if (!g_virtual_ranges->Query(vaddr, 0, &range) || vaddr < range.start ||
+	    vaddr - range.start >= range.size || size > range.size - (vaddr - range.start)) return false;
+	if (range.type == VirtualRangeType::Direct) {
+		const auto& mappings = g_physical_memory->GetMappings();
+		auto owner = mappings.upper_bound(vaddr);
+		if (owner == mappings.begin()) return false;
+		--owner;
+		const auto offset = vaddr - owner->first;
+		if (offset >= owner->second.size || size > owner->second.size - offset ||
+		    offset > UINT64_MAX - owner->second.start_addr) return false;
+		const auto physical = owner->second.start_addr + offset;
+		if (size > UINT64_MAX - physical) return false;
+		for (const auto& [other_vaddr, other]: mappings) {
+			if (other_vaddr == owner->first) continue;
+			// Physical mappings are bounded by the managed direct-memory allocation.
+			if (other.start_addr < physical + size && physical < other.start_addr + other.size)
+				return false;
+		}
+		return true;
+	}
+	// Flexible backing occupies its own disjoint allocator range. Pooled physical blocks
+	// cannot be mapped with CanMapDirect; runtime/code/stack Commit has private ownership.
+	return range.type == VirtualRangeType::Flexible || range.type == VirtualRangeType::Pooled ||
+	       range.type == VirtualRangeType::Runtime || range.type == VirtualRangeType::Code ||
+	       range.type == VirtualRangeType::Stack;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -2811,6 +2864,7 @@ void ReleaseFlexibleMemory(uint64_t size) {
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	ActivityProtectionMutation activity_protection_mutation;
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	const auto ranges = RequireGuestRuntimeMemory(vaddr, size);
@@ -2846,6 +2900,7 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMe
 
 bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
                         VirtualMemory::Mode* old_mode) {
+	ActivityProtectionMutation activity_protection_mutation;
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	constexpr uint64_t                    GuestPageSize = 0x4000;
 	const auto page_offset = vaddr & (GuestPageSize - 1u);
@@ -2895,6 +2950,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int ProtectMemory(const void* addr, size_t len, int prot) {
+	ActivityProtectionMutation activity_protection_mutation;
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"

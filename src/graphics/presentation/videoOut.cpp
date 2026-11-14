@@ -29,6 +29,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -193,6 +195,7 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	bool                                pacing_diag_flip_pending = true; // Diagnostic only, guarded by mutex.
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	uint64_t                            pre_vblanks = 0;
 	uint64_t                            flip_vblank = 0; // vblank_status.count at the last flip.
@@ -482,6 +485,30 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// Opt-in, bounded pacing evidence. The caller already holds the port mutex.
+static bool PacingDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PACING_DIAG");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+static void PacingDiagLogLocked(const char* event, const VideoOutConfig& cfg, int old_rate) {
+	const auto& buses = VideoOutDriver::Impl::VIDEO_OUT_BUSES;
+	const auto bus = std::find(buses.begin(), buses.end(), cfg.bus);
+	const int handle = bus == buses.end() ? -1 : static_cast<int>(bus - buses.begin()) + 1;
+	std::printf("PACING_DIAG event=%s handle=%d port=%p master_port=%p generation=%llu bus=%d "
+	            "old_rate=%d requested_rate=%d interval_vblanks=%d vblank_hz=%u "
+	            "flip_count=%llu vblank_count=%llu\n",
+	            event, handle, static_cast<const void*>(&cfg), static_cast<const void*>(cfg.master),
+	            static_cast<unsigned long long>(cfg.generation), cfg.bus, old_rate,
+	            cfg.flip_rate, cfg.flip_rate + 1, Config::GetVblankFrequency(),
+	            static_cast<unsigned long long>(cfg.flip_status.count),
+	            static_cast<unsigned long long>(cfg.vblank_status.count));
+	std::fflush(stdout);
+}
+
 // A flip is due once flip_rate + 1 vblanks have passed since the last flip, so a late frame flips
 // at the next vblank.
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
@@ -664,6 +691,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.currentBuffer = -1;
 	config.pre_vblanks               = 0;
 	config.flip_vblank               = 0;
+	config.pacing_diag_flip_pending  = true;
 	config.vblank_status             = VideoOutVblankStatus();
 
 	return handle;
@@ -1154,6 +1182,10 @@ bool FlipQueue::Flip() {
 		auto& r = *it;
 		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
+		if (PacingDiagEnabled() && r.index >= 0 && r.cfg->pacing_diag_flip_pending) {
+			PacingDiagLogLocked("first_active_flip", *r.cfg, r.cfg->flip_rate);
+			r.cfg->pacing_diag_flip_pending = false;
+		}
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1255,7 +1287,12 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
+	const int old_rate = ctx->flip_rate;
 	ctx->flip_rate = rate;
+	if (PacingDiagEnabled() && old_rate != rate) {
+		ctx->pacing_diag_flip_pending = true;
+		PacingDiagLogLocked("accepted_rate_change", *ctx, old_rate);
+	}
 
 	return OK;
 }

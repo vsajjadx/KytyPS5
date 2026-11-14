@@ -17,11 +17,15 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
+
+#include <fmt/format.h>
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -377,8 +381,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	const auto& program   = input_info.stage.module->info;
+	ReadbackAttribution::Scope attribution_scope(program.shader_hash, ReadbackAttribution::Phase::Compute);
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty() &&
+	// Table-call programs never take the meta-clear/fill shortcuts (they always carry source
+	// reads; stated explicitly so the closure validation below cannot be bypassed).
+	if (resources.specialization_reads.empty() && !input_info.stage.call_closure &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
@@ -399,6 +406,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		// frame rather than suspending the render thread.
 		return;
 	}
+	BufferCache::PreparedUploadScope upload_scope(m_context.GetBufferCache());
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -418,10 +426,26 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	// Preparation above may already have recorded host housekeeping (clears/transfers/uploads);
+	// what is guaranteed is that no guest dispatch of an unproven table-call program is recorded.
+	CallClosureCheck call_check;
+	if (input_info.stage.call_closure &&
+	    !ValidatePreparedCallClosure(input_info.stage, bindings, call_check, false)) {
+		ResetBindings();
+		return;
+	}
 
-	const auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
+	// CommitBindings may restart recording (e.g. stream wrap); re-prove the closure, including the
+	// same native owners, before the guest dispatch is recorded. Committed descriptors without a
+	// dispatch are harmless.
+	if (input_info.stage.call_closure &&
+	    !ValidatePreparedCallClosure(input_info.stage, bindings, call_check, true)) {
+		ResetBindings();
+		return;
+	}
+	const auto vk_buffer = buffer.Handle();
 	if (GpuRingRuntime(input_info.stage)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} else if (HasStorageWrites(input_info, bindings)) {
@@ -530,6 +554,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
+	NoteRecordedWriters(std::span {&descriptor_stage, 1u}); // diagnostic; no-op unless KYTY_READBACK_ATTRIBUTION
 	m_context.GetCommandScheduler().NoteWorkTiming(input_info.stage.module->info.shader_hash &
 	                                               ~(1ull << 63u));
 	if (const char* want = std::getenv("KYTY_DUMP_HASH");
@@ -572,12 +597,14 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	ReadbackAttribution::Scope attribution_scope(input_info.stage.module->info.shader_hash, ReadbackAttribution::Phase::Compute);
 	buffer.EndRendering();
 	auto* pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	if (pipeline == nullptr) {
 		// Same as above: async creation pending; skip this dispatch.
 		return;
 	}
+	BufferCache::PreparedUploadScope upload_scope(m_context.GetBufferCache());
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -598,8 +625,19 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	CallClosureCheck call_check;
+	if (input_info.stage.call_closure &&
+	    !ValidatePreparedCallClosure(input_info.stage, bindings, call_check, false)) {
+		ResetBindings();
+		return;
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *pipeline,
 	               std::span {&descriptor_stage, 1u});
+	if (input_info.stage.call_closure &&
+	    !ValidatePreparedCallClosure(input_info.stage, bindings, call_check, true)) {
+		ResetBindings();
+		return;
+	}
 	const auto vk_buffer = buffer.Handle();
 	if (GpuRingRuntime(input_info.stage)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -622,6 +660,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
+	NoteRecordedWriters(std::span {&descriptor_stage, 1u}); // diagnostic; no-op unless KYTY_READBACK_ATTRIBUTION
 	m_context.GetCommandScheduler().NoteWorkTiming(input_info.stage.module->info.shader_hash &
 	                                               ~(1ull << 63u));
 	if (const char* want = std::getenv("KYTY_DUMP_HASH");
@@ -639,6 +678,113 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	ResetBindings();
+}
+
+bool RenderExecutor::ValidatePreparedCallClosure(const ShaderStageRuntime& stage,
+                                                 const PreparedBindings&   bindings,
+                                                 CallClosureCheck&         check,
+                                                 bool                      after_commit) {
+	const auto image_count = stage.module->info.info.images.size();
+	if (!after_commit) {
+		check.closure = stage.call_closure.get();
+		check.owner_serials.assign(image_count, 0u);
+		check.views.assign(image_count, nullptr);
+	}
+	const auto& closure = *stage.call_closure;
+	const auto& info    = stage.module->info.info;
+	const auto  fail    = [&](const std::string& reason) {
+		m_context.GetPipelineCache().NoteCallFailure(closure.shader_hash, "prepared closure: " + reason);
+		return false;
+	};
+	// Preparation must not have changed what the bind-time proof relied on. Checked at entry AND
+	// again at the end of every pass, so no mapping/protection change can fall inside the window
+	// of this pass's reads.
+	const auto memory_unchanged = [&] {
+		return closure.protection_generation != 0u &&
+		       LibKernel::Memory::MappingGeneration() == closure.mapping_generation &&
+		       LibKernel::Memory::ProtectionGeneration() == closure.protection_generation;
+	};
+	if (!memory_unchanged()) return fail("guest mapping or protection changed since the call was linked");
+	if (after_commit && (check.closure != &closure || check.owner_serials.size() != image_count ||
+	                     check.views.size() != image_count)) {
+		return fail("call closure identity changed during commit");
+	}
+	for (const auto [address, size]: closure.table_ranges) {
+		if (!LibKernel::Memory::IsBackingUniquelyMapped(address, size)) {
+			return fail(fmt::format("call table 0x{:x}+{} has another physical mapping", address, size));
+		}
+	}
+	for (const auto& code: closure.code) {
+		const uint64_t bytes = code.words.size() * sizeof(uint32_t);
+		if (!LibKernel::Memory::IsBackingUniquelyMapped(code.address, bytes)) {
+			return fail(fmt::format("callee code 0x{:x}+{} has another physical mapping", code.address, bytes));
+		}
+		// Strict currentness without synchronization: mapped, uniquely backed, no GPU-written
+		// buffer bytes, no registered image and no pending image write-back over the code
+		// (RenderContext::TryReadActivityCurrent); then exactly the linked words.
+		std::vector<uint32_t> current(code.words.size());
+		if (!m_context.TryReadActivityCurrent(code.address, current.data(), bytes) ||
+		    current != code.words) {
+			return fail(fmt::format("callee code 0x{:x}+{} changed since it was linked", code.address, bytes));
+		}
+	}
+	const auto overlaps_code = [&](const GuestRange& range) -> const CallClosure::Code* {
+		for (const auto& code: closure.code) {
+			const uint64_t bytes = code.words.size() * sizeof(uint32_t);
+			if (range.address < code.address + bytes && code.address < range.address + range.size) return &code;
+		}
+		return nullptr;
+	};
+	if (info.uses_image_heap) return fail("image heap bindings cannot be proven disjoint from callee code");
+	auto& textures = m_context.GetTextureCache();
+	for (size_t index = 0; index < info.images.size(); ++index) {
+		const auto& resource = info.images[index];
+		if (!resource.written) continue;
+		if (index >= stage.resources->images.size() || index >= bindings.images.size()) {
+			return fail(fmt::format("written image {} has no prepared binding", index));
+		}
+		if (DecodeNativeDescriptor<ShaderTextureResource>(stage.resources->images[index]).IsNull()) continue;
+		if (resource.heap || resource.depth_compare) {
+			return fail(fmt::format("written image {} is a heap or depth image", index));
+		}
+		const auto& binding = bindings.images[index];
+		const auto* owner   = binding.image_id ? textures.m_slot_images.try_get(binding.image_id) : nullptr;
+		if (owner == nullptr || !owner->registered || binding.image_view == nullptr) {
+			return fail(fmt::format("written image {} has no registered native owner", index));
+		}
+		// Same native owner object and committed view before and after CommitBindings (serials
+		// are never reused).
+		if (!after_commit) {
+			check.owner_serials[index] = owner->serial;
+			check.views[index]         = binding.image_view;
+		} else if (check.owner_serials[index] != owner->serial || check.views[index] != binding.image_view) {
+			return fail(fmt::format("written image {} changed native owner or view during commit", index));
+		}
+		// Ordinary color only: no depth/stencil planes or associations, no DCC/HTile metadata.
+		if (owner->depth_id || !owner->stencil_ids.empty() || owner->info.IsDepth() ||
+		    owner->info.HasStencil() || owner->info.HasMetadata() || binding.desc.info.IsDepth() ||
+		    binding.desc.info.HasStencil() || binding.desc.info.HasMetadata()) {
+			return fail(fmt::format("written image {} is not an ordinary color image", index));
+		}
+		// The requested range, the final native owner's full backing (all mips/layers) and the
+		// owner's CPU-tracked range.
+		std::vector<GuestRange> ranges {binding.desc.info.data, owner->info.data};
+		if (owner->IsTracked()) {
+			if (owner->track_addr_end <= owner->track_addr) {
+				return fail(fmt::format("written image {} has an inverted tracked range", index));
+			}
+			ranges.push_back({owner->track_addr, owner->track_addr_end - owner->track_addr});
+		}
+		for (const auto& range: ranges) {
+			if (!range.Valid()) return fail(fmt::format("written image {} has an invalid guest range", index));
+			if (const auto* code = overlaps_code(range)) {
+				return fail(fmt::format("written image {} (0x{:x}+{}) overlaps callee code 0x{:x}", index,
+				                        range.address, range.size, code->address));
+			}
+		}
+	}
+	if (!memory_unchanged()) return fail("guest mapping or protection changed during closure validation");
+	return true;
 }
 
 } // namespace Libs::Graphics

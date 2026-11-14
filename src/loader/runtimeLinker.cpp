@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -724,6 +725,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		uint32_t before = 0;
 		const bool have_before = walker_read && Libs::LibKernel::Memory::TryReadBacking(
 		                                            info->access_violation_vaddr, &before, 4);
+		const uint32_t attribution_fault_size =
+		    Libs::Graphics::ReadbackAttribution::Enabled() && access == GpuAccess::Read &&
+		    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0 ? 4u : 0u;
+		Libs::Graphics::ReadbackAttribution::Scope attribution_fault(
+		    Libs::Graphics::ReadbackAttribution::Fault(info->exception_address, info->access_violation_vaddr,
+		                                            attribution_fault_size));
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			if (access == GpuAccess::Read) SysFaultDiag(info->native_context, info->access_violation_vaddr);
 			if (access == GpuAccess::Read &&

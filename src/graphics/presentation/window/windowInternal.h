@@ -37,7 +37,8 @@ struct WindowContext {
 	[[nodiscard]] static vk::PhysicalDeviceVulkan11Features RequiredVulkan11Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
-	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
+	[[nodiscard]] static bool MenuTestBackgroundEnabled(const char* directory, const char* option) noexcept;
+	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen, bool background = false) noexcept;
 	void                                                    CreateVulkan();
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
@@ -51,6 +52,7 @@ struct WindowContext {
 
 	GraphicContext                 graphic_ctx;
 	SDL_Window*                    window        = nullptr;
+	bool                           menu_test_background = false;
 	vk::SurfaceKHR                 surface       = nullptr;
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;

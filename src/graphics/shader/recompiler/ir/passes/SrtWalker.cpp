@@ -1,4 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/readbackAttribution.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -27,6 +29,10 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
+	// The observation wrapper owns this cookie; renderer activity hooks must fail closed.
+	runtime.read_activity_memory = nullptr;
+	runtime.read_activity_epoch = nullptr;
+	runtime.validate_activity_targets = nullptr;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? Read : nullptr;
 	return runtime;
@@ -466,10 +472,12 @@ private:
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
 	void NoteLoadSite(const Node& node) {
-		if (std::getenv("KYTY_WALKER_DIAG") == nullptr) return;
+		if (std::getenv("KYTY_WALKER_DIAG") == nullptr && !ReadbackAttribution::Enabled()) return;
 		const auto& inst = *node.inst;
 		const auto& mem  = m_plan.memory_info[inst.Flags<MemoryFlags>().index];
-		std::string desc = std::string(ValueOpcodeName(inst.GetOpcode())) + " kind=" +
+		std::string desc = "pc=" + std::to_string(inst.Flags<MemoryFlags>().pc) + " index=" +
+		                   std::to_string(inst.Flags<MemoryFlags>().index) + " op=" +
+		                   std::string(ValueOpcodeName(inst.GetOpcode())) + " kind=" +
 		                   std::to_string(static_cast<int>(mem.kind)) + " off=" +
 		                   std::to_string(mem.offset) + " shader=" + std::to_string(m_plan.shader_hash) +
 		                   " uses=" + DescribeUses(inst, 7);
@@ -1015,7 +1023,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		c.add(c.r8, 8);
+		if (m_plan.capture_activity_reads) {
+			c.mov(c.dword[c.r8 + 8], c.eax);
+			c.mov(c.dword[c.r8 + 12], inst.Flags<MemoryFlags>().index);
+		}
+		c.add(c.r8, m_plan.capture_activity_reads ? 16 : 8);
 		Store(node);
 	}
 	c.L(zero);
@@ -1405,13 +1417,17 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
+	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures * (m_plan.capture_activity_reads ? 2u : 1u), 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
 	if (!m_load_sites.empty()) {
 		std::scoped_lock lock {WalkerLoadInfoMutex()};
 		for (auto& [offset, desc]: m_load_sites) {
+			if (ReadbackAttribution::Enabled()) {
+				std::fprintf(stderr, "RBASITE hostpc=%016llx %s\n",
+				             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(c.getCode() + offset)), desc.c_str());
+			}
 			WalkerLoadInfo()[c.getCode() + offset] = std::move(desc);
 		}
 	}
@@ -1420,14 +1436,17 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	DeriveActivityPlan(plan);
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+	ReadbackAttribution::Scope attribution_scope(plan.shader_hash, ReadbackAttribution::Phase::WalkSrt);
 #if defined(TRACY_ENABLE)
-	KYTY_PROFILER_BLOCK("WalkSrt");
+	ZoneNamedN(attribution_zone, "WalkSrt", tracy::ProfilerAvailable());
+	if (ReadbackAttribution::Enabled()) attribution_zone.Value(plan.shader_hash);
 #endif
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
@@ -1437,9 +1456,14 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
-	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
-			reads->emplace_back(*read, sizeof(uint32_t));
+	plan.activity_observations.clear();
+	for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end;
+	     read += plan.capture_activity_reads ? 2u : 1u) {
+		if (reads != nullptr) reads->emplace_back(*read, sizeof(uint32_t));
+		if (plan.capture_activity_reads) {
+			plan.activity_observations.push_back({read[0], static_cast<uint32_t>(read[1]),
+			                                     static_cast<uint32_t>(read[1] >> 32u)});
+		}
 	}
 	return true;
 }

@@ -605,10 +605,11 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
 	if (decoded.has_swap_pc) {
-		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
+		// Leaf returns are resolved CFG edges; saved return addresses must not escape into GPU
+		// data. Caller S_GETPC data pointers keep GetShaderBase, exactly as in call-free shaders.
 		for (const auto* block: ir.blocks)
 			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::CallReturnAddress);
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;

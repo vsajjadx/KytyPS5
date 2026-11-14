@@ -902,9 +902,10 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	prepared.type =
 	    source.guest_element_size == 4 ? vk::IndexType::eUint32 : vk::IndexType::eUint16;
 	if (source.host_data != nullptr) {
-		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		prepared.offset = stream.Copy(source.host_data, source.size, 16);
-		prepared.buffer = stream.Handle();
+		const auto [upload, offset] = buffer.GetContext().GetBufferCache().UploadPrepared(
+		    source.host_data, source.size, 16);
+		prepared.offset = offset;
+		prepared.buffer = upload->Handle();
 	} else {
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
@@ -1047,6 +1048,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
+	BufferCache::PreparedUploadScope upload_scope(m_context.GetBufferCache());
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
@@ -1154,10 +1156,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    .max_instances  = limits.maxMeshWorkGroupCount[1],
 		    .max_total      = limits.maxMeshWorkGroupTotalCount,
 		};
-		auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		task_params  = stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
+		const auto [upload, offset] = m_context.GetBufferCache().UploadPrepared(
+		    &params, sizeof(params), 8);
+		task_params = upload->BufferDeviceAddress() + offset;
 	}
 
+	// Image-heap slot uploads can also restart the scheduler. Commit them before capturing
+	// the native buffer or recording vertex/index bindings and the remaining draw state.
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
@@ -1165,7 +1171,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1236,6 +1241,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	m_context.GetCommandScheduler().NoteRecordedWork();
+	NoteRecordedWriters(stages); // diagnostic; no-op unless KYTY_READBACK_ATTRIBUTION
 	m_context.GetCommandScheduler().NoteWorkTiming(
 	    (1ull << 63u) | ((state.ps_active ? state.ps_input_info.stage.module->info.shader_hash
 	                                      : state.vertex_info[0].stage.module->info.shader_hash) &

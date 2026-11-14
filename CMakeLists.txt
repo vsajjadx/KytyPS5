@@ -490,7 +490,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -700,6 +700,8 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME table_selected_call COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-call-only)
+	add_test(NAME table_call_resource_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-call-resource-failure-only)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -714,6 +716,13 @@ if(BUILD_TESTING)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME legacy_value_opcode_wire COMMAND $<TARGET_FILE:resource_materialization_tests> --legacy-opcodes-only)
+	add_test(NAME host_activity_capture_eligibility
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --activity-eligibility-only)
+	set_tests_properties(host_activity_capture_eligibility PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+	add_test(NAME host_activity_proof
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --activity-proof-only)
+	set_tests_properties(host_activity_proof PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -771,6 +780,53 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME flush_draws_split
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flush-split-only)
+	add_test(NAME command_restart_bindings
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --command-restart-bindings-only)
+	add_test(NAME command_restart_draw
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --command-restart-draw-only)
+	add_test(NAME command_restart_compute
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --command-restart-compute-only)
+	add_test(NAME attachment_split
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --attachment-split-only)
+	add_test(NAME prepared_stream_lifetime
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prepared-stream-lifetime-only)
+	add_test(NAME flush_draws_split_graphics
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flush-split-graphics-only)
+	add_test(NAME menu_test_background
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --menu-test-background-only)
+	add_test(NAME activity_clear_meta_epoch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-clear-meta-epoch-only)
+	add_test(NAME activity_guarded_profile
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --activity-guarded-profile-only)
+	set_tests_properties(activity_guarded_profile PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+	add_test(NAME activity_guarded_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-guarded-native-only)
+	set_tests_properties(activity_guarded_native PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+	add_test(NAME activity_guarded_native_original
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-guarded-native-original-only)
+	set_tests_properties(activity_guarded_native_original PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=0")
+	set_tests_properties(activity_clear_meta_epoch PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+add_test(NAME activity_cmask_native
+    COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-cmask-native-only)
+set_tests_properties(activity_cmask_native PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+add_test(NAME activity_cmask_native_original
+    COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-cmask-native-original-only)
+set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=0")
+
+	add_test(NAME activity_binding_footprint_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-binding-footprint-native-only)
+	set_tests_properties(activity_binding_footprint_native PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+	add_test(NAME activity_binding_footprint_native_original
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-binding-footprint-native-original-only)
+	set_tests_properties(activity_binding_footprint_native_original PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=0")
+	add_test(NAME activity_proof_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-proof-native-only)
+	set_tests_properties(activity_proof_native PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
+	add_test(NAME activity_proof_native_original
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --activity-proof-native-original-only)
+	set_tests_properties(activity_proof_native_original PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=0")
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
 	add_test(NAME video_out_flip_rate
@@ -814,6 +870,12 @@ if(BUILD_TESTING)
 		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
 	add_test(NAME buffer_readback_window_invalid
 		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=2048junk
+		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
+	add_test(NAME buffer_readback_window_128
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=128
+		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
+	add_test(NAME buffer_readback_window_128_invalid
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_DOWNLOAD_WINDOW_KIB=128junk
 		$<TARGET_FILE:shader_recompiler_compute_tests> --readback-window-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)

@@ -128,6 +128,7 @@ struct ConfigOptions {
 };
 
 void Load(const ConfigOptions& cfg);
+uint64_t Revision();
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();

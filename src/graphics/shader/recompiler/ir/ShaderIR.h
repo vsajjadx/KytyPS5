@@ -726,6 +726,11 @@ struct ResourcePlan {
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	mutable uint64_t activity_serial = 0;
+	// Derived at walker compilation; immutable graph eligibility is never re-walked per dispatch.
+	uint32_t activity_counter = UINT32_MAX;
+	bool capture_activity_reads = false;
+	mutable std::vector<ActivityObservation> activity_observations;
 };
 
 struct Program: ResourcePlan {

@@ -1,3 +1,4 @@
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -12,6 +13,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/causalDiagnosticsRuntime.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -270,6 +273,20 @@ static void BackGpuRing(RenderContext& context, const ShaderStageRuntime& stage,
 	context.GetBufferCache().PrepareBdaRange(found->second.address, found->second.size);
 }
 
+// Recognized traversals trace the mirror of the TLAS whose header address the shader loads from
+// scalar data.
+static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& stage,
+                            PreparedBindings& bindings) {
+	const auto& program = stage.module->info;
+	const auto  dword   = program.bindings.ray_query_dword;
+	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
+	const auto& flat       = stage.resources->flattened_srt;
+	const auto [low, high] = program.info.ray_query_tlas;
+	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
+	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.module->info.bindings.descriptor_counts[
@@ -409,6 +426,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BufferCache::PreparedUploadScope upload_scope(m_context.GetBufferCache());
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (!PrepareCallData(bindings)) {
+		ResetBindings();
+		return;
+	}
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
@@ -420,6 +441,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
@@ -445,6 +467,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		ResetBindings();
 		return;
 	}
+	WritePreparedCallData(bindings, call_check, buffer);
 	const auto vk_buffer = buffer.Handle();
 	if (GpuRingRuntime(input_info.stage)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -607,6 +630,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	BufferCache::PreparedUploadScope upload_scope(m_context.GetBufferCache());
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (!PrepareCallData(bindings)) {
+		ResetBindings();
+		return;
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	BackAddressBases(m_context, input_info.stage);
 	BackGpuRing(m_context, input_info.stage, cs_regs);
@@ -615,11 +642,25 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
+	// Indirect arguments may use a private read-only upload; do not admit a second
+	// view of captured call data through that path.
+	if (input_info.stage.call_closure &&
+	    std::ranges::any_of(input_info.stage.call_closure->data, [&](const auto& data) {
+		    const uint64_t bytes = data.words.size() * sizeof(uint32_t);
+		    return args_addr < data.address + bytes &&
+		           data.address < args_addr + sizeof(vk::DispatchIndirectCommand);
+	    })) {
+		m_context.GetPipelineCache().NoteCallFailure(program.shader_hash,
+		    "indirect arguments overlap captured call data");
+		ResetBindings();
+		return;
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
@@ -638,6 +679,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ResetBindings();
 		return;
 	}
+	WritePreparedCallData(bindings, call_check, buffer);
 	const auto vk_buffer = buffer.Handle();
 	if (GpuRingRuntime(input_info.stage)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -657,10 +699,40 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+	auto* indirect_observer = m_context.GetBufferCache().IndirectArgsObserver();
+	const bool observe_arguments = indirect_observer != nullptr &&
+	                               indirect_observer->Matches(program.shader_hash);
+	if (observe_arguments) {
+		indirect_observer->CopyBeforeDispatch(vk_buffer, *args_buffer, args_offset,
+		                                      args_addr, program.shader_hash);
+	}
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	uint64_t ledger_causal_dispatch_sequence = 0;
+	if (CausalDiagnostics::Enabled() &&
+	    (indirect_observer != nullptr ? observe_arguments
+	                                  : program.shader_hash == 0x1a04c58a9fbc2052ull)) {
+		auto& scheduler = m_context.GetCommandScheduler();
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::TargetDispatchIndirectRecorded,
+		                                     CausalDiagnostics::Domain(&scheduler.GetMasterSemaphore()),
+		                                     0, scheduler.CurrentTick());
+		record.data[0] = input_info.stage.module->info.shader_hash;
+		record.data[1] = args_offset; // native indirect-buffer byte offset, not a guest read
+		record.data[2] = scheduler.CausalLifetimeSequence();
+		const auto recorded = CausalDiagnostics::RecordEvent(
+		    CausalDiagnostics::Family::Native, record, false, true);
+		ledger_causal_dispatch_sequence = recorded.parent.sequence;
+		if (observe_arguments) indirect_observer->NoteRecordedDispatch(record, recorded);
+	}
+	const auto ledger_position = IndirectArgsLedger::RecordingPosition(
+	    m_context.GetCommandScheduler(), vk_buffer);
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		ledger->Consumer(args_addr, args_buffer->LedgerSpan(args_offset, 12), ledger_position,
+		    {program.shader_hash, input_info.stage.module->id, static_cast<uint32_t>(program.stage)},
+		    ledger_causal_dispatch_sequence);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
-	NoteRecordedWriters(std::span {&descriptor_stage, 1u}); // diagnostic; no-op unless KYTY_READBACK_ATTRIBUTION
+	NoteRecordedWriters(std::span {&descriptor_stage, 1u}, &ledger_position);
 	m_context.GetCommandScheduler().NoteWorkTiming(input_info.stage.module->info.shader_hash &
 	                                               ~(1ull << 63u));
 	if (const char* want = std::getenv("KYTY_DUMP_HASH");
@@ -680,25 +752,110 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	ResetBindings();
 }
 
+bool RenderExecutor::PrepareCallData(PreparedBindings& bindings) {
+	bindings.call_data_sources.clear();
+	if (bindings.runtime->call_closure == nullptr) return true;
+	const auto& closure = *bindings.runtime->call_closure;
+	const auto fail = [&](const char* reason) {
+		m_context.GetPipelineCache().NoteCallFailure(closure.shader_hash, reason);
+		return false;
+	};
+	if (!closure.data.empty() && bindings.runtime->module->info.bindings.ray_query_dword !=
+	                                 ShaderRecompiler::IR::PushData::NoStart) {
+		// A native acceleration structure is another representation of guest bytes.
+		// Canonical SSBO/BDA copies do not update it, and its input spans are not proven
+		// disjoint here. Refuse only this combination, before PrepareRayQuery builds it.
+		return fail("captured call data with native ray queries requires acceleration-structure input disjointness");
+	}
+	// The linker publishes a globally coalesced snapshot, not one table copy per callee.
+	// Recheck its contract before any GPU allocation; malformed ranges fail closed.
+	constexpr uint64_t MaxBytes = 8u * 1024u * 1024u;
+	constexpr size_t MaxRanges = 16384u;
+	if (closure.data.size() > MaxRanges) return fail("captured call data has too many ranges");
+	uint64_t total = 0, previous_end = 0;
+	for (const auto& data: closure.data) {
+		if (data.words.empty() || data.words.size() > MaxBytes / sizeof(uint32_t)) {
+			return fail("captured call data has an empty or oversized range");
+		}
+		const uint64_t bytes = data.words.size() * sizeof(uint32_t);
+		if ((data.address & 3u) != 0u || data.address == 0 ||
+		    !GuestRange {data.address, bytes}.Valid() || data.address < previous_end ||
+		    bytes > MaxBytes - total) {
+			return fail("captured call data is not a bounded, ordered, disjoint snapshot");
+		}
+		total += bytes;
+		previous_end = data.address + bytes;
+	}
+	auto& cache = m_context.GetBufferCache();
+	bindings.call_data_sources.reserve(closure.data.size());
+	for (const auto& data: closure.data) {
+		const uint64_t bytes = data.words.size() * sizeof(uint32_t);
+		// All owner discovery/staging happens before CommitBindings may restart recording.
+		cache.PrepareBdaRange(data.address, bytes);
+		const auto [buffer, offset] = cache.UploadPrepared(
+		    bindings.uploads, data.words.data(), bytes, sizeof(uint32_t));
+		bindings.call_data_sources.emplace_back(buffer->Handle(), offset, bytes);
+	}
+	return true;
+}
+
+void RenderExecutor::WritePreparedCallData(const PreparedBindings& bindings,
+                                           const CallClosureCheck& check,
+                                           CommandBuffer& command) {
+	if (check.data_owners.empty()) return;
+	// No owner lookup, upload allocation, submission or guest-memory read may occur here.
+	// CommitBindings already retained each immutable source through this consumer tick.
+	const auto native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0, nullptr);
+	for (size_t index = 0; index < check.data_owners.size(); ++index) {
+		const auto& source = bindings.call_data_sources[index];
+		const auto& owner = check.data_owners[index];
+		const vk::BufferCopy copy {source.offset, owner.offset, owner.range};
+		native.copyBuffer(source.buffer, owner.buffer, 1, &copy);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, owner.range);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eComputeShader, {}, 1, &after, 0, nullptr, 0, nullptr);
+}
+
 bool RenderExecutor::ValidatePreparedCallClosure(const ShaderStageRuntime& stage,
                                                  const PreparedBindings&   bindings,
                                                  CallClosureCheck&         check,
                                                  bool                      after_commit) {
-	const auto image_count = stage.module->info.info.images.size();
-	if (!after_commit) {
-		check.closure = stage.call_closure.get();
-		check.owner_serials.assign(image_count, 0u);
-		check.views.assign(image_count, nullptr);
-	}
 	const auto& closure = *stage.call_closure;
 	const auto& info    = stage.module->info.info;
-	const auto  fail    = [&](const std::string& reason) {
+	const auto image_count = info.images.size();
+	const auto fail = [&](const std::string& reason) {
 		m_context.GetPipelineCache().NoteCallFailure(closure.shader_hash, "prepared closure: " + reason);
 		return false;
 	};
-	// Preparation must not have changed what the bind-time proof relied on. Checked at entry AND
-	// again at the end of every pass, so no mapping/protection change can fall inside the window
-	// of this pass's reads.
+	if (!after_commit) {
+		check.closure = &closure;
+		check.owner_serials.assign(image_count, 0u);
+		check.views.assign(image_count, nullptr);
+		check.data_owners.resize(closure.data.size());
+		check.data_sources = bindings.call_data_sources;
+		size_t max_words = 0;
+		for (const auto* ranges: {&closure.code, &closure.data}) {
+			for (const auto& range: *ranges) {
+				// Linked raw leaves already have a 65536-DWORD cap; data has an 8 MiB
+				// aggregate cap. Keep this allocation bounded even for malformed metadata.
+				if (range.words.size() > (8u * 1024u * 1024u) / sizeof(uint32_t)) {
+					return fail("immutable call snapshot exceeds the currentness scratch budget");
+				}
+				max_words = std::max(max_words, range.words.size());
+			}
+		}
+		check.current_words.resize(max_words);
+	}
+	// Mapping/protection mutations cannot fall inside either validation window.
 	const auto memory_unchanged = [&] {
 		return closure.protection_generation != 0u &&
 		       LibKernel::Memory::MappingGeneration() == closure.mapping_generation &&
@@ -706,36 +863,146 @@ bool RenderExecutor::ValidatePreparedCallClosure(const ShaderStageRuntime& stage
 	};
 	if (!memory_unchanged()) return fail("guest mapping or protection changed since the call was linked");
 	if (after_commit && (check.closure != &closure || check.owner_serials.size() != image_count ||
-	                     check.views.size() != image_count)) {
+	                     check.views.size() != image_count || check.data_owners.size() != closure.data.size() ||
+	                     check.data_sources != bindings.call_data_sources)) {
 		return fail("call closure identity changed during commit");
+	}
+	if (bindings.call_data_sources.size() != closure.data.size()) {
+		return fail("captured data has no immutable prepared upload");
+	}
+	const auto overlaps_closure = [&](const GuestRange& range) -> const CallClosure::Code* {
+		for (const auto* ranges: {&closure.code, &closure.data}) {
+			for (const auto& bytes: *ranges) {
+				const uint64_t size = bytes.words.size() * sizeof(uint32_t);
+				if (range.address < bytes.address + size &&
+				    bytes.address < range.address + range.size) return &bytes;
+			}
+		}
+		return nullptr;
+	};
+	auto& cache = m_context.GetBufferCache();
+	const auto alignment = m_context.GetGraphics().StorageMinAlignment();
+	for (const auto& resource: info.buffers) {
+		const auto index = resource.descriptor_index;
+		if (index == UINT32_MAX) {
+			if (resource.written) return fail("written buffer has no bounded native descriptor");
+			continue;
+		}
+		if (index >= bindings.buffer_sources.size() || index >= bindings.buffers.size()) {
+			return fail("buffer has no prepared native binding");
+		}
+		const auto& source = bindings.buffer_sources[index];
+		if (source.address == 0 || source.size == 0) continue; // null: stores are dropped
+		if (!GuestRange {source.address, source.size}.Valid()) return fail("buffer has an invalid prepared range");
+		const bool reads_data = std::ranges::any_of(closure.data, [&](const auto& data) {
+			const uint64_t bytes = data.words.size() * sizeof(uint32_t);
+			return source.address < data.address + bytes && data.address < source.address + source.size;
+		});
+		if (!resource.written && !reads_data) continue;
+		vk::DescriptorBufferInfo canonical;
+		if (alignment == 0 || !cache.CanonicalBinding(source.address, source.size, canonical)) {
+			return fail(fmt::format("buffer {} has no canonical native owner", index));
+		}
+		const auto aligned = Common::AlignDown(canonical.offset, alignment);
+		const auto prefix = canonical.offset - aligned;
+		const vk::DescriptorBufferInfo expected {canonical.buffer, aligned, source.size + prefix};
+		if (prefix > source.address || prefix > UINT64_MAX - source.size ||
+		    bindings.buffers[index] != expected) {
+			return fail(fmt::format("buffer {} is not the prepared canonical native view", index));
+		}
+		if (resource.written) {
+			// Use the actual prepared view, including its alignment prefix, not GetSize().
+			// In particular raw OOB_SELECT=2 accesses can extend beyond NumRecords.
+			const GuestRange written {source.address - prefix, source.size + prefix};
+			if (const auto* bytes = overlaps_closure(written)) {
+				return fail(fmt::format("written buffer {} (0x{:x}+{}) overlaps immutable call bytes 0x{:x}",
+				                        index, written.address, written.size, bytes->address));
+			}
+		}
 	}
 	for (const auto [address, size]: closure.table_ranges) {
 		if (!LibKernel::Memory::IsBackingUniquelyMapped(address, size)) {
 			return fail(fmt::format("call table 0x{:x}+{} has another physical mapping", address, size));
 		}
 	}
-	for (const auto& code: closure.code) {
-		const uint64_t bytes = code.words.size() * sizeof(uint32_t);
-		if (!LibKernel::Memory::IsBackingUniquelyMapped(code.address, bytes)) {
-			return fail(fmt::format("callee code 0x{:x}+{} has another physical mapping", code.address, bytes));
-		}
-		// Strict currentness without synchronization: mapped, uniquely backed, no GPU-written
-		// buffer bytes, no registered image and no pending image write-back over the code
-		// (RenderContext::TryReadActivityCurrent); then exactly the linked words.
-		std::vector<uint32_t> current(code.words.size());
-		if (!m_context.TryReadActivityCurrent(code.address, current.data(), bytes) ||
-		    current != code.words) {
-			return fail(fmt::format("callee code 0x{:x}+{} changed since it was linked", code.address, bytes));
+	for (const auto* ranges: {&closure.code, &closure.data}) {
+		for (const auto& bytes: *ranges) {
+			const uint64_t size = bytes.words.size() * sizeof(uint32_t);
+			if (bytes.words.empty() || !GuestRange {bytes.address, size}.Valid() ||
+			    bytes.words.size() > check.current_words.size() ||
+			    !LibKernel::Memory::IsBackingUniquelyMapped(bytes.address, size)) {
+				return fail(fmt::format("immutable call bytes 0x{:x}+{} have invalid or aliased backing", bytes.address, size));
+			}
+			// Reject preceding GPU writes and image backing; this never synchronizes stale CPU
+			// bytes. Equal CPU bytes alone are insufficient, hence the ordered data copy below.
+			if (!m_context.TryReadActivityCurrent(bytes.address, check.current_words.data(), size) ||
+			    !std::equal(bytes.words.begin(), bytes.words.end(), check.current_words.begin())) {
+				return fail(fmt::format("immutable call bytes 0x{:x}+{} changed since linking", bytes.address, size));
+			}
 		}
 	}
-	const auto overlaps_code = [&](const GuestRange& range) -> const CallClosure::Code* {
-		for (const auto& code: closure.code) {
-			const uint64_t bytes = code.words.size() * sizeof(uint32_t);
-			if (range.address < code.address + bytes && code.address < range.address + range.size) return &code;
+	for (size_t index = 0; index < closure.data.size(); ++index) {
+		const auto& data = closure.data[index];
+		const uint64_t size = data.words.size() * sizeof(uint32_t);
+		const auto& source = bindings.call_data_sources[index];
+		const auto staging = std::ranges::find_if(bindings.uploads.buffers, [&](const auto& buffer) {
+			return buffer && buffer->Handle() == source.buffer;
+		});
+		if (staging == bindings.uploads.buffers.end() || source.range != size ||
+		    (source.offset & 3u) != 0 || source.offset > (*staging)->Size() ||
+		    size > (*staging)->Size() - source.offset) {
+			return fail("captured data staging is not owned through the consumer tick");
 		}
-		return nullptr;
-	};
-	if (info.uses_image_heap) return fail("image heap bindings cannot be proven disjoint from callee code");
+		vk::DescriptorBufferInfo owner;
+		if (!cache.CanonicalBinding(data.address, size, owner)) {
+			return fail("captured data lost its canonical native owner");
+		}
+		if (!after_commit) check.data_owners[index] = owner;
+		else if (check.data_owners[index] != owner) {
+			return fail("captured data changed native owner during commit");
+		}
+	}
+	const bool heap_resources = std::ranges::any_of(info.images, &ShaderRecompiler::IR::ImageResource::heap);
+	if (heap_resources != info.uses_image_heap ||
+	    (after_commit && heap_resources != (check.image_heap.draw != 0u))) {
+		return fail("image heap usage changed or is inconsistent with its closure proof");
+	}
+	if (heap_resources) {
+		if (!after_commit) {
+			// Code/data and runtime call tables must be disjoint from derived heap inputs.
+			// Legacy call tables can still be written by the guest: these ranges do not become
+			// byte snapshots or canonical uploads. Coalesce intervals once for binary lookup.
+			check.heap_input_guards.clear();
+			for (const auto* ranges: {&closure.code, &closure.data}) {
+				for (const auto& bytes: *ranges) {
+					check.heap_input_guards.push_back({bytes.address, bytes.words.size() * sizeof(uint32_t)});
+				}
+			}
+			for (const auto [address, size]: closure.table_ranges) {
+				const GuestRange table {address, size};
+				if (!table.Valid()) return fail("call table has an invalid heap protection range");
+				check.heap_input_guards.push_back(table);
+			}
+			std::ranges::sort(check.heap_input_guards);
+			size_t count = 0;
+			for (const auto range: check.heap_input_guards) {
+				if (count != 0u && range.address <= check.heap_input_guards[count - 1u].End()) {
+					auto& previous = check.heap_input_guards[count - 1u];
+					previous.size = std::max(previous.End(), range.End()) - previous.address;
+				} else {
+					check.heap_input_guards[count++] = range;
+				}
+			}
+			check.heap_input_guards.resize(count);
+		}
+		auto& heap = m_context.GetImageHeap();
+		std::string reason;
+		const bool valid = after_commit
+		    ? heap.ValidateCallClosure(info.images, stage.resources->flattened_srt, check.image_heap, reason)
+		    : heap.CaptureCallClosure(info.images, stage.resources->flattened_srt, check.heap_input_guards,
+		                              check.image_heap, reason);
+		if (!valid) return fail(reason);
+	}
 	auto& textures = m_context.GetTextureCache();
 	for (size_t index = 0; index < info.images.size(); ++index) {
 		const auto& resource = info.images[index];
@@ -748,37 +1015,59 @@ bool RenderExecutor::ValidatePreparedCallClosure(const ShaderStageRuntime& stage
 			return fail(fmt::format("written image {} is a heap or depth image", index));
 		}
 		const auto& binding = bindings.images[index];
-		const auto* owner   = binding.image_id ? textures.m_slot_images.try_get(binding.image_id) : nullptr;
-		if (owner == nullptr || !owner->registered || binding.image_view == nullptr) {
+		ImageId owner_id {};
+		uint64_t owner_serial = 0;
+		vk::ImageView native_view = nullptr;
+		bool ordinary_color = false;
+		bool inverted_tracked = false;
+		std::array<GuestRange, 3> ranges {binding.desc.info.data};
+		size_t range_count = 2u;
+		{
+			// CPU faults can shrink track_addr/end. Snapshot one owner under its lock,
+			// then release it before closure/guest-memory checks; retain no raw pointer.
+			std::scoped_lock lock {textures.m_lock};
+			const auto* owner = binding.image_id ? textures.m_slot_images.try_get(binding.image_id) : nullptr;
+			if (owner != nullptr && owner->registered) {
+				owner_id = binding.image_id;
+				owner_serial = owner->serial;
+				native_view = binding.image_view;
+				ordinary_color = !owner->depth_id && owner->stencil_ids.empty() &&
+				                 !owner->info.IsDepth() && !owner->info.HasStencil() &&
+				                 !owner->info.HasMetadata();
+				ranges[1] = owner->info.data;
+				if (owner->IsTracked()) {
+					inverted_tracked = owner->track_addr_end <= owner->track_addr;
+					if (!inverted_tracked) {
+						ranges[range_count++] = {owner->track_addr, owner->track_addr_end - owner->track_addr};
+					}
+				}
+			}
+		}
+		if (!owner_id || native_view == nullptr) {
 			return fail(fmt::format("written image {} has no registered native owner", index));
 		}
 		// Same native owner object and committed view before and after CommitBindings (serials
 		// are never reused).
 		if (!after_commit) {
-			check.owner_serials[index] = owner->serial;
-			check.views[index]         = binding.image_view;
-		} else if (check.owner_serials[index] != owner->serial || check.views[index] != binding.image_view) {
+			check.owner_serials[index] = owner_serial;
+			check.views[index]         = native_view;
+		} else if (check.owner_serials[index] != owner_serial || check.views[index] != native_view) {
 			return fail(fmt::format("written image {} changed native owner or view during commit", index));
 		}
 		// Ordinary color only: no depth/stencil planes or associations, no DCC/HTile metadata.
-		if (owner->depth_id || !owner->stencil_ids.empty() || owner->info.IsDepth() ||
-		    owner->info.HasStencil() || owner->info.HasMetadata() || binding.desc.info.IsDepth() ||
-		    binding.desc.info.HasStencil() || binding.desc.info.HasMetadata()) {
+		if (!ordinary_color || binding.desc.info.IsDepth() || binding.desc.info.HasStencil() ||
+		    binding.desc.info.HasMetadata()) {
 			return fail(fmt::format("written image {} is not an ordinary color image", index));
 		}
-		// The requested range, the final native owner's full backing (all mips/layers) and the
-		// owner's CPU-tracked range.
-		std::vector<GuestRange> ranges {binding.desc.info.data, owner->info.data};
-		if (owner->IsTracked()) {
-			if (owner->track_addr_end <= owner->track_addr) {
-				return fail(fmt::format("written image {} has an inverted tracked range", index));
-			}
-			ranges.push_back({owner->track_addr, owner->track_addr_end - owner->track_addr});
+		if (inverted_tracked) {
+			return fail(fmt::format("written image {} has an inverted tracked range", index));
 		}
-		for (const auto& range: ranges) {
+		// The requested range, the final native owner's full backing (all mips/layers) and the
+		// owner's CPU-tracked range, copied without allocating after Commit.
+		for (const auto& range: std::span {ranges}.first(range_count)) {
 			if (!range.Valid()) return fail(fmt::format("written image {} has an invalid guest range", index));
-			if (const auto* code = overlaps_code(range)) {
-				return fail(fmt::format("written image {} (0x{:x}+{}) overlaps callee code 0x{:x}", index,
+			if (const auto* code = overlaps_closure(range)) {
+				return fail(fmt::format("written image {} (0x{:x}+{}) overlaps immutable call bytes 0x{:x}", index,
 				                        range.address, range.size, code->address));
 			}
 		}

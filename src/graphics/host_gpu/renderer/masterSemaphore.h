@@ -18,6 +18,8 @@ void DumpSubmitHistory();
 // True when the KYTY_GPU_SYNC environment variable is set: every submit is waited on so a GPU
 // hang is attributed to the exact submit that caused it.
 bool GpuSyncDebugEnabled();
+// Exact child opt-in for passive staged-fault observation; never a scheduling input.
+[[nodiscard]] bool FaultPeekEnabled() noexcept;
 
 class MasterSemaphore {
 public:
@@ -37,6 +39,14 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
+	// Entered is only a branch-selection witness. Only completed authorizes a host
+	// read, and only after an existing successful vkWaitSemaphores(requested tick).
+	struct HostWaitWitness {
+		uint64_t entered_tick = 0;
+		uint64_t completed_tick = 0;
+	};
+	[[nodiscard]] HostWaitWitness ReadFaultPeekHostWait() const noexcept;
+
 	void Refresh();
 	void Wait(uint64_t tick);
 
@@ -45,6 +55,9 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	// Fixed footprint only when disabled; no accesses on the default-off path.
+	std::atomic<uint64_t> m_fault_peek_wait_entered {0};
+	std::atomic<uint64_t> m_fault_peek_wait_completed {0};
 };
 
 } // namespace Libs::Graphics

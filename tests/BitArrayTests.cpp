@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include <thread>
 
 namespace {
 
@@ -304,9 +305,29 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+void TestBackingPublication() {
+  for (unsigned trial = 0; trial < 128; ++trial) {
+    Bits gpu_dirty;
+    gpu_dirty.Set(0);
+    std::array<uint64_t, 4> backing{};
+    std::thread writer([&] {
+      for (unsigned i = 0; i < backing.size(); ++i)
+        backing[i] = (uint64_t{trial} << 32) | (i + 1);
+      gpu_dirty.Unset(0);
+    });
+    while (gpu_dirty.Any(0, 1)) std::this_thread::yield();
+    bool correct = true;
+    for (unsigned i = 0; i < backing.size(); ++i)
+      correct &= backing[i] == ((uint64_t{trial} << 32) | (i + 1));
+    writer.join();
+    Check(correct, "cleared GPU-dirty bit did not publish backing bytes");
+  }
+}
+
 } // namespace
 
 int main() {
+  TestBackingPublication();
   TestPointAndRangeOperations();
   TestMaskedConstructionAndBitwiseOperations();
   TestRangeDiscoveryAndIteration();

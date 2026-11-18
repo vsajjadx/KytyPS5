@@ -87,7 +87,7 @@ static void PrintUsage() {
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
-	::printf("  --native-rt                          Use native RT on the GPU.\n");
+	::printf("  --native-rt                          Enable native RT backend (guest traversal conversion disabled).\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -113,7 +113,7 @@ static void PrintUsage() {
 	::printf("  --frame-generation-backend <fsr|multi> Backend; multi is experimental. Default: fsr.\n");
 	::printf("  --frame-generation-multiplier <2-6>  Requested Multi factor; FSR stays 2x. Default: 2.\n");
 	::printf("                                       Selection alone does not enable generation.\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                       Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");

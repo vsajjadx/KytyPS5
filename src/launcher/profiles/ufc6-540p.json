@@ -1,0 +1,51 @@
+{
+  "name": "Experimental reduced-quality graphics only: fixed 960x540 at 1080p output, DRS off, DOF off",
+  "id": "PPSA23566",
+  "version": "01.004.000",
+  "process": "eboot.bin",
+  "credits": [
+    "PORTHEON: Marcelo Miyake (XAndromedaXR), Copyright (C) 2026"
+  ],
+  "mods": [
+    {
+      "name": "Render scale (fixed)",
+      "type": "checkbox",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0x1B453D6",
+          "off": "7829D2E906010000C57828E0498D9680030000C57829F2E9F2000000C57828E0",
+          "on": "7829D2E906010000C57828E0488D158BBC9807C57829F2E9F2000000C57828E0"
+        }
+      ]
+    },
+    {
+      "name": "Dynamic resolution off",
+      "type": "checkbox",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0x3BD5891",
+          "off": "108544FDFFFFC5F82E8548FDFFFF410F97C74488BD40FDFFFF488BB3C80C0000",
+          "on": "108544FDFFFFC5F82E8548FDFFFF41B700904488BD40FDFFFF488BB3C80C0000"
+        }
+      ]
+    },
+    {
+      "name": "No depth of field",
+      "type": "checkbox",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0x1B45183",
+          "off": "396B084839D10F85422A0000418B8E08070000488B150BA66D08898A08020000",
+          "on": "396B084839D10F85422A0000B9000000006690488B150BA66D08898A08020000"
+        }
+      ]
+    }
+  ],
+  "license": "GPL-2.0-or-later",
+  "source": "https://github.com/XAndromedaXR/PORTHEON/releases/tag/7.0",
+  "source_file": "PORTHEON-Released/games/UFC6/src/ufc6.c",
+  "source_sha256": "f4e25c3bb80478dd156a594a0dffd0fc625d40da76e3e72b0321bd457cdc4cd8"
+}

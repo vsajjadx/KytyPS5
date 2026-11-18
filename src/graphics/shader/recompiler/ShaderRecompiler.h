@@ -58,8 +58,25 @@ struct ShaderSource {
 		uint32_t table_stride = 0;
 		uint32_t table_addend = 0;
 		uint32_t table_word_offset = 0;
+		// Live SGPR pairs proven to carry the same record's companion words (+8/+12).
+		std::bitset<128> context_registers;
+	};
+	struct CapturedData {
+		uint64_t address = 0;
+		std::vector<uint32_t> words;
+		bool operator==(const CapturedData&) const = default;
 	};
 	struct Linked {
+		struct ContextRead {
+			size_t site = 0;
+			uint32_t slot = 0, local_pc = 0, offset = 0, dwords = 0;
+		};
+		struct ContextLoad {
+			size_t site = 0;
+			uint32_t slot = 0, local_pc = 0;
+			std::vector<uint32_t> words;
+			bool operator==(const ContextLoad&) const = default;
+		};
 		// One leaf copy per uniform site, or per (table site, callee slot).
 		// offset/size index RAW DWORDs of `code`; synthetic_pc is this copy's first translation PC
 		// (the caller keeps its original PCs; copies start after the caller's last instruction).
@@ -72,6 +89,8 @@ struct ShaderSource {
 		std::vector<Function> functions;
 		std::vector<uint32_t> observed_function;
 		std::vector<std::vector<uint64_t>> site_targets;
+		std::vector<ContextRead> context_reads;
+		std::vector<ContextLoad> context_loads;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
@@ -85,7 +104,11 @@ struct ShaderSource {
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 	// Last table enumeration summary (bounded diagnostics only).
 	std::string call_diagnostic;
-	// Callee code snapshotted for table sites; must stay immutable for the dispatch.
+	// Exact table records and context payloads used by fixed scalar-load projections.
+	// The renderer must validate and upload these owned snapshots to the canonical
+	// prepared buffers before dispatch; CPU equality alone is not sufficient.
+	std::vector<CapturedData> call_data;
+	// Callee code AND projected data must stay immutable for the dispatch.
 	std::vector<std::pair<uint64_t, uint64_t>> call_code_ranges;
 	// Table ranges of this dispatch; must be uniquely backed so same-dispatch writes are seen.
 	std::vector<std::pair<uint64_t, uint64_t>> call_table_ranges;

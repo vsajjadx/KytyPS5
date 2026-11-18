@@ -24,7 +24,7 @@ enum Mode : uint32_t { Walk, Triangles, Boxes, Instances };
 
 constexpr uint32_t PairGeometry = 1; // The geometry hash of its last build or update is known.
 constexpr uint32_t PairUpdated  = 2;
-constexpr uint32_t StateAbsent  = 1; // The job met an unsynchronized page.
+constexpr uint32_t StateAbsent  = 1; // The job met a page no buffer backs.
 constexpr uint32_t GroupSize    = 64;
 constexpr uint64_t TriangleSize = 36;
 
@@ -101,6 +101,7 @@ struct alignas(16) Context {
 	uint32_t instances;
 	uint32_t missing_count;
 	uint64_t structure;
+	uint64_t records;
 };
 static_assert(sizeof(Context) == 32);
 
@@ -370,7 +371,6 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
-	m_context.PrepareBda();
 	Collect();
 	auto& area = m_areas[m_next_area];
 	if (area.tick != 0) {

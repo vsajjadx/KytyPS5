@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/ActivityDiagnostics.h"
 #include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/renderer/readbackAttribution.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -295,7 +296,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
                                         vk::BufferUsageFlags usage, const auto& write) {
 	const auto [mapped, offset] = staging.Map(size, alignment);
 	if (mapped != nullptr) {
-		write(mapped, offset);
+		write(mapped, offset, staging);
 		staging.Commit();
 		return {&staging, offset};
 	}
@@ -303,7 +304,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
 	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
 	                                         usage, size);
-	write(temporary->Mapped().data(), 0);
+	write(temporary->Mapped().data(), 0, *temporary);
 	temporary->Flush(0, size);
 	auto* buffer = temporary.get();
 	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
@@ -320,6 +321,10 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		// Copy waits for ring reuse and flushes the fresh host data before submission.
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
 		const auto destination_offset = buffer.Offset(address);
+		if (auto* ledger = IndirectArgsLedger::Active(); ledger != nullptr && buffer.CpuAddress() != 0) {
+			ledger->HostSnapshot(address, chunk, m_staging_buffer.LedgerSpan(offset, chunk),
+			                     m_staging_buffer.Mapped().data() + offset);
+		}
 		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
 		m_scheduler.EndRendering();
 		const auto command = m_scheduler.Current().Handle();
@@ -340,6 +345,12 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		command.pipelineBarrier2(dependency);
 		const vk::BufferCopy copy {offset, destination_offset, chunk};
 		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		if (auto* ledger = IndirectArgsLedger::Active()) {
+			ledger->TransferCopy(buffer.CpuAddress() != 0 ? address : 0, chunk,
+			    m_staging_buffer.LedgerSpan(offset, chunk),
+			    buffer.LedgerSpan(destination_offset, chunk),
+			    IndirectArgsLedger::RecordingPosition(m_scheduler, command));
+		}
 		auto after          = before;
 		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -386,15 +397,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
-		}
-		{
-			std::lock_guard lock(m_bda_sync_mutex);
-			m_dma_accessed.ForEachInRange(
-			    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
-				    for (auto address = begin; address < end; address += CACHING_PAGESIZE) {
-					    addresses[buffer.Offset(address) >> CACHING_PAGEBITS] += BDA_ACCESSED;
-				    }
-			    });
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
@@ -542,6 +544,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+      m_indirect_args_diagnostics(IndirectArgsDiagnosticEnabled()
+          ? std::make_unique<IndirectArgsDiagnostics>(graphics, scheduler) : nullptr),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
@@ -598,10 +602,11 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (auto* ledger = IndirectArgsLedger::Active()) ledger->DirtyUnknown(vaddr, size);
 	if (ShaderRecompiler::IR::HostActivityProofEnabled()) ++m_activity_epoch;
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size, true);
+	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -658,7 +663,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size, true);
+			QueueBdaSync(vaddr, size);
 		}
 	};
 	if (ReadbackAttribution::Enabled()) {
@@ -750,6 +755,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	const IndirectArgsLedger::CopyScope ledger_migration(true, overlap.CpuAddress());
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -805,7 +811,8 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 
 	const auto source = UploadMemory(
 	    m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
-	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
+	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset,
+	                                             const Buffer& native_source) {
 		    size_t first = 0;
 		    for (const auto& upload: uploads) {
 			    for (auto& copy: copies.subspan(first, upload.end - first)) {
@@ -813,6 +820,11 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 				    if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
 					                                         copy.size)) {
 					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				    }
+				    if (auto* ledger = IndirectArgsLedger::Active()) {
+					    ledger->HostSnapshot(address, copy.size,
+					        native_source.LedgerSpan(base_offset + copy.srcOffset, copy.size),
+					        mapped + copy.srcOffset);
 				    }
 				    copy.srcOffset += base_offset;
 			    }
@@ -833,6 +845,15 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	for (const auto& upload: uploads) {
 		native.copyBuffer(source.first->Handle(), upload.buffer->Handle(),
 		                  static_cast<uint32_t>(upload.end - first), copies.data() + first);
+		if (auto* ledger = IndirectArgsLedger::Active()) {
+			const auto position = IndirectArgsLedger::RecordingPosition(m_scheduler, native);
+			for (const auto& copy: copies.subspan(first, upload.end - first)) {
+				ledger->TransferCopy(IndirectArgsLedger::GuestOffset(
+				        upload.buffer->CpuAddress(), copy.dstOffset, copy.size), copy.size,
+				    source.first->LedgerSpan(copy.srcOffset, copy.size),
+				    upload.buffer->LedgerSpan(copy.dstOffset, copy.size), position);
+			}
+		}
 		first = upload.end;
 	}
 	const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -953,6 +974,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ReservePreparedUpload(
 		}
 	}
 	m_prepared_upload_offset = offset + mapped_size;
+	m_prepared_upload_buffer->LedgerReserve(offset, mapped_size);
 	return {m_prepared_upload_buffer.get(), offset};
 }
 
@@ -1015,6 +1037,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			        vaddr, result.first->Mapped().data() + result.second, size)) {
 				EXIT("BufferCache: failed to read sparse prepared buffer memory\n");
 			}
+			if (auto* ledger = IndirectArgsLedger::Active()) {
+				ledger->HostSnapshot(vaddr, size, result.first->LedgerSpan(result.second, size),
+				                     result.first->Mapped().data() + result.second);
+			}
 			result.first->Flush(result.second, size);
 			retained.sources.push_back({vaddr, size, result.first->Handle(), result.second});
 			return result;
@@ -1023,6 +1049,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			if (auto* ledger = IndirectArgsLedger::Active()) {
+				ledger->HostSnapshot(vaddr, size, m_stream_buffer.LedgerSpan(offset, size), mapped);
 			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
@@ -1060,7 +1089,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
-	    [&](uint8_t* mapped, uint64_t) {
+	    [&](uint8_t* mapped, uint64_t, const Buffer&) {
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}
@@ -1086,6 +1115,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuFill(vaddr, size, value);
 		return;
 	}
 
@@ -1118,6 +1148,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		if (!IsRegionGpuModified(src_vaddr, size)) {
 			std::memcpy(reinterpret_cast<void*>(dst_vaddr),
 			            reinterpret_cast<const void*>(src_vaddr), size);
+			if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuCopy(dst_vaddr, src_vaddr, size);
 			return;
 		}
 		// The source page holds GPU writes, but not these bytes: their guest backing is current.
@@ -1128,6 +1159,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			std::vector<uint8_t> bytes(size);
 			if (LibKernel::Memory::TryReadBacking(src_vaddr, bytes.data(), size)) {
 				std::memcpy(reinterpret_cast<void*>(dst_vaddr), bytes.data(), size);
+				if (auto* ledger = IndirectArgsLedger::Active()) {
+					ledger->CpuCopy(dst_vaddr, src_vaddr, size, bytes.data());
+				}
 				return;
 			}
 		}
@@ -1165,7 +1199,20 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	const IndirectArgsLedger::CopyScope ledger_copy(false, src_memory ? src_vaddr : 0);
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+bool BufferCache::CanonicalBinding(uint64_t address, uint64_t size,
+                                   vk::DescriptorBufferInfo& binding) const {
+	if (!GuestRange {address, size}.Valid() || address == 0 || size == 0) return false;
+	auto owner = m_buffers.upper_bound(address);
+	if (owner == m_buffers.begin()) return false;
+	--owner;
+	const auto& buffer = m_slot_buffers[owner->second];
+	if (!buffer.IsInBounds(address, size)) return false;
+	binding = {buffer.Handle(), buffer.Offset(address), size};
+	return true;
 }
 
 bool BufferCache::BindingOwnerRange(uint64_t address, uint64_t size, vk::Buffer handle,
@@ -1520,13 +1567,12 @@ void BufferCache::PrepareBdaRange(uint64_t vaddr, uint64_t size) {
 	// Enroll the persistent backing in BDA synchronization once. CPU writes queue
 	// their dirty subranges thereafter, and ChangeRegister queues a replacement
 	// backing in full. PrepareBda consumes those uploads before this dispatch.
-	// Keep DMA enrollment aligned to BDA pages, as ChangeRegister uses it to tag
-	// whole page-table entries. Existing untagged entries remain valid pointers.
+	// Keep explicit residency enrollment aligned to the page-table entries.
 	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	if (!m_dma_accessed.Contains(begin, end - begin)) {
-		m_dma_accessed.Add(begin, end - begin);
+	if (!m_bda_prepared.Contains(begin, end - begin)) {
+		m_bda_prepared.Add(begin, end - begin);
 		m_bda_sync.Add(begin, end - begin);
 	}
 }
@@ -1535,49 +1581,11 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	if (!is_write) {
-		m_bda_sync.Add(begin, end - begin);
-		return;
-	}
-	m_dma_accessed.ForEachInRange(begin, end - begin, [this](uint64_t first, uint64_t last) {
-		m_bda_sync.Add(first, last - first);
-	});
-}
-
-void BufferCache::MarkDmaAccess(const RangeSet& pages) {
-	{
-		std::lock_guard lock(m_bda_sync_mutex);
-		pages.ForEach([this](uint64_t begin, uint64_t end) {
-			m_dma_accessed.Add(begin, end - begin);
-			m_bda_sync.Add(begin, end - begin);
-		});
-	}
-	RangeSet                       unbacked;
-	std::vector<vk::DeviceAddress> entries;
-	pages.ForEach([&](uint64_t begin, uint64_t end) {
-		entries.clear();
-		for (auto address = begin; address < end; address += CACHING_PAGESIZE) {
-			const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
-			if (owner == nullptr || !*owner) {
-				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
-				unbacked.Add(address, CACHING_PAGESIZE);
-				entries.push_back(0);
-				continue;
-			}
-			const auto& buffer = m_slot_buffers[*owner];
-			entries.push_back(buffer.BufferDeviceAddress() + buffer.Offset(address) + BDA_ACCESSED);
-		}
-		if (!unbacked.Contains(begin, end - begin)) {
-			WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress),
-			                entries.data(), entries.size() * sizeof(vk::DeviceAddress));
-		}
-	});
-	unbacked.ForEach(
-	    [this](uint64_t start, uint64_t end) { (void)FindBuffer(start, end - start); });
+	m_bda_sync.Add(begin, end - begin);
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {

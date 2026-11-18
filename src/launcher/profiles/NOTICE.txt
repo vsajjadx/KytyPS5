@@ -1,0 +1,19 @@
+ufc6-540p.json
+
+Graphics patch bytes selected from PORTHEON's UFC 6 launcher source.
+Copyright (C) 2026 Marcelo Miyake (XAndromedaXR).
+SPDX-License-Identifier: GPL-2.0-or-later
+
+Source: https://github.com/XAndromedaXR/PORTHEON/releases/tag/7.0
+Archive: PORTHEON-7.0-Windows-x64.zip
+Source file: PORTHEON-Released/games/UFC6/src/ufc6.c
+Source SHA-256: f4e25c3bb80478dd156a594a0dffd0fc625d40da76e3e72b0321bd457cdc4cd8
+
+This subset contains only fixed 960x540 rendering at 1080p output, dynamic
+resolution disabled, and depth of field disabled, for PPSA23566 v01.004.000.
+It contains no other gameplay cheats or engine modifications. The launcher
+integration and conflict checking are maintained by this KytyPS5 fork.
+
+Distributed under GNU GPL version 2 or any later version. See the repository's
+LICENSE for the full GPL version 2 text; the original copyright and licensing
+notice remain applicable to the extracted patch data.

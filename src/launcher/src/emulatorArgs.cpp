@@ -2,6 +2,7 @@
 
 #include "configuration.h"
 #include "gameContent.h"
+#include "ufc6GraphicsProfile.h"
 
 #include <QDir>
 #include <QFileInfo>
@@ -30,7 +31,8 @@ static bool IsUfc6(const Configuration& info) {
 	       name.match(info.name).hasMatch();
 }
 
-QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_plan) {
+QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_plan, QString* error) {
+	if (error != nullptr) error->clear();
 	QStringList args;
 	const bool  tuned = info.game_tuning_enabled && IsTunedGame(info);
 	// UFC 6's asynchronous launch path stalled on the splash screen in local testing, while
@@ -40,7 +42,16 @@ QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_p
 	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
+		if (error != nullptr) *error = Configuration::tr("Invalid screen resolution.");
 		return {};
+	}
+	QString effective_patch = patch_plan;
+	if (info.ufc6_540p_enabled) {
+		const auto profile_error = Ufc6GraphicsProfile::PreparePlan(info, patch_plan, &effective_patch);
+		if (!profile_error.isEmpty()) {
+			if (error != nullptr) *error = profile_error;
+			return {};
+		}
 	}
 
 	args << "--screen-width" << r.at(0);
@@ -63,7 +74,7 @@ QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_p
 	}
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
-	AddFlag(args, info.output_1080p_enabled || tuned, "--output-1080p");
+	AddFlag(args, info.output_1080p_enabled || tuned || info.ufc6_540p_enabled, "--output-1080p");
 	AddFlag(args, info.frame_generation_enabled, "--frame-generation");
 	args << "--frame-generation-backend" << info.frame_generation_backend;
 	args << "--frame-generation-multiplier" << QString::number(info.frame_generation_multiplier);
@@ -138,8 +149,8 @@ QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_p
 		args << "--addcont" << entry;
 	}
 
-	if (QFileInfo::exists(patch_plan)) {
-		args << "--game-patch" << patch_plan;
+	if (QFileInfo::exists(effective_patch)) {
+		args << "--game-patch" << effective_patch;
 	}
 
 	return args;

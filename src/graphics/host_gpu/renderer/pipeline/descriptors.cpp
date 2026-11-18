@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/readbackAttribution.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -178,7 +179,7 @@ static bool kDisableNarrowWrites() {
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
-                    BufferCache::PreparedUpload& uploads) {
+                    BufferCache::PreparedUpload& uploads, bool allow_stream) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -213,7 +214,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written && !narrow,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
-	    !resource.written, &uploads);
+	    allow_stream && !resource.written, &uploads);
 	if (narrow && resource.fixed_write_end != 0u) {
 		// The full range above must retain its persistent owner: a streaming upload is
 		// read-only guest data and cannot receive writes that later readbacks must see.
@@ -878,6 +879,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
 	prepared.uploads = {};
+	prepared.call_data_sources.clear();
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -971,13 +973,19 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
-void RenderExecutor::NoteRecordedWriters(std::span<PreparedBindings* const> stages) {
-	if (!ReadbackAttribution::Enabled()) return; // off: no collection, formatting or allocation
+void RenderExecutor::NoteRecordedWriters(std::span<PreparedBindings* const> stages,
+                                        const IndirectArgsLedger::Position* ledger_position) {
+	const bool attribution = ReadbackAttribution::Enabled();
+	auto* ledger = IndirectArgsLedger::Active();
+	if (!attribution && ledger == nullptr) return; // off: no collection, formatting or allocation
+	const auto position = ledger == nullptr ? IndirectArgsLedger::Position {} :
+	    (ledger_position != nullptr ? *ledger_position : IndirectArgsLedger::RecordingPosition(
+	        m_context.GetCommandScheduler(), m_context.GetCommandScheduler().Current().Handle()));
 	auto& cache = m_context.GetBufferCache();
 	// NoteRecordedWork only counts work; no submit happens between the native command and here,
 	// so this is the tick of the command buffer that holds it (not a submit/complete time).
 	const uint64_t tick     = m_context.GetCommandScheduler().CurrentTick();
-	const uint64_t sequence = cache.NextRecordedWorkSequence();
+	const uint64_t sequence = attribution ? cache.NextRecordedWorkSequence() : 0;
 	for (const auto* stage: stages) {
 		if (stage == nullptr || stage->runtime == nullptr) continue;
 		const auto& program = stage->runtime->module->info;
@@ -1002,7 +1010,16 @@ void RenderExecutor::NoteRecordedWriters(std::span<PreparedBindings* const> stag
 			std::memcpy(&writer.native_handle, &handle, sizeof(handle));
 			writer.native_offset = native.offset;
 			writer.native_range  = native.range;
-			cache.NoteRecordedWriter(writer, sequence, tick);
+			if (attribution) cache.NoteRecordedWriter(writer, sequence, tick);
+			if (ledger != nullptr) {
+				ledger->Candidate(source.address, source.size,
+				    IndirectArgsLedger::DescriptorSpan(
+				        IndirectArgsLedger::HandleBits(static_cast<VkBuffer>(native.buffer)),
+				        native.offset, native.range, stage->shader_data,
+				        program.bindings.memory_offset_dword, index),
+				    position, {writer.shader, writer.module, writer.stage, writer.resource,
+				               writer.descriptor});
+			}
 		}
 	}
 }
@@ -1027,8 +1044,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset, prepared.uploads);
+		const auto& source = prepared.buffer_sources[index];
+		// Every raw read alias of captured call data must use the same canonical owner as
+		// BDA. A small private stream upload could otherwise preserve an earlier CPU value.
+		const bool captured = prepared.runtime->call_closure &&
+		    std::ranges::any_of(prepared.runtime->call_closure->data, [&](const auto& data) {
+			    const uint64_t bytes = data.words.size() * sizeof(uint32_t);
+			    // Subtract the lower address instead of forming possibly overflowing ends.
+			    return source.size != 0 && bytes != 0 &&
+			        (source.address <= data.address ? data.address - source.address < source.size
+			                                       : source.address - data.address < bytes);
+		    });
+		prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset,
+		                                              prepared.uploads, !captured);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =

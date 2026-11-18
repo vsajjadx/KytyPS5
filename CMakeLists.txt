@@ -542,6 +542,13 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+find_package(Threads REQUIRED)
+add_executable(causal_diagnostics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CausalDiagnosticsTests.cpp"
+)
+target_include_directories(causal_diagnostics_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_link_libraries(causal_diagnostics_tests PRIVATE Threads::Threads)
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -640,6 +647,15 @@ add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
+
+add_executable(playgo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayGoTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
+target_include_directories(playgo_tests PRIVATE ${inc_headers})
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -776,6 +792,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME table_selected_call COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-call-only)
 	add_test(NAME table_leaf_getpc_cfg COMMAND $<TARGET_FILE:shader_cfg_tests> --table-leaf-getpc-only)
+	add_test(NAME table_selected_context_cfg COMMAND $<TARGET_FILE:shader_cfg_tests> --table-context-only)
+	add_test(NAME call_data_snapshot COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --call-data-snapshot-only)
+	add_test(NAME scalar_read_provenance_native COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-read-provenance-only)
 	add_test(NAME table_leaf_getpc_native COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-leaf-getpc-only)
 	add_test(NAME table_tracking_soft_failure COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --table-tracking-failure-only)
 	# Each child gets an explicit environment; the default-OFF case clears inherited settings.
@@ -820,6 +839,7 @@ if(BUILD_TESTING)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME causal_diagnostics COMMAND $<TARGET_FILE:causal_diagnostics_tests>)
 	add_test(NAME legacy_value_opcode_wire COMMAND $<TARGET_FILE:resource_materialization_tests> --legacy-opcodes-only)
 	add_test(NAME host_activity_capture_eligibility
 		COMMAND $<TARGET_FILE:resource_materialization_tests> --activity-eligibility-only)
@@ -828,6 +848,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:resource_materialization_tests> --activity-proof-only)
 	set_tests_properties(host_activity_proof PROPERTIES ENVIRONMENT "KYTY_HOST_ACTIVITY_PROOF=1")
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME scalar_read_provenance_cpu COMMAND $<TARGET_FILE:resource_tracking_tests> --scalar-read-provenance-only)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
@@ -847,6 +868,7 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -878,6 +900,47 @@ if(BUILD_TESTING)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	add_test(NAME fault_harvest_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-harvest-only)
+	set_tests_properties(fault_harvest_native PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=1;KYTY_GPU_SYNC=0;KYTY_FAULT_PEEK=0")
+	add_test(NAME fault_harvest_native_disabled
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-harvest-only)
+	set_tests_properties(fault_harvest_native_disabled PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=0;KYTY_GPU_SYNC=0;KYTY_FAULT_PEEK=0")
+	add_test(NAME fault_passive_peek_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-harvest-only)
+	set_tests_properties(fault_passive_peek_native PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=1;KYTY_FAULT_PEEK=1;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME fault_passive_peek_requires_causal
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-harvest-only)
+	set_tests_properties(fault_passive_peek_requires_causal PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=0;KYTY_FAULT_PEEK=1;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME indirect_args_observation_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-args-observation-only)
+	set_tests_properties(indirect_args_observation_native PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=1;KYTY_FAULT_PEEK=1;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME indirect_args_observation_disabled
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-args-observation-disabled-only)
+	set_tests_properties(indirect_args_observation_disabled PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=1;KYTY_FAULT_PEEK=1;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME indirect_args_observation_requires_causal
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-args-observation-only)
+	set_tests_properties(indirect_args_observation_requires_causal PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=0;KYTY_FAULT_PEEK=1;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME indirect_args_observation_requires_host_wait
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-args-observation-only)
+	set_tests_properties(indirect_args_observation_requires_host_wait PROPERTIES
+		ENVIRONMENT "KYTY_CAUSAL_DIAG=1;KYTY_FAULT_PEEK=0;KYTY_GPU_SYNC=0;KYTY_GPU_SPIN_US=0")
+	add_test(NAME causal_flip_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --causal-flip-only)
+	set_tests_properties(causal_flip_native PROPERTIES ENVIRONMENT "KYTY_CAUSAL_DIAG=1")
+	add_test(NAME guest_gpu_queue_selection
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-gpu-queue-only)
+	set_tests_properties(guest_gpu_queue_selection PROPERTIES
+		ENVIRONMENT "KYTY_SUBMIT_DRAW_THRESHOLD=64")
+	add_test(NAME legacy_subgroup_reductions_native
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --legacy-reductions-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
@@ -992,6 +1055,7 @@ set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		causal_diagnostics_tests
 		multi_frame_generation_hud_oracle_tests
 		multi_frame_present_policy_tests
 		multi_frame_generation_local_oracle_tests
@@ -1037,6 +1101,7 @@ set_tests_properties(activity_cmask_native_original PROPERTIES ENVIRONMENT "KYTY
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		playgo_tests
 	)
 endif()
 

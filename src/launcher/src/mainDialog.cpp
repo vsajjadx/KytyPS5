@@ -344,15 +344,8 @@ static QString CmdCommand(const QString& interpreter, const QStringList& args,
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+void MainDialog::RunInterpreter(QProcess* process, const QStringList& args, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
-
-	auto args = CreateEmulatorArgs(info, Cheats::PlanPath(info.title_id));
-	if (args.isEmpty()) {
-		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
-		QApplication::quit();
-		return;
-	}
 
 	// Without a terminal, the emulator runs directly.
 	process->setProgram(interpreter);
@@ -445,6 +438,15 @@ void MainDialogPrivate::Run() {
 		return;
 	}
 
+	const auto info = m_ui->widget->CreateConfiguration(*item);
+	QString error;
+	const auto args = CreateEmulatorArgs(*info, Cheats::PlanPath(info->title_id), &error);
+	if (args.isEmpty()) {
+		QMessageBox::critical(m_main_dialog, tr("Cannot launch game"),
+		                      error.isEmpty() ? tr("Invalid emulator configuration") : error);
+		return;
+	}
+
 	item->SetRunning(true);
 	m_running_games++;
 	m_controller_preview.SetSuspended(true);
@@ -462,8 +464,7 @@ void MainDialogPrivate::Run() {
 			        Update();
 		        }
 	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	m_main_dialog->RunInterpreter(process, args, g_close_terminal);
 
 	Update();
 }
@@ -480,9 +481,11 @@ void MainDialogPrivate::CreateShortcut() {
 	}
 
 	const auto info = m_ui->widget->CreateConfiguration(*item);
-	const auto args = CreateEmulatorArgs(*info, Cheats::PlanPath(info->title_id));
+	QString error;
+	const auto args = CreateEmulatorArgs(*info, Cheats::PlanPath(info->title_id), &error);
 	if (args.isEmpty()) {
-		QMessageBox::critical(m_main_dialog, tr("Error"), tr("Invalid emulator configuration"));
+		QMessageBox::critical(m_main_dialog, tr("Cannot create shortcut"),
+		                      error.isEmpty() ? tr("Invalid emulator configuration") : error);
 		return;
 	}
 

@@ -4,6 +4,7 @@
 #include "SrtWalkerTestMemory.h"
 #include "OfflineCachePlanDump.inc"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -2009,6 +2010,7 @@ int main(int argc, char** argv) {
     std::puts("ResourceMaterializationTests: activity proof passed");
     return 0;
   }
+  TestLegacyValueOpcodePlan();
   TestActivityCaptureEligibility();
   TestAuxiliaryGuardedActivity();
   TestPreparedActivitySnapshots();

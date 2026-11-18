@@ -42,7 +42,7 @@ struct ShaderModule;
 struct CallClosure {
 	struct Code {
 		uint64_t              address = 0;
-		std::vector<uint32_t> words; // exact linked callee words (the snapshot executed)
+		std::vector<uint32_t> words; // exact captured words
 	};
 	uint64_t                                   shader_hash           = 0;
 	uint64_t                                   source_revision       = 0;
@@ -50,6 +50,9 @@ struct CallClosure {
 	uint64_t                                   protection_generation = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> table_ranges;
 	std::vector<Code>                          code;
+	// Table records and context-derived descriptor words. These reach the GPU through an
+	// ordered canonical-owner copy; raw callee code above is never uploaded by that path.
+	std::vector<Code>                          data;
 };
 
 struct ShaderStageRuntime {

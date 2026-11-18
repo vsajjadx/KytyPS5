@@ -9129,6 +9129,9 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+#include "ScalarReadProvenanceResourceTests.inc"
+#include "ScratchAddressSpaceResourceTests.inc"
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -9147,7 +9150,20 @@ int main(int argc, char **argv) {
       std::cout << "resource materialization validation tests passed\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--scalar-read-provenance-only") == 0) {
+      Run("scalar read bank provenance", TestScalarReadBankProvenance);
+      Run("resource limit", TestResourceLimitIsTransactional);
+      std::cout << "scalar read bank provenance tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--scratch-validation-only") == 0) {
+      Run("scratch address space validation", TestScratchAddressSpaceValidation);
+      std::cout << "scratch address space validation tests passed\n";
+      return 0;
+    }
     Check(argc == 1, "unknown resource tracking test option");
+    Run("scratch address space validation", TestScratchAddressSpaceValidation);
+    Run("scalar read bank provenance", TestScalarReadBankProvenance);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

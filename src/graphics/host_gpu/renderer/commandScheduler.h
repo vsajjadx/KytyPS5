@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
+#include "graphics/host_gpu/renderer/causalDiagnostics.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -36,11 +37,15 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
-	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
+	// Priority callbacks publish guest-memory completions. Normal callbacks also harvest
+	// GPU faults/call-table misses and may materialize buffers, besides retiring resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Diagnostic-only, nonblocking live-owner snapshot; never queries the GPU.
+	[[nodiscard]] CausalDiagnostics::CurrentState ReadCausalState() noexcept;
+	[[nodiscard]] uint64_t CausalLifetimeSequence() const noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -94,6 +99,7 @@ private:
 	void HarvestGpuTimingV2(bool final = false);
 	void DestroyGpuTimingV2AfterDrain();
 	struct GpuTimingV2;
+	struct CausalState;
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -112,9 +118,11 @@ private:
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
-	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	OperationState               m_operation_state      = OperationState::Open;
+	std::unique_ptr<CausalState>  m_causal_state;
+	// Starts in the initializer: every field consumed by the worker must precede it.
+	std::jthread                 m_priority_thread;
 };
 
 } // namespace Libs::Graphics

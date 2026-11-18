@@ -3,6 +3,8 @@
 #include <array>
 #include <chrono>
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/causalOperationWitness.h"
+#include "graphics/host_gpu/renderer/causalDiagnosticsRuntime.h"
 #include "graphics/host_gpu/renderer/gpuSubmitTiming.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -287,13 +289,71 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+
+struct CommandScheduler::CausalState {
+    CausalDiagnostics::ParentRef lifetime{};
+    CausalDiagnostics::CallbackParents parents{};
+    uint64_t active_operation = 0; // Existing operation mutex.
+    std::atomic<uint64_t> phase{0}, last_native_submit{0};
+    uint64_t phase_generation = 0; // Priority worker only.
+
+    explicit CausalState(MasterSemaphore& master) {
+        auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::SchedulerCreated,
+            CausalDiagnostics::Domain(&master), CausalDiagnostics::NewId(), master.CurrentTick());
+        record.data[0] = master.KnownGpuTick();
+        record.data[1] = CausalDiagnostics::CallbackParents::Size;
+        lifetime = CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record).parent;
+    }
+    void SetPhase(CausalDiagnostics::WorkerPhase value) {
+        phase.store((++phase_generation << 8) | static_cast<uint8_t>(value), std::memory_order_release);
+    }
+};
+
+CausalDiagnostics::CurrentState CommandScheduler::ReadCausalState() noexcept {
+    CausalDiagnostics::CurrentState out{};
+    if (!m_causal_state) return out;
+    out.timestamp_ns = CausalDiagnostics::NowNs();
+    out.domain = CausalDiagnostics::Domain(&m_master);
+    out.lifetime_sequence = m_causal_state->lifetime.sequence;
+    out.lifetime_id = m_causal_state->lifetime.id;
+    std::unique_lock lock(m_operation_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return out;
+    out.available = true;
+    out.phase_before = m_causal_state->phase.load(std::memory_order_acquire);
+    out.active_operation = m_causal_state->active_operation;
+    out.active_tick = m_priority_active_tick;
+    out.priority_queued = m_priority_operations.size();
+    out.priority_front_tick = m_priority_operations.empty() ? 0 : m_priority_operations.front().tick;
+    out.normal_queued = m_pending_operations.size();
+    out.operation_state = static_cast<uint64_t>(m_operation_state);
+    out.parent_bridge_lost = m_causal_state->parents.Lost();
+    out.parent_bridge_overwritten = m_causal_state->parents.Overwritten();
+    out.last_native_submit = m_causal_state->last_native_submit.load(std::memory_order_acquire);
+    out.cached_known_tick = m_master.KnownGpuTick();
+    out.recording_tick = m_master.CurrentTick();
+    out.phase_after = m_causal_state->phase.load(std::memory_order_acquire);
+    out.phase_stable = out.phase_before == out.phase_after;
+    return out;
+}
+uint64_t CommandScheduler::CausalLifetimeSequence() const noexcept {
+    return m_causal_state ? m_causal_state->lifetime.sequence : 0;
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
+      m_causal_state(CausalDiagnostics::Enabled() ? std::make_unique<CausalState>(m_master) : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_causal_state) {
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::SchedulerDestroyed,
+		    CausalDiagnostics::Domain(&m_master), m_causal_state->lifetime.id, CurrentTick());
+		record.SetParent(m_causal_state->lifetime);
+		record.data[0] = m_master.KnownGpuTick();
+		CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -391,6 +451,9 @@ void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
+		CausalDiagnostics::Context context{};
+		uint64_t causal_id = 0;
+		bool parent_missing = false;
 		{
 			std::lock_guard lock(m_operation_mutex);
 			if (m_pending_operations.empty() ||
@@ -399,6 +462,19 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			if (m_causal_state) {
+				context = m_causal_state->parents.Dequeued(false, CausalDiagnostics::Domain(&m_master),
+				                                   causal_id, parent_missing);
+			}
+		}
+		CausalDiagnostics::ContextScope causal_scope(context, m_causal_state != nullptr);
+		if (m_causal_state) {
+			auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::PriorityDequeued,
+			    CausalDiagnostics::Domain(&m_master), causal_id, operation.tick);
+			record.related = m_causal_state->lifetime.sequence;
+			record.flags = parent_missing ? 0x80u : 0u;
+			record.data[1] = context.point; record.data[2] = context.request;
+			CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, record);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -414,12 +490,68 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+	// Consumed synchronously; never retain the caller's diagnostic stack binding.
+	auto witness = CausalDiagnostics::TakeEnqueueWitness(m_causal_state != nullptr);
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		if (m_causal_state) {
+			auto context = CausalDiagnostics::CurrentContext();
+			const auto id = m_causal_state->parents.NextId(priority);
+			const auto tick = CurrentTick();
+			auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::PriorityQueued,
+			    CausalDiagnostics::Domain(&m_master), id, tick);
+			record.related = m_causal_state->lifetime.sequence;
+			record.flags = priority ? 1u : 0u;
+			record.data[0] = priority ? 1u : 0u;
+			record.data[1] = context.point; record.data[2] = context.request;
+			// This is an enqueue attempt. Accepted insertion is corroborated by
+			// dequeue/callback; an allocation failure may leave only this record.
+			context.cause = CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, record).parent;
+			// Added allocation/capsule only when explicitly enabled. PendingOperation
+			// and the engine queue layout remain unchanged; exceptions propagate.
+			const CausalDiagnostics::OperationWitness accepted {
+			    .native_domain = CausalDiagnostics::Domain(&m_master),
+			    .lifetime_sequence = m_causal_state->lifetime.sequence,
+			    .operation_id = id, .selected_tick = tick,
+			    .queued_parent = context.cause, .enqueue_thread = record.thread,
+			    .priority = priority};
+			operation = [this, context, accepted, callback = std::move(operation)]() mutable {
+				const auto id = accepted.operation_id;
+				const auto tick = accepted.selected_tick;
+				const auto priority = accepted.priority;
+				CausalDiagnostics::ContextScope captured(context);
+				auto begin = CausalDiagnostics::Make(CausalDiagnostics::Event::PriorityCallbackBegin,
+				    CausalDiagnostics::Domain(&m_master), id, tick);
+				begin.related = m_causal_state->lifetime.sequence;
+				begin.flags = priority ? 1u : 0u;
+				begin.data[0] = priority ? 1u : 0u;
+				begin.data[1] = context.point; begin.data[2] = context.request;
+				auto running = context;
+				running.cause = CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, begin).parent;
+				CausalDiagnostics::ContextScope active(running);
+				CausalDiagnostics::CallbackExecutionScope execution(
+				    CausalDiagnostics::QueuedExecution(accepted, running.cause));
+				callback();
+				auto end = CausalDiagnostics::Make(CausalDiagnostics::Event::PriorityCallbackEnd,
+				    CausalDiagnostics::Domain(&m_master), id, tick);
+				end.related = m_causal_state->lifetime.sequence;
+				end.flags = priority ? 1u : 0u;
+				end.data[0] = priority ? 1u : 0u;
+				end.data[1] = context.point; end.data[2] = context.request;
+				CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, end);
+			};
+			// One selected tick is shared by the actual pending operation and its
+			// diagnostic capsule. Commit metadata only after insertion succeeds.
+			queue.push({std::move(operation), tick});
+			m_causal_state->parents.Enqueued(priority, context);
+			// Publish only accepted metadata, before unlocking permits a dequeue.
+			witness.PublishAccepted(accepted);
+		} else {
+			queue.push({std::move(operation), CurrentTick()});
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -431,6 +563,9 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 		                           [this] { return m_operation_state == OperationState::Closed; });
 	}
 	lock.unlock();
+	witness.PublishInline();
+	CausalDiagnostics::CallbackExecutionScope inline_execution(
+	    CausalDiagnostics::InlineExecution(), m_causal_state != nullptr);
 	operation();
 }
 
@@ -442,31 +577,60 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
+		CausalDiagnostics::Context context{};
+		uint64_t causal_id = 0;
+		bool parent_missing = false;
 		{
 			std::unique_lock lock(m_operation_mutex);
+			if (m_causal_state) m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::QueueWait);
 			m_operation_available.wait(lock, [this, &stop] {
 				return stop.stop_requested() || !m_priority_operations.empty();
 			});
 			if (stop.stop_requested()) {
+				if (m_causal_state) m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::Stopped);
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
 			m_priority_operations.pop();
 			m_priority_active_tick = operation.tick;
+			if (m_causal_state) {
+				context = m_causal_state->parents.Dequeued(true, CausalDiagnostics::Domain(&m_master),
+				                                   causal_id, parent_missing);
+				m_causal_state->active_operation = causal_id;
+				m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::NativeWait);
+			}
+		}
+		CausalDiagnostics::ContextScope causal_scope(context, m_causal_state != nullptr);
+		if (m_causal_state) {
+			auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::PriorityDequeued,
+			    CausalDiagnostics::Domain(&m_master), causal_id, operation.tick);
+			record.related = m_causal_state->lifetime.sequence;
+			record.flags = 1u | (parent_missing ? 0x80u : 0u);
+			record.data[0] = 1; record.data[1] = context.point; record.data[2] = context.request;
+			CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, record);
+			record.event = CausalDiagnostics::Event::PriorityWait;
+			record.timestamp_ns = CausalDiagnostics::NowNs();
+			CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Priority, record);
 		}
 		{
 			Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::AsyncPublishWorker);
 			m_master.Wait(operation.tick);
 		}
 		if (!stop.stop_requested()) {
+			if (m_causal_state) m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::Callback);
 			RunOperation(std::move(operation.callback));
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active_tick = 0;
+			if (m_causal_state) {
+				m_causal_state->active_operation = 0;
+				m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::Idle);
+			}
 		}
 		m_operation_available.notify_all();
 	}
+	if (m_causal_state) m_causal_state->SetPhase(CausalDiagnostics::WorkerPhase::Stopped);
 }
 
 void CommandScheduler::DrainPriorityOperations() {
@@ -540,6 +704,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	CausalDiagnostics::ParentRef causal_submit{};
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -561,12 +726,33 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		if (m_causal_state) {
+			auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::NativeSubmitAttempt,
+			    CausalDiagnostics::Domain(&m_master), 0, tick);
+			record.related = m_causal_state->lifetime.sequence;
+			record.data[0] = m_submit_work_count;
+			record.data[1] = submit.num_wait_semaphores; record.data[2] = submit.num_signal_semaphores;
+			causal_submit = CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record).parent;
+		}
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (m_causal_state && result == vk::Result::eSuccess) {
+			m_causal_state->last_native_submit.store(tick, std::memory_order_release);
+		}
 		if (result == vk::Result::eSuccess) {
 			// CommandBuffer no longer records which operation produced the work, so the history
 			// and counters mark the submit Unknown (10) instead of claiming a dispatch.
 			RecordSubmitHistory(tick, 10, 0, 0, 0, 0, 0, 0);
 		}
+	}
+
+	if (m_causal_state) {
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::NativeSubmitResult,
+		    CausalDiagnostics::Domain(&m_master), 0, tick);
+		record.SetParent(causal_submit);
+		record.related = m_causal_state->lifetime.sequence;
+		record.data[0] = static_cast<uint64_t>(static_cast<int64_t>(result));
+		record.data[1] = m_submit_work_count; record.data[2] = m_master.KnownGpuTick();
+		CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record);
 	}
 
 	if (result == vk::Result::eSuccess && GpuSyncDebugEnabled()) {

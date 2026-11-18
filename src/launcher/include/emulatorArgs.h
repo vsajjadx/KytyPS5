@@ -7,6 +7,7 @@
 class Configuration;
 
 // Normal launches and desktop shortcuts must use this same argument list.
-[[nodiscard]] QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_plan = {});
+[[nodiscard]] QStringList CreateEmulatorArgs(const Configuration& info, const QString& patch_plan = {},
+                                             QString* error = nullptr);
 
 #endif

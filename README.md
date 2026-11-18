@@ -26,14 +26,25 @@ can change significantly between builds.
 ## This Fork
 
 This is an unofficial fork of KytyPS5. Builds and notes are on the
-[fork releases page](https://github.com/vsajjadx/KytyPS5/releases); report fork-specific problems
-in [this repository](https://github.com/vsajjadx/KytyPS5/issues). Fork changes are tested on
-Windows x64 only.
+[fork releases page](https://github.com/vsajjadx/KytyPS5/releases). Fork changes are tested on
+Windows x64 only. This repository currently has issues disabled.
 
-**Compatibility.** This Windows candidate passed all 124 regression tests and controlled UFC 6
-samples at every requested Multi factor 2–6 on the animated offline main menu. This is a menu
-result, not gameplay or general game compatibility. Wolverine is not confirmed working;
-previous tests remained black at 0 FPS with unsupported shader/descriptor operations.
+**2026-11-18 correctness and diagnostics update.** The complete clean-origin build and
+all **144/144 registered regression tests** pass. A separate native metadata-ledger fixture also
+passes its exact 21-word GPU readback and native completion checks. The successful test artifacts
+were built from the recorded `96de01dc-dirty` source state; final committed release binaries are
+identified separately in the package manifest. Persisted opcode IDs and the reproduced
+deferred-queue access violation have tested repairs.
+Wolverine's tested descriptor path compiles and passes the native renderer cases, but the recorded
+game still remains black. Its instrumented `(0,1,1)` indirect arguments are legal zero-work input,
+and neither those values nor timeline progress establish a shader fault or working gameplay.
+The legal observer controls and bounded metadata ledger improve the available evidence without
+claiming a game fix. A controlled UFC 6 Practice baseline exists; final candidate gameplay and
+matched performance verification remain pending. See the [current validation evidence](docs/gameplay-validation-2026-11-18.md)
+and [upstream provenance](docs/upstream-provenance-2026-11-18.md).
+
+**Historical 2026-11-14 release.** That candidate passed 124 regression tests and controlled UFC 6
+samples at requested Multi factors 2-6 on the animated offline main menu. Those are menu results.
 
 Download the [MultiFG release](https://github.com/vsajjadx/KytyPS5/releases/tag/KytyPS5-2026-11-14-MultiFG) and see the
 [functional source snapshot `bfe7e4d`](https://github.com/vsajjadx/KytyPS5/commit/bfe7e4de9e5e65165c862d1a765e4f08c626e9f3).
@@ -85,7 +96,7 @@ and scene cuts fall back to real images. Changes to enable state, backend, facto
 overlays cancel stale generated work; GPU resources remain retained until their recorded use
 completes. HDR, extra overlay layers and long-session quality are not established Multi results.
 
-**Current validation.** The latest v6 development candidate passed **124/124 tests in 116.35 s**,
+**Historical 2026-11-14 validation.** The v6 development candidate passed **124/124 tests in 116.35 s**,
 including its complete native GPU group in **22.27 s**. Coverage includes the 90 original
 image/region checks, 75 additional static-HUD region checks at every factor 2–6, 20 scene-change
 cases, and an FSR → Multi → FSR lifecycle sequence. Existing image thresholds and input/output

@@ -60,10 +60,27 @@ add_executable(launcher_frame_generation_tests EXCLUDE_FROM_ALL
 	src/configuration.cpp
 	src/emulatorArgs.cpp
 	src/gameContent.cpp
+	src/ufc6GraphicsProfile.cpp
+	src/cheatFile.cpp
+	resources.qrc
 )
-target_link_libraries(launcher_frame_generation_tests Qt6::Gui common)
+target_link_libraries(launcher_frame_generation_tests Qt6::Gui common FFmpeg::ffmpeg)
 target_include_directories(launcher_frame_generation_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set_target_properties(launcher_frame_generation_tests PROPERTIES AUTOMOC ON)
+set_target_properties(launcher_frame_generation_tests PROPERTIES AUTOMOC ON AUTORCC ON)
+
+add_executable(launcher_graphics_profile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGraphicsProfileTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+	src/emulatorArgs.cpp
+	src/gameContent.cpp
+	src/ufc6GraphicsProfile.cpp
+	src/cheatFile.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_graphics_profile_tests Qt6::Gui common FFmpeg::ffmpeg)
+target_include_directories(launcher_graphics_profile_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_graphics_profile_tests PROPERTIES AUTOMOC ON AUTORCC ON)
 
 add_executable(launcher_settings_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LauncherSettingsDialogTests.cpp"
@@ -81,6 +98,9 @@ target_link_libraries(launcher_settings_dialog_tests Qt6::Widgets Vulkan::Header
 target_include_directories(launcher_settings_dialog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_settings_dialog_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 if(BUILD_TESTING)
+	add_test(NAME launcher_graphics_profile COMMAND $<TARGET_FILE:launcher_graphics_profile_tests>)
+	set_tests_properties(launcher_graphics_profile PROPERTIES LABELS "cpu;launcher;graphics_profile")
+	add_dependencies(kyty_tests launcher_graphics_profile_tests)
 	add_test(NAME launcher_frame_generation COMMAND $<TARGET_FILE:launcher_frame_generation_tests>)
 	set_tests_properties(launcher_frame_generation PROPERTIES LABELS "cpu;launcher;frame_generation_options")
 	add_dependencies(kyty_tests launcher_frame_generation_tests)
@@ -190,14 +210,17 @@ endif()
 
 if(WIN32)
     install(CODE "
-    		execute_process(
-    			COMMAND ${QT_WINDEPLOYQT} \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}.exe\"
-				--no-compiler-runtime
-				--no-system-d3d-compiler
-				--no-system-dxc-compiler
-				--no-opengl-sw
-				--no-translations
-    		)
+        execute_process(
+            COMMAND \"${QT_WINDEPLOYQT}\" \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}.exe\"
+                --no-compiler-runtime
+                --no-system-d3d-compiler
+                --no-system-dxc-compiler
+                --no-opengl-sw
+                --no-translations
+            RESULT_VARIABLE _kyty_deploy_result)
+        if(NOT _kyty_deploy_result EQUAL 0)
+            message(FATAL_ERROR \"windeployqt failed with \${_kyty_deploy_result}\")
+        endif()
     ")
 elseif(LINUX)
 	# Bundle the Qt runtime and plugins.

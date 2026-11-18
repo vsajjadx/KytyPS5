@@ -368,3 +368,18 @@ VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
 VALUE_OPCODE(CallTableMiss, Void, U32, U32, U32)
 // A call's saved return address (call pc + 4). Must be dead after linking (has_swap_pc guard).
 VALUE_OPCODE(CallReturnAddress, U64, U32)
+
+// Keep all historical opcode IDs above unchanged: ResourcePlan serializes their uint16_t values.
+// New operations must be appended here, after the complete existing wire schema.
+// Reduces the subgroup by the 32-bit ValueOpcode in its flags.
+VALUE_OPCODE(SubgroupReduceU32, U32, U32)
+
+// A ray query over the mirror of the dispatch's guest TLAS: whether its context is valid; origin
+// xyz, direction xyz, t_max and cull mask; then per candidate {t, u, v, guest prim record} and the
+// guest address of its instance.
+VALUE_OPCODE(RayQueryValid, U1)
+VALUE_OPCODE(RayQueryInitialize, Void, U32, U32, U32, U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(RayQueryProceed, U1, U1)
+VALUE_OPCODE(RayQueryCandidate, U32x4, U1)
+VALUE_OPCODE(RayQueryCandidateInstance, U64, U1)
+VALUE_OPCODE(RayQueryConfirm, Void, U1)

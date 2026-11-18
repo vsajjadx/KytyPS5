@@ -12,6 +12,8 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/frameStats.h"
 #include "common/platform/sysDbg.h"
+#include "graphics/host_gpu/renderer/causalDiagnosticsRuntime.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedger.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -32,11 +34,20 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
+namespace Causal = CausalDiagnostics;
+
+enum class CausalScheduleReason : uint8_t {
+	EmptyWait, HostCommand, Runnable, BlockedWait, IdleDeferredFlush, BlockedDeferredFlush, Shutdown
+};
+enum class CausalPublicationRoute : uint64_t {
+	GuestMapping = 1, CpuBacking, BackingFallbackMapping, CpuBackingAndRecordedGpuMirror, GpuStoreFallbackMapping, GdsReadback
+};
 
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
@@ -78,6 +89,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	if (IsGpuThread()) {
 		command();
 		return;
+	}
+	if (Causal::Enabled()) {
+		// A queued host callback can interrupt ProcessPm4. Its caller, not the
+		// interrupted guest slice, owns any native work recorded by that callback.
+		command = Common::UniqueFunction<void>(
+		    Causal::BindContext(Causal::CurrentContext(), std::move(command)));
 	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
@@ -150,7 +167,22 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	std::optional<Causal::ContextScope> enter_scope;
+	std::optional<Causal::ContextScope> acquired_scope;
+	if (Causal::Enabled()) {
+		auto context = Causal::CurrentContext();
+		context.point = Causal::NewId();
+		auto event = Causal::Make(Causal::Event::SuspendEnter, Causal::Domain(this), context.point);
+		context.cause = Causal::RecordEvent(Causal::Family::Guest, event).parent;
+		enter_scope.emplace(context);
+	}
 	m_suspend_point_ready->acquire();
+	if (Causal::Enabled()) {
+		auto context = Causal::CurrentContext();
+		auto event = Causal::Make(Causal::Event::SuspendAcquired, Causal::Domain(this), context.point);
+		context.cause = Causal::RecordEvent(Causal::Family::Guest, event).parent;
+		acquired_scope.emplace(context);
+	}
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -277,7 +309,23 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	// Keep the production wait's single read; diagnostics must never reread a label.
+	const auto observed = *addr;
+	const bool satisfied = TestWaitRegMemValue(observed, ref, mask, func);
+	if (Causal::Enabled()) {
+		const auto context = Causal::CurrentContext();
+		auto event = Causal::Make(Causal::Event::SignalObserved, Causal::Domain(this),
+		                          context.guest.id, GetScheduler().CurrentTick());
+		event.data[0] = reinterpret_cast<uint64_t>(addr);
+		event.data[1] = observed;
+		event.data[2] = mask;
+		event.related = ref;
+		event.flags = static_cast<uint8_t>(func | (wait_op << 4u) |
+		                                  (sizeof(T) == 8 ? 0x40u : 0u) |
+		                                  (satisfied ? 0x80u : 0u));
+		Causal::RecordEvent(Causal::Family::Signal, event, true);
+	}
+	if (!satisfied) {
 		SuspendPm4();
 	}
 }
@@ -327,7 +375,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
-		*output = src[i];
+		const uint32_t value = src[i]; // retain the one existing source load
+		*output = value;
+		if (auto* ledger = IndirectArgsLedger::Active()) {
+			ledger->CpuStore(reinterpret_cast<uint64_t>(output), &value, sizeof(value));
+		}
 		output += !write_one_address;
 	}
 }
@@ -340,6 +392,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuStore(dst_address, &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -414,8 +467,37 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
-	m_queues[submission.queue_id].push_back(std::move(submission));
+	const auto queue_id = submission.queue_id;
+	m_queues[queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	if (Causal::Enabled()) {
+		auto& queued = m_queues[queue_id].back();
+		const auto context = Causal::CurrentContext();
+		queued.diagnostic_id = Causal::NewId();
+		queued.diagnostic_point = context.point;
+		queued.diagnostic_request = queued.type == SubmissionType::FlipPreparation
+		                                ? queued.flip_request_id : context.request;
+		auto event = Causal::Make(Causal::Event::GuestEnqueue, Causal::Domain(this), queued.diagnostic_id);
+		event.data[0] = queued.queue_id;
+		event.data[1] = static_cast<uint64_t>(queued.type);
+		event.data[2] = queued.type == SubmissionType::Commands ? queued.commands.size()
+		                : queued.type == SubmissionType::FlipPreparation ? queued.flip_request_id
+		                                                                 : queued.diagnostic_point;
+		event.related = queued.diagnostic_point;
+		const auto parent = Causal::RecordEvent(Causal::Family::Guest, event).parent;
+		queued.diagnostic_sequence = parent.sequence;
+		if (queued.type == SubmissionType::SuspendPoint) {
+			auto marker_context = context;
+			marker_context.guest = parent;
+			marker_context.cause = parent;
+			Causal::ContextScope marker_scope(marker_context);
+			auto marker = Causal::Make(Causal::Event::SuspendEnqueued, Causal::Domain(this),
+			                           queued.diagnostic_point);
+			marker.SetParent(parent);
+			marker.related = queued.diagnostic_id;
+			Causal::RecordEvent(Causal::Family::Guest, marker);
+		}
+	}
 	m_work_available.Signal();
 }
 
@@ -433,6 +515,19 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
 	SysStartSamplingCurrentThread("gpu");
+	const bool causal_enabled = Causal::Enabled();
+	// Every invocation is under m_queue_mutex. The deferred flag remains GPU-thread-only.
+	const auto record_schedule = [gpu, causal_enabled](CausalScheduleReason reason, int selected = -1) {
+		if (!causal_enabled) return;
+		auto event = Causal::Make(Causal::Event::GuestSchedule, Causal::Domain(gpu));
+		event.data[0] = gpu->m_submission_count;
+		event.data[1] = gpu->m_commands.size();
+		event.data[2] = gpu->m_next_queue;
+		event.related = selected < 0 ? UINT64_MAX : static_cast<uint64_t>(selected);
+		event.flags = static_cast<uint8_t>(reason) | (gpu->m_deferred_flush ? 0x40u : 0u) |
+		              (gpu->m_stopping ? 0x80u : 0u);
+		Causal::RecordEvent(Causal::Family::Guest, event, true);
+	};
 
 	for (;;) {
 		Submission                   submission;
@@ -449,20 +544,32 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				record_schedule(CausalScheduleReason::EmptyWait);
 				KYTY_PROFILER_BLOCK("GuestGpu::EmptyQueueWait");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (FaultPeekEnabled() && gpu->m_commands.empty() &&
+				    gpu->m_submission_count == 0 && !gpu->m_stopping && !gpu->m_deferred_flush) {
+					gpu->m_queue_mutex.Unlock();
+					(void)gpu->m_renderer.GetBufferCache().PeekCompletedFaultDownloads();
+					if (IndirectArgsDiagnosticEnabled())
+						(void)gpu->m_renderer.GetBufferCache().PeekCompletedIndirectArgs();
+					gpu->m_queue_mutex.Lock();
+				}
 			}
 			if (flush_deferred) {
 				gpu->m_processing = true;
+				record_schedule(CausalScheduleReason::IdleDeferredFlush);
 			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
+				record_schedule(CausalScheduleReason::Shutdown);
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
+				record_schedule(CausalScheduleReason::HostCommand);
 			} else {
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
@@ -476,8 +583,10 @@ void GuestGpu::ThreadRun(void* data) {
 					// Blocked submissions may wait on batched work that is not submitted yet.
 					flush_deferred    = true;
 					gpu->m_processing = true;
+					record_schedule(CausalScheduleReason::BlockedDeferredFlush);
 				} else if (selected_queue < 0) {
 					gpu->m_processing = false;
+					record_schedule(CausalScheduleReason::BlockedWait);
 					{
 						KYTY_PROFILER_BLOCK("GuestGpu::BlockedSubmissionWait");
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -488,19 +597,34 @@ void GuestGpu::ThreadRun(void* data) {
 						}
 					}
 					continue;
+				} else {
+					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+					submission  = std::move(queue.front());
+					queue.pop_front();
+					gpu->m_submission_count--;
+					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+					gpu->m_processing = true;
 				}
-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
-				queue.pop_front();
-				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
+				if (selected_queue >= 0) record_schedule(CausalScheduleReason::Runnable, selected_queue);
 			}
 		}
 		if (flush_deferred) {
 			gpu->m_deferred_flush = false;
 			gpu->m_gfx_cp->BufferInit();
+			uint64_t diagnostic_tick = 0, diagnostic_work = 0;
+			if (causal_enabled) {
+				diagnostic_tick = gpu->m_renderer.GetCommandScheduler().CurrentTick();
+				diagnostic_work = gpu->m_renderer.GetCommandScheduler().CurrentSubmitWorkCount();
+			}
 			gpu->m_gfx_cp->BufferFlush();
+			if (causal_enabled) {
+				auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+				auto event = Causal::Make(Causal::Event::GuestFlush, Causal::Domain(&scheduler.GetMasterSemaphore()), 0, diagnostic_tick);
+				event.data[2] = diagnostic_work;
+				event.related = scheduler.CurrentTick();
+				event.flags = 3; // Existing forced deferred flush, outside the queue lock.
+				Causal::RecordEvent(Causal::Family::Guest, event);
+			}
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
 			continue;
@@ -561,16 +685,57 @@ void GuestGpu::FlushSubmission(CommandProcessor& cp, bool complete) {
 		Common::LockGuard lock(m_queue_mutex);
 		idle = m_commands.empty() && m_submission_count == 0;
 	}
+	uint64_t diagnostic_tick = 0, diagnostic_work = 0;
+	if (Causal::Enabled()) {
+		diagnostic_tick = m_renderer.GetCommandScheduler().CurrentTick();
+		diagnostic_work = m_renderer.GetCommandScheduler().CurrentSubmitWorkCount();
+	}
+	const auto record_flush = [&](uint8_t reason) {
+		if (!Causal::Enabled()) return;
+		auto& scheduler = m_renderer.GetCommandScheduler();
+		const auto context = Causal::CurrentContext();
+		auto event = Causal::Make(Causal::Event::GuestFlush, Causal::Domain(&scheduler.GetMasterSemaphore()),
+		                          context.guest.id, diagnostic_tick);
+		event.data[0] = complete;
+		event.data[1] = idle;
+		event.data[2] = diagnostic_work;
+		event.related = scheduler.CurrentTick();
+		event.flags = reason;
+		Causal::RecordEvent(Causal::Family::Guest, event);
+	};
 	if (idle) {
 		m_deferred_flush = false;
 		cp.BufferFlush();
+		record_flush(1);
 	} else if (!cp.BufferFlushDeferred()) {
 		m_deferred_flush = true;
+		record_flush(0);
+	} else {
+		record_flush(2);
 	}
 }
 
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
+	std::optional<Causal::ContextScope> guest_scope;
+	std::optional<Causal::ContextScope> slice_scope;
+	if (Causal::Enabled()) {
+		Causal::Context context{};
+		context.guest = {submission.diagnostic_sequence, Causal::Domain(this),
+		                 submission.diagnostic_id, Causal::Family::Guest};
+		context.cause = context.guest;
+		context.point = submission.diagnostic_point;
+		context.request = submission.diagnostic_request;
+		guest_scope.emplace(context);
+		auto event = Causal::Make(Causal::Event::GuestSliceBegin, Causal::Domain(this),
+		                          submission.diagnostic_id, m_renderer.GetCommandScheduler().CurrentTick());
+		event.data[0] = submission.queue_id;
+		event.data[1] = static_cast<uint64_t>(submission.type);
+		event.data[2] = submission.commands.size();
+		event.related = context.point;
+		context.cause = Causal::RecordEvent(Causal::Family::Guest, event).parent;
+		slice_scope.emplace(context);
+	}
 
 	cp.BufferInit();
 	bool complete = true;
@@ -589,13 +754,37 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			if (Causal::Enabled()) {
+				const auto domain = Causal::Domain(this);
+				const auto point = submission.diagnostic_point;
+				// The scheduler restores the captured context and installs its
+				// callback-begin parent. Capture no GuestGpu lifetime reference.
+				m_renderer.GetCommandScheduler().DeferPriorityOperation(
+				    [ready = m_suspend_point_ready, domain, point] {
+					    ready->release();
+					    if (Causal::Enabled()) {
+						    auto event = Causal::Make(Causal::Event::SuspendCreditReleased, domain, point);
+						    Causal::RecordEvent(Causal::Family::Guest, event);
+					    }
+				    });
+			} else {
+				m_renderer.GetCommandScheduler().DeferPriorityOperation(
+				    [ready = m_suspend_point_ready] { ready->release(); });
+			}
 			cp.BufferFlush();
 			cp.Reset();
 			break;
 	}
 
+	if (Causal::Enabled()) {
+		auto event = Causal::Make(Causal::Event::GuestSliceEnd, Causal::Domain(this),
+		                          submission.diagnostic_id, m_renderer.GetCommandScheduler().CurrentTick());
+		event.data[0] = submission.queue_id;
+		event.data[1] = static_cast<uint64_t>(submission.type);
+		event.data[2] = (complete ? 1u : 0u) | (submission.execution.MadeProgress() ? 2u : 0u);
+		event.related = submission.diagnostic_point;
+		Causal::RecordEvent(Causal::Family::Guest, event);
+	}
 	return complete;
 }
 
@@ -693,6 +882,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			if (Causal::Enabled()) {
+				const auto context = Causal::CurrentContext();
+				auto event = Causal::Make(Causal::Event::GuestBlocked, Causal::Domain(this),
+				                          context.guest.id, GetScheduler().CurrentTick());
+				event.data[0] = opcode;
+				event.data[1] = cursor.offset_dw;
+				event.data[2] = remaining_dw;
+				event.related = context.point;
+				Causal::RecordEvent(Causal::Family::Guest, event, true);
+			}
 			return;
 		}
 		cursor.offset_dw += packet_dw;
@@ -1008,19 +1207,43 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
+	const bool causal_enabled = Causal::Enabled();
+	uint64_t diagnostic_id = 0;
+	Causal::ParentRef publication_parent{};
+	if (causal_enabled) diagnostic_id = Causal::NewId();
+	const auto record_publication = [&](CausalPublicationRoute route) {
+		if (!causal_enabled) return;
+		const bool scalar_value = data_sel == 1 || data_sel == 2 || data_sel == 3;
+		auto event = Causal::Make(Causal::Event::SignalPublished, Causal::Domain(this),
+		                          diagnostic_id, GetScheduler().CurrentTick());
+		event.data[0] = reinterpret_cast<uint64_t>(address);
+		event.data[1] = scalar_value ? (data_sel == 1 ? static_cast<uint32_t>(data) : data) : 0;
+		event.data[2] = static_cast<uint64_t>(route);
+		event.related = interrupt_context_id;
+		event.flags = static_cast<uint8_t>(data_sel | (interrupt_selector << 3u) |
+		                                  (gl2_writeback ? 0x40u : 0u) | (scalar_value ? 0x80u : 0u));
+		publication_parent = Causal::RecordEvent(Causal::Family::Signal, event).parent;
+	};
+
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
 	// downloads GPU-written bytes under the label before the store.
-	const auto write_label = [this, address](const void* value, uint64_t size) {
+	const auto write_label = [this, address, &record_publication](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size)) {
 			std::memcpy(address, value, size);
+			if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuStore(vaddr, value, size);
+			record_publication(CausalPublicationRoute::GuestMapping);
 			return;
 		}
 		if (!buffers.HasGpuDirtyBytes(vaddr, size)) {
 			if (!LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 				std::memcpy(address, value, size);
+				if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuStore(vaddr, value, size);
+				record_publication(CausalPublicationRoute::BackingFallbackMapping);
+			} else {
+				record_publication(CausalPublicationRoute::CpuBacking);
 			}
 			return;
 		}
@@ -1029,6 +1252,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		// GPU thread).
 		if (!buffers.StoreOverGpuDirty(vaddr, value, size)) {
 			std::memcpy(address, value, size);
+			if (auto* ledger = IndirectArgsLedger::Active()) ledger->CpuStore(vaddr, value, size);
+			record_publication(CausalPublicationRoute::GpuStoreFallbackMapping);
+		} else {
+			record_publication(CausalPublicationRoute::CpuBackingAndRecordedGpuMirror);
 		}
 	};
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
@@ -1046,6 +1273,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
+			record_publication(CausalPublicationRoute::GdsReadback);
 			break;
 		}
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
@@ -1053,10 +1281,31 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 	if (interrupt) {
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-		    });
+		if (causal_enabled) {
+			auto context = Causal::CurrentContext();
+			if (publication_parent.sequence != 0) context.cause = publication_parent;
+			Causal::ContextScope publication_scope(context);
+			const auto domain = Causal::Domain(this);
+			const auto label = reinterpret_cast<uint64_t>(address);
+			GetScheduler().DeferPriorityOperation(
+			    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id,
+			     domain, label, diagnostic_id, interrupt_selector] {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+				    if (Causal::Enabled()) {
+					    auto event = Causal::Make(Causal::Event::InterruptCallback, domain, diagnostic_id);
+					    event.data[0] = static_cast<uint64_t>(event_id);
+					    event.data[1] = interrupt_context_id;
+					    event.data[2] = label;
+					    event.flags = static_cast<uint8_t>(interrupt_selector);
+					    Causal::RecordEvent(Causal::Family::Signal, event);
+				    }
+			    });
+		} else {
+			GetScheduler().DeferPriorityOperation(
+			    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    });
+		}
 	}
 }
 
@@ -1179,6 +1428,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_state != nullptr;
+}
+
+bool GuestGpu::IsGpuThreadFor(const RenderContext& renderer) noexcept {
+	return g_gpu_state != nullptr && &g_gpu_state->m_renderer == &renderer;
 }
 
 } // namespace Libs::Graphics

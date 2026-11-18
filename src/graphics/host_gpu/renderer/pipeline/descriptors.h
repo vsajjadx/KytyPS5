@@ -47,6 +47,9 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 	BufferCache::PreparedUpload           uploads;
+	// Immutable host-visible copies of CallClosure::data, retained by CommitBindings at the
+	// actual consumer tick. Parallel to runtime->call_closure->data, never raw code.
+	std::vector<vk::DescriptorBufferInfo> call_data_sources;
 };
 
 [[nodiscard]] vk::DescriptorType

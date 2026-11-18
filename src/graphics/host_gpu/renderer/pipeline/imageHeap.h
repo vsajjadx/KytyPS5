@@ -7,6 +7,8 @@
 
 #include <deque>
 #include <memory>
+#include <span>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -50,6 +52,87 @@ public:
 	// At a suspend point.
 	void RunGarbageCollector();
 
+
+	// A compute call closure may coexist with read-only sampled heap bindings only when
+	// every derived table/image input is disjoint from its immutable guest bytes.
+	// These owned identities survive Commit clearing m_active; no retained View* is used.
+	// GPU/render thread only, like Acquire/Rebind/Commit. Live unmap and suspend-point GC
+	// run on that thread; CPU faults change only locked dirty pages. Native-owner tracked
+	// ranges are copied under TextureCache's lock because CPU faults can shrink them.
+	struct CallClosureProof {
+		struct Reference {
+			uint32_t image = 0, mapping_offset = 0, slot_count = 0;
+			uint64_t slots = 0, view_serial = 0;
+			ShaderRecompiler::IR::ImageResource profile;
+			bool operator==(const Reference&) const = default;
+		};
+		struct View {
+			uint64_t serial = 0;
+			GuestRange table;
+			vk::Buffer buffer = nullptr;
+			uint64_t slots = 0;
+			uint32_t slot_count = 0;
+			uint64_t first = 0, step = 0, count = 0, limit = 0;
+			size_t element_begin = 0, element_count = 0;
+			ShaderRecompiler::IR::ImageResource profile;
+			bool operator==(const View&) const = default;
+		};
+		struct Element {
+			uint32_t index = 0, kind = 0;
+			ShaderRecompiler::IR::DescriptorValue descriptor;
+			ImageId image_id;
+			uint64_t serial = 0;
+			vk::ImageView view = nullptr;
+			vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+			GuestRange requested_data, requested_metadata, requested_stencil;
+			bool operator==(const Element&) const = default;
+		};
+		// Fixed snapshots of input geometry and identity, not pointers into TextureCache.
+		// A stencil-plane record may have no native image of its own.
+		struct ImageInput {
+			ImageId image_id, depth_id;
+			uint64_t serial = 0;
+			vk::Image image = nullptr;
+			GuestRange data, metadata, stencil, tracked;
+			vk::Format format = vk::Format::eUndefined;
+			Prospero::BufferFormat guest_format = Prospero::BufferFormat::kInvalid;
+			Prospero::ImageType type = Prospero::ImageType::kColor2D;
+			vk::Extent3D extent = {0, 0, 0};
+			ImageSubresources resources;
+			ImageSubresourceRange mapping;
+			uint32_t pitch = 0, bytes_per_block = 0, samples = 0;
+			Prospero::TileMode tile = Prospero::TileMode::kLinear;
+			ImageMetadataKind metadata_kind = ImageMetadataKind::None;
+			VideoOutCompression compression = VideoOutCompression::Uncompressed;
+			uint64_t clear_word = 0;
+			bool stencil_compressed = false, clear_register_valid = false;
+			bool dcc_alpha_msb = false, htile_initial_clear = false;
+			bool operator==(const ImageInput&) const = default;
+		};
+		struct Owner {
+			ImageInput input;
+			size_t association_begin = 0, association_count = 0;
+			bool operator==(const Owner&) const = default;
+		};
+		uint64_t draw = 0;
+		vk::DescriptorSet set = nullptr;
+		Element null_element;
+		std::vector<Reference> references;
+		std::vector<View> views;
+		std::vector<Element> elements;
+		std::vector<Owner> owners;
+		std::vector<ImageInput> associations;
+		std::vector<GuestRange> ranges;
+	};
+	[[nodiscard]] bool CaptureCallClosure(
+	    std::span<const ShaderRecompiler::IR::ImageResource> resources,
+	    std::span<const uint32_t> flattened_srt, std::span<const GuestRange> protected_ranges,
+	    CallClosureProof& proof, std::string& reason) const;
+	[[nodiscard]] bool ValidateCallClosure(
+	    std::span<const ShaderRecompiler::IR::ImageResource> resources,
+	    std::span<const uint32_t> flattened_srt, const CallClosureProof& proof,
+	    std::string& reason) const;
+
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
 
@@ -70,6 +153,7 @@ private:
 
 	struct View {
 		Memory&                             memory;
+		uint64_t                            serial = 0; // Never reused, unlike an address.
 		uint64_t                            step  = 0;
 		uint64_t                            first = 0;
 		uint64_t                            count = 0;
@@ -104,6 +188,28 @@ private:
 		std::vector<std::unique_ptr<View>> views;
 	};
 
+
+	[[nodiscard]] bool ReadCallReference(
+	    uint32_t image, const ShaderRecompiler::IR::ImageResource& resource,
+	    std::span<const uint32_t> flattened_srt, CallClosureProof::Reference& result,
+	    std::string& reason) const;
+	[[nodiscard]] bool ReadCallView(const View& view, CallClosureProof::View& result,
+	                                std::string& reason) const;
+	[[nodiscard]] bool ReadCallElement(uint32_t index, CallClosureProof::Element& result,
+	                                   std::string& reason) const;
+	[[nodiscard]] static bool ReadCallImage(ImageId id, const Image& image,
+	                                        CallClosureProof::ImageInput& result,
+	                                        std::string& reason);
+	[[nodiscard]] static bool CheckCallAssociation(const CallClosureProof::ImageInput& owner,
+	                                               const CallClosureProof::ImageInput& plane,
+	                                               std::string& reason);
+	[[nodiscard]] bool CaptureCallOwner(ImageId id, uint64_t serial, CallClosureProof::Owner& result,
+	                                    std::vector<CallClosureProof::ImageInput>& associations,
+	                                    std::string& reason) const;
+	[[nodiscard]] bool ValidateCallOwner(const CallClosureProof::Owner& saved,
+	                                     std::span<const CallClosureProof::ImageInput> associations,
+	                                     std::string& reason) const;
+
 	[[nodiscard]] bool Refresh(Memory& memory);
 	void               MarkDirty(Memory& memory, size_t begin, size_t end);
 	template <bool track>
@@ -128,6 +234,7 @@ private:
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
+	uint64_t                             m_view_serial  = 0;
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
 	std::vector<Element>                 m_elements;

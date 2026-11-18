@@ -13512,6 +13512,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 #include "ShaderTableCallCfgTests.inc"
 #include "ShaderTableLeafGetpcCfgTests.inc"
 #include "ShaderTableTrackingFailureCfgTests.inc"
+#include "ShaderTableCallContextCfgTests.inc"
+#include "ShaderTableCallContextBudgetCfgTests.inc"
+#include "ShaderTableContextFlowCfgTests.inc"
 #include "ShaderMixedGetpcFatalProbe.inc"
 #include "ShaderRayTracingTests.inc"
 
@@ -13522,6 +13525,12 @@ int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--table-context-only") == 0) {
+    TestTableSelectedContextImage();
+    TestTableContextBudgets();
+    TestTableContextControlFlow();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--uniform-leaf-getpc-fatal-probe") == 0) {
     ProbeUniformLeafGetpcFatal();
     return 2; // probe must terminate before returning
@@ -13687,6 +13696,9 @@ int main(int argc, char** argv) {
   TestTableSelectedLeafCall();
   TestTableLeafOriginalGetpc();
   TestTableTrackingSoftFailure();
+  TestTableSelectedContextImage();
+  TestTableContextBudgets();
+  TestTableContextControlFlow();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

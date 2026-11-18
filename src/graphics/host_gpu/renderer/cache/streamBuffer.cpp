@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
 
 #include <cstring>
 #include <numeric>
@@ -90,6 +91,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		m_ledger_identity = ledger->NewResource(IndirectArgsLedger::HandleBits(native_buffer), size);
+	}
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -103,6 +107,25 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
+	}
+}
+
+IndirectArgsLedger::NativeSpan Buffer::LedgerSpan(uint64_t offset, uint64_t size) const noexcept {
+	auto identity = m_ledger_identity;
+	if (identity.handle == 0) {
+		identity.handle = IndirectArgsLedger::HandleBits(static_cast<VkBuffer>(Handle()));
+		identity.bytes = Size(); // late installation: handle/range known, generation unknown
+	}
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		return ledger->Span(identity, offset, size, m_ledger_suballocated);
+	}
+	return {};
+}
+
+void Buffer::LedgerReserve(uint64_t offset, uint64_t size) noexcept {
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		m_ledger_suballocated = true;
+		ledger->Reserve(m_ledger_identity, offset, size);
 	}
 }
 
@@ -170,6 +193,16 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		const auto position = IndirectArgsLedger::RecordingPosition(Scheduler(), native);
+		const auto guest = IndirectArgsLedger::GuestOffset(CpuAddress(), destination_offset, size);
+		const auto source_guest = source.CpuAddress() != 0
+		    ? IndirectArgsLedger::GuestOffset(source.CpuAddress(), source_offset, size)
+		    : IndirectArgsLedger::g_copy_source_guest;
+		ledger->TransferCopy(guest, size, source.LedgerSpan(source_offset, size),
+		                     LedgerSpan(destination_offset, size), position, source_guest,
+		                     IndirectArgsLedger::g_copy_is_migration);
+	}
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, MEMORY_ACCESS),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS),
@@ -191,6 +224,11 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
 	native.fillBuffer(Handle(), offset, size, value);
+	if (auto* ledger = IndirectArgsLedger::Active()) {
+		ledger->TransferFill(IndirectArgsLedger::GuestOffset(CpuAddress(), offset, size), size, value,
+		                     LedgerSpan(offset, size),
+		                     IndirectArgsLedger::RecordingPosition(Scheduler(), native));
+	}
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
@@ -262,6 +300,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
+	LedgerReserve(m_offset, m_mapped_size);
 	return {Mapped().data() + m_offset, m_offset};
 }
 

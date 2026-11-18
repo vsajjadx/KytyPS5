@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsLedger.h"
 
 #include <cstdint>
 #include <memory>
@@ -61,6 +62,9 @@ public:
 		return address >= m_cpu_address && size <= Size() &&
 		       address - m_cpu_address <= Size() - size;
 	}
+	// Metadata only; never resolves a cache slot, queries Vulkan, or touches guest memory.
+	[[nodiscard]] IndirectArgsLedger::NativeSpan LedgerSpan(uint64_t offset, uint64_t size) const noexcept;
+	void LedgerReserve(uint64_t offset, uint64_t size) noexcept;
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
@@ -90,6 +94,8 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	IndirectArgsLedger::ResourceIdentity m_ledger_identity {};
+	bool m_ledger_suballocated = false;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;

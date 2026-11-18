@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/indirectArgsDiagnostics.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/readbackRecordCorrelation.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -37,9 +39,6 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
-	// Tags the BDA page-table entries of pages a DMA shader accessed; an access to another page
-	// records a fault.
-	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -85,6 +84,10 @@ public:
 	void RetainPreparedUploads(const PreparedUpload& uploads);
 
 	[[nodiscard]] uint64_t BindingEpoch() const { return m_activity_epoch.load(); }
+	// GPU thread, read-only: resolve an existing canonical owner without creating, merging,
+	// synchronizing or uploading it. The exact byte view is suitable for an ordered copy.
+	[[nodiscard]] bool CanonicalBinding(uint64_t address, uint64_t size,
+	                                    vk::DescriptorBufferInfo& binding) const;
 	// GPU thread, read-only: validate the actual committed native handle and bound its guest owner.
 	[[nodiscard]] bool BindingOwnerRange(uint64_t address, uint64_t size, vk::Buffer handle,
 	                                     bool written, uint64_t& begin, uint64_t& length,
@@ -172,13 +175,29 @@ public:
 	// Persistent, read-only residency for exact GPU-side address reads.
 	void PrepareBdaRange(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	// Tags fault-scan pages as DMA-accessed and queues them; creates buffers for unbacked ones.
-	void MarkDmaAccess(const RangeSet& pages);
+	[[nodiscard]] FaultManager::HarvestSnapshot ReadFaultHarvestDiagnostics() const noexcept {
+		return m_fault_manager.ReadHarvestDiagnostics();
+	}
+	[[nodiscard]] FaultManager::PeekSnapshot ReadFaultPeekDiagnostics() const noexcept {
+		return m_fault_manager.ReadFaultPeekDiagnostics();
+	}
+	[[nodiscard]] bool PeekCompletedFaultDownloads() noexcept {
+		return m_fault_manager.PeekCompletedFaultDownloads();
+	}
+	[[nodiscard]] IndirectArgsDiagnostics* IndirectArgsObserver() noexcept {
+		return m_indirect_args_diagnostics.get();
+	}
+	[[nodiscard]] IndirectArgsDiagnostics::Snapshot ReadIndirectArgsDiagnostics() const noexcept {
+		return m_indirect_args_diagnostics ? m_indirect_args_diagnostics->Read()
+		                                   : IndirectArgsDiagnostics::Snapshot {};
+	}
+	[[nodiscard]] bool PeekCompletedIndirectArgs() noexcept {
+		return m_indirect_args_diagnostics && m_indirect_args_diagnostics->PeekCompleted();
+	}
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	// A write queues only the pages a DMA shader accessed.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
@@ -236,6 +255,7 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
+	std::unique_ptr<IndirectArgsDiagnostics>           m_indirect_args_diagnostics;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
@@ -250,8 +270,8 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
-	// Pages DMA shaders accessed, guarded by m_bda_sync_mutex.
-	RangeSet                                          m_dma_accessed;
+	// Explicit residency already enrolled, guarded by m_bda_sync_mutex.
+	RangeSet                                          m_bda_prepared;
 	// Cache at most 64 MiB of upload chunks. Additional in-flight chunks remain owned by
 	// their scopes/deferred callbacks and are released after their consumer completes.
 	std::vector<std::shared_ptr<Buffer>> m_prepared_upload_pool;

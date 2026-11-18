@@ -13,6 +13,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/causalDiagnosticsRuntime.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -45,6 +47,171 @@ namespace Libs::VideoOut {
 LIB_NAME("VideoOut", "VideoOut");
 
 namespace EventQueue = LibKernel::EventQueue;
+namespace Causal = Graphics::CausalDiagnostics;
+
+// One fixed, coherent fault snapshot, separate from the causal family histories.
+// The reader uses try-lock; formatting and output hold no engine/cache mutex.
+static void ReportFaultHarvest(const Causal::CurrentState& owner, uint64_t now,
+                               const Graphics::FaultManager::HarvestSnapshot& snapshot) {
+    std::array<char, 8192> text {};
+    size_t used = 0;
+    bool complete = true;
+    const auto append = [&](const char* format, auto... values) {
+        if (!complete) return;
+        const int size = std::snprintf(text.data() + used, text.size() - used, format, values...);
+        if (size <= 0 || static_cast<size_t>(size) >= text.size() - used) {
+            complete = false;
+            return;
+        }
+        used += static_cast<size_t>(size);
+    };
+    const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+    append("FAULT_HARVEST_BEGIN v=1 ns=%llu domain=0x%016llx life=%llu\n",
+           u(now), u(owner.domain), u(owner.lifetime_sequence));
+    append("FAULT_HARVEST_STATE enabled=%u available=%u\n",
+           snapshot.enabled ? 1u : 0u, snapshot.available ? 1u : 0u);
+    if (snapshot.available) {
+        append("FAULT_HARVEST_COUNTS queued=%llu completed=%llu identity_errors=%llu cumulative_misses=%llu\n",
+               u(snapshot.queued_total), u(snapshot.completed_total),
+               u(snapshot.identity_errors), u(snapshot.cumulative_call_table_misses));
+        const auto record = [&](const char* kind, size_t slot, const Graphics::FaultManager::HarvestRecord& item) {
+            append("FAULT_HARVEST_%s slot=%u valid=%u area=%u phase=%u domain=0x%016llx life=%llu op=%llu tick=%llu "
+                   "enqueue_seq=%llu enqueue_tid=%u misses=%llu page_raw=%llu page_clamped=%u "
+                   "shader=0x%016llx target=0x%016llx pc=0x%08x\n",
+                   kind, static_cast<unsigned>(slot), item.valid ? 1u : 0u, static_cast<unsigned>(item.area),
+                   static_cast<unsigned>(item.phase), u(item.domain), u(item.lifetime),
+                   u(item.operation_id), u(item.tick), u(item.enqueue_sequence),
+                   static_cast<unsigned>(item.enqueue_thread), u(item.miss_invocations),
+                   u(item.raw_page_faults), static_cast<unsigned>(item.page_faults),
+                   u(item.call_miss.shader_hash), u(item.call_miss.target),
+                   static_cast<unsigned>(item.call_miss.pc));
+        };
+        for (size_t index = 0; index < snapshot.areas.size(); ++index) record("AREA", index, snapshot.areas[index]);
+        record("LAST", snapshot.last_completed.area, snapshot.last_completed);
+    }
+    append("FAULT_HARVEST_END v=1 ns=%llu\n", u(now));
+    if (complete) {
+        (void)std::fwrite(text.data(), 1, used, stderr);
+    } else {
+        constexpr char error[] = "FAULT_HARVEST_ERROR v=1 bounded_format_failed=1\n";
+        (void)std::fwrite(error, 1, sizeof(error) - 1, stderr);
+    }
+}
+
+
+static void ReportFaultPeek(const Causal::CurrentState& owner, uint64_t now,
+                            const Graphics::FaultManager::PeekSnapshot& snapshot) {
+    std::array<char, 8192> text {};
+    size_t used = 0;
+    bool complete = true;
+    const auto append = [&](const char* format, auto... values) {
+        if (!complete) return;
+        const int size = std::snprintf(text.data() + used, text.size() - used, format, values...);
+        if (size <= 0 || static_cast<size_t>(size) >= text.size() - used) {
+            complete = false;
+            return;
+        }
+        used += static_cast<size_t>(size);
+    };
+    const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+    append("FAULT_PEEK_BEGIN v=1 ns=%llu domain=0x%016llx life=%llu\n",
+           u(now), u(owner.domain), u(owner.lifetime_sequence));
+    append("FAULT_PEEK_STATE enabled=%u available=%u status=%u\n",
+           snapshot.enabled ? 1u : 0u, snapshot.available ? 1u : 0u,
+           static_cast<unsigned>(snapshot.status));
+    if (snapshot.available) {
+        append("FAULT_PEEK_COUNTS observed=%llu known=%llu wait_entered=%llu waited=%llu\n",
+               u(snapshot.observed_total), u(snapshot.cached_known_tick),
+               u(snapshot.host_wait_entered_tick), u(snapshot.host_waited_tick));
+        for (size_t slot = 0; slot < snapshot.areas.size(); ++slot) {
+            const auto& observation = snapshot.areas[slot];
+            const auto& item = observation.staged;
+            append("FAULT_PEEK_AREA slot=%u valid=%u staged_valid=%u area=%u phase=%u "
+                   "domain=0x%016llx life=%llu op=%llu tick=%llu enqueue_seq=%llu enqueue_tid=%u "
+                   "misses=%llu page_raw=%llu page_clamped=%u shader=0x%016llx target=0x%016llx "
+                   "pc=0x%08x observed_known=%llu observed_waited=%llu\n",
+                   static_cast<unsigned>(slot), observation.valid ? 1u : 0u, item.valid ? 1u : 0u,
+                   static_cast<unsigned>(item.area), static_cast<unsigned>(item.phase),
+                   u(item.domain), u(item.lifetime), u(item.operation_id), u(item.tick),
+                   u(item.enqueue_sequence), static_cast<unsigned>(item.enqueue_thread),
+                   u(item.miss_invocations), u(item.raw_page_faults),
+                   static_cast<unsigned>(item.page_faults), u(item.call_miss.shader_hash),
+                   u(item.call_miss.target), static_cast<unsigned>(item.call_miss.pc),
+                   u(observation.observed_known_tick), u(observation.observed_host_waited_tick));
+        }
+    }
+    append("FAULT_PEEK_END v=1 ns=%llu\n", u(now));
+    if (complete) {
+        (void)std::fwrite(text.data(), 1, used, stderr);
+    } else {
+        constexpr char error[] = "FAULT_PEEK_ERROR v=1 bounded_format_failed=1\n";
+        (void)std::fwrite(error, 1, sizeof(error) - 1, stderr);
+    }
+}
+
+// A separate fixed snapshot: exact native-dispatch identity and passive argument
+// observations. No output is formatted while an observer/cache/engine lock is held.
+static void ReportIndirectArgs(const Causal::CurrentState& owner, uint64_t now,
+                               const Graphics::IndirectArgsDiagnostics::Snapshot& snapshot) {
+    std::array<char, 8192> text {};
+    size_t used = 0;
+    bool complete = true;
+    const auto append = [&](const char* format, auto... values) {
+        if (!complete) return;
+        const int size = std::snprintf(text.data() + used, text.size() - used, format, values...);
+        if (size <= 0 || static_cast<size_t>(size) >= text.size() - used) {
+            complete = false;
+            return;
+        }
+        used += static_cast<size_t>(size);
+    };
+    const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+    append("INDIRECT_ARGS_BEGIN v=1 ns=%llu domain=0x%016llx life=%llu\n",
+           u(now), u(owner.domain), u(owner.lifetime_sequence));
+    append("INDIRECT_ARGS_STATE enabled=%u available=%u status=%u shader=0x%016llx capacity=%u\n",
+           snapshot.enabled ? 1u : 0u, snapshot.available ? 1u : 0u,
+           static_cast<unsigned>(snapshot.status), u(snapshot.selected_shader),
+           static_cast<unsigned>(Graphics::IndirectArgsDiagnostics::Capacity));
+    if (snapshot.available) {
+        append("INDIRECT_ARGS_COUNTS matched=%llu copied=%llu observed=%llu capacity_skipped=%llu "
+               "identity_errors=%llu known=%llu wait_entered=%llu waited=%llu\n",
+               u(snapshot.matched_total), u(snapshot.copied_total), u(snapshot.observed_total),
+               u(snapshot.capacity_skipped), u(snapshot.identity_errors), u(snapshot.cached_known_tick),
+               u(snapshot.host_wait_entered_tick), u(snapshot.host_waited_tick));
+        const auto identity = [&](const Graphics::IndirectArgsDiagnostics::Dispatch& item) {
+            append(" recorded=%u ordinal=%llu seq=%llu domain=0x%016llx life=%llu tick=%llu "
+                   "shader=0x%016llx guest_addr=0x%016llx native_buffer=0x%016llx native_offset=%llu tid=%u "
+                   "cause_seq=%llu cause_domain=0x%016llx cause_id=%llu cause_family=%u "
+                   "guest_seq=%llu guest_domain=0x%016llx guest_id=%llu guest_family=%u point=%llu request=%llu",
+                   item.valid ? 1u : 0u, u(item.ordinal), u(item.sequence), u(item.domain),
+                   u(item.lifetime), u(item.tick), u(item.shader), u(item.guest_address),
+                   u(item.native_buffer), u(item.native_offset), static_cast<unsigned>(item.recording_thread),
+                   u(item.cause.sequence), u(item.cause.domain), u(item.cause.id),
+                   static_cast<unsigned>(item.cause.family), u(item.guest.sequence),
+                   u(item.guest.domain), u(item.guest.id), static_cast<unsigned>(item.guest.family),
+                   u(item.point), u(item.request));
+        };
+        append("INDIRECT_ARGS_LATEST");
+        identity(snapshot.latest_match);
+        append("\n");
+        for (size_t slot = 0; slot < snapshot.slots.size(); ++slot) {
+            const auto& observation = snapshot.slots[slot];
+            append("INDIRECT_ARGS_SLOT slot=%u valid=%u", static_cast<unsigned>(slot),
+                   observation.valid ? 1u : 0u);
+            identity(observation.dispatch);
+            append(" x=%u y=%u z=%u observed_known=%llu observed_waited=%llu\n",
+                   observation.groups[0], observation.groups[1], observation.groups[2],
+                   u(observation.observed_known_tick), u(observation.observed_host_waited_tick));
+        }
+    }
+    append("INDIRECT_ARGS_END v=1 ns=%llu\n", u(now));
+    if (complete) {
+        (void)std::fwrite(text.data(), 1, used, stderr);
+    } else {
+        constexpr char error[] = "INDIRECT_ARGS_ERROR v=1 bounded_format_failed=1\n";
+        (void)std::fwrite(error, 1, sizeof(error) - 1, stderr);
+    }
+}
 
 constexpr int      VIDEO_OUT_EVENT_FLIP                                 = 0;
 constexpr int      VIDEO_OUT_EVENT_VBLANK                               = 1;
@@ -237,7 +404,18 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		// Inline in the existing request node; no diagnostic queue or allocation.
+		// On the 64-bit host this adds an 80-byte Context (Request: 88 -> 168).
+		Causal::Context             causal {};
 	};
+	static_assert(sizeof(void*) != 8 || sizeof(Request) == 168);
+
+	// Called only behind Enabled(). Observation records do not advance the request
+	// parent, so repeated readiness refusals can coalesce without creating a chain.
+	Causal::Record RequestRecord(Causal::Event event, const Request& request, uint8_t flags = 0) const;
+	void RecordRequest(Causal::Event event, Request& request, uint8_t flags = 0,
+	                   bool transition = true);
+
 
 	Graphics::Presenter& m_presenter;
 	const uint32_t       m_width;
@@ -855,11 +1033,59 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
+		if (Causal::Enabled()) {
+			// The live renderer owns the scheduler. No engine lock is held here.
+			Causal::MaybeReport(
+			    [&] { return m_renderer.GetCommandScheduler().ReadCausalState(); },
+			    [&](const Causal::CurrentState& owner, uint64_t now) {
+				    ReportFaultHarvest(owner, now, m_renderer.GetBufferCache().ReadFaultHarvestDiagnostics());
+				    if (Graphics::FaultPeekEnabled()) {
+					    ReportFaultPeek(owner, now, m_renderer.GetBufferCache().ReadFaultPeekDiagnostics());
+					    if (Graphics::IndirectArgsDiagnosticEnabled())
+						    ReportIndirectArgs(owner, now, m_renderer.GetBufferCache().ReadIndirectArgsDiagnostics());
+				    }
+			    });
+		}
 
 		total_wait += period - (Clock::now() - frame_begin);
 		if (total_wait.count() < 0) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
 		}
+	}
+}
+
+Causal::Record FlipQueue::RequestRecord(Causal::Event event, const Request& request,
+                                       uint8_t flags) const {
+	auto context = request.causal;
+	const auto current = Causal::CurrentContext();
+	if (current.cause.sequence != 0) context.cause = current.cause;
+	if (context.guest.sequence == 0) context.guest = current.guest;
+	if (current.point != 0) context.point = current.point;
+	context.request = request.id;
+	Causal::ContextScope scope(context);
+	auto record = Causal::Make(event, Causal::Domain(this), request.id);
+	record.related = request.group;
+	record.data[0] = Causal::Domain(request.cfg); // identity token, never dereferenced here
+	record.data[1] = request.generation;
+	record.data[2] = static_cast<uint32_t>(request.index) |
+	                 (static_cast<uint64_t>(request.state) << 32u) |
+	                 (static_cast<uint64_t>(request.source == FlipRequestSource::GpuEop) << 40u) |
+	                 (static_cast<uint64_t>(request.frame != nullptr) << 41u);
+	record.flags = flags;
+	return record;
+}
+
+void FlipQueue::RecordRequest(Causal::Event event, Request& request, uint8_t flags,
+                             bool transition) {
+	const auto record = RequestRecord(event, request, flags);
+	const auto result = Causal::RecordEvent(Causal::Family::Flip, record, !transition);
+	if (transition) {
+		const auto current = Causal::CurrentContext();
+		if (request.causal.guest.sequence == 0) request.causal.guest = current.guest;
+		if (current.point != 0) request.causal.point = current.point;
+		request.causal.request = request.id;
+		// A dropped record still has an attempted sequence; ancestry reports it missing.
+		request.causal.cause = result.parent;
 	}
 }
 
@@ -874,6 +1100,10 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 				if (it->cfg != &cfg || it->group != 0) {
 					++it;
 					continue;
+				}
+				if (Causal::Enabled()) {
+					RecordRequest(Causal::Event::FlipReplaced, *it,
+					              it->state == RequestState::Ready ? 2 : 1);
 				}
 				cfg.flip_status.flipPendingNum--;
 				cfg.flip_status.gcQueueNum -= it->source == FlipRequestSource::GpuEop;
@@ -924,6 +1154,9 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	if (source == FlipRequestSource::GpuEop) {
 		cfg.flip_status.gcQueueNum++;
 	}
+	if (Causal::Enabled()) {
+		RecordRequest(Causal::Event::FlipReserved, pending.back());
+	}
 
 	return true;
 }
@@ -951,6 +1184,10 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			if (it->cfg != &cfg) {
 				++it;
 				continue;
+			}
+			if (Causal::Enabled()) {
+				RecordRequest(Causal::Event::FlipCancelled, *it,
+				              it->state == RequestState::Reserved ? 1 : 2);
 			}
 			if (it->state == RequestState::Reserved) {
 				auto cancelled = it++;
@@ -1027,6 +1264,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		    std::find_if(m_requests.begin(), m_requests.end(),
 		                 [request_id](const auto& r) { return r.id == request_id; });
 		if (request != m_requests.end()) {
+			if (Causal::Enabled()) {
+				RecordRequest(Causal::Event::FlipCancelled, *request, 3);
+			}
 			m_cancelled_requests.splice(m_cancelled_requests.end(), m_requests, request);
 		}
 		return;
@@ -1051,6 +1291,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	prepared->frame               = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
+	if (Causal::Enabled()) {
+		RecordRequest(Causal::Event::FlipPrepared, *prepared);
+	}
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1059,12 +1302,18 @@ void FlipQueue::Complete(uint64_t request_id) {
 	                            [request_id](const auto& r) { return r.id == request_id; });
 	if (request != m_requests.end()) {
 		request->state = RequestState::Ready;
+		if (Causal::Enabled()) {
+			RecordRequest(Causal::Event::FlipReady, *request);
+		}
 		m_mutex.Unlock();
 		return;
 	}
 	auto  cancelled = std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
 	                               [request_id](const auto& r) { return r.id == request_id; });
 	auto* frame     = cancelled->frame;
+	if (Causal::Enabled()) {
+		RecordRequest(Causal::Event::FlipCancelled, *cancelled, 4);
+	}
 	m_cancelled_requests.erase(cancelled);
 	m_done_cond_var.SignalAll();
 	m_mutex.Unlock();
@@ -1101,20 +1350,51 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 
 bool FlipQueue::Flip() {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
+	const bool diagnostic = Causal::Enabled();
 
 	m_mutex.Lock();
 	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
 	                               [](const auto& r) { return r.group == r.id; });
 	if (owner == m_requests.end()) {
+		if (diagnostic) {
+			const auto* gpu = m_requests.empty() ? nullptr : &m_requests.front();
+			const auto* cpu = m_cpu_requests.empty() ? nullptr : &m_cpu_requests.front();
+			auto record = Causal::Make(Causal::Event::FlipNoOwner, Causal::Domain(this),
+			                           gpu != nullptr ? gpu->id : 0);
+			record.related = cpu != nullptr ? cpu->id : 0;
+			record.data[0] = m_requests.size();
+			record.data[1] = m_cpu_requests.size();
+			record.data[2] = m_cancelled_requests.size();
+			const auto state = [](const Request* r) -> uint8_t {
+				return r == nullptr ? 15 : static_cast<uint8_t>(r->state) |
+				                                  (static_cast<uint8_t>(r->frame != nullptr) << 2u);
+			};
+			record.flags = state(gpu) | (state(cpu) << 4u);
+			Causal::RecordEvent(Causal::Family::Flip, record, true);
+		}
 		m_mutex.Unlock();
 		return false;
 	}
 	const uint64_t group = owner->id;
+	Request* blocker = nullptr;
+	bool cpu_member = false;
+	// Preserve the CPU-member short circuit and the original two scans. Only the
+	// actual first matching predicate captures a diagnostic pointer under m_mutex.
 	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
-	                [group](const auto& r) { return r.group == group; }) ||
-	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
-		    return r.group == group && r.state != RequestState::Ready;
+	                [&](auto& r) {
+		                const bool match = r.group == group;
+		                if (diagnostic && match) { blocker = &r; cpu_member = true; }
+		                return match;
+	                }) ||
+	    std::any_of(m_requests.begin(), m_requests.end(), [&](auto& r) {
+		    const bool match = r.group == group && r.state != RequestState::Ready;
+		    if (diagnostic && match) blocker = &r;
+		    return match;
 	    })) {
+		if (diagnostic) {
+			RecordRequest(cpu_member ? Causal::Event::FlipCpuMember : Causal::Event::FlipNotReady,
+			              *blocker, 0, false);
+		}
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1141,9 +1421,28 @@ bool FlipQueue::Flip() {
 	for (size_t i = 0; i < count; i++) {
 		auto&             r = requests[i];
 		Common::LockGuard lock(r.cfg->mutex);
-		due &= r.cfg->generation == r.generation;
+		const auto current_generation = r.cfg->generation;
+		const bool generation_current = current_generation == r.generation;
+		due &= generation_current;
+		bool rate_due = true;
 		if (r.id == group) {
-			due &= IsFlipDueLocked(*r.cfg);
+			rate_due = IsFlipDueLocked(*r.cfg);
+			due &= rate_due;
+		}
+		if (diagnostic && (!generation_current || !rate_due)) {
+			const uint8_t reason = static_cast<uint8_t>(!generation_current) |
+			                       (static_cast<uint8_t>(!rate_due) << 1u);
+			// VideoOutSetFlipRate admits only 0..2. Bits 2..3 retain that exact rate.
+			auto record = RequestRecord(Causal::Event::FlipNotDue, r,
+			                            reason | (static_cast<uint8_t>(r.cfg->flip_rate) << 2u));
+			// Format 0 supplies the captured request identity.
+			Causal::RecordEvent(Causal::Family::Flip, record, true);
+			// Format 1 carries the current port values used by the unchanged due checks.
+			record.flags |= 0x80u;
+			record.data[0] = current_generation;
+			record.data[1] = r.cfg->vblank_status.count;
+			record.data[2] = r.cfg->flip_vblank;
+			Causal::RecordEvent(Causal::Family::Flip, record, true);
 		}
 		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
 		    g_headset_mirror.load(std::memory_order_relaxed)) {
@@ -1155,6 +1454,14 @@ bool FlipQueue::Flip() {
 		}
 	}
 	if (due) {
+		if (diagnostic) {
+			for (size_t i = 0; i < count; i++) {
+				// This marks group dispatch, not GPU completion or a physical presentation.
+				const uint8_t flags = static_cast<uint8_t>(layer_count == 0) |
+				                      (static_cast<uint8_t>(requests[i].frame == hidden) << 1u);
+				RecordRequest(Causal::Event::FlipDispatch, requests[i], flags);
+			}
+		}
 		if (hidden != nullptr) {
 			m_presenter.Discard(*hidden);
 		}
@@ -1194,6 +1501,13 @@ bool FlipQueue::Flip() {
 		r.cfg->flip_status.flipPendingNum--;
 		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
 		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
+		if (diagnostic) {
+			// At most four copied group members; the ordinary path performs no extra scan.
+			const auto dispatched = std::find_if(requests.begin(), requests.begin() + count,
+			                                     [&](const auto& copy) { return copy.id == r.id; });
+			r.causal = dispatched->causal;
+			RecordRequest(Causal::Event::FlipGuestComplete, r);
+		}
 		it = m_requests.erase(it);
 	}
 	m_done_cond_var.SignalAll();

@@ -496,6 +496,16 @@
                 </property>
                </widget>
               </item>
+              <item row="5" column="0" colspan="2">
+               <widget class="QCheckBox" name="checkBox_ufc6_540p">
+                <property name="toolTip">
+                 <string>PORTHEON graphics profile for UFC 6 PPSA23566 v01.004.000 only: fixed 960x540 rendering, dynamic resolution off and depth of field off, with 1080p output. Reduces image quality. Your cheat selections are preserved; overlapping enabled patches must be disabled before launch.</string>
+                </property>
+                <property name="text">
+                 <string>UFC 6 performance profile: 540p, DRS/DOF off (experimental)</string>
+                </property>
+               </widget>
+              </item>
              </layout>
             </widget>
            </item>

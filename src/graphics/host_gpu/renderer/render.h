@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
@@ -29,6 +30,7 @@ struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+namespace IndirectArgsLedger { struct Position; }
 
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
@@ -153,7 +155,8 @@ public:
 	void                           RebindImages(PreparedBindings& bindings);
 	// Diagnostic only (KYTY_READBACK_ATTRIBUTION): called right after a native draw/dispatch was
 	// recorded; reports each bound stage's possible buffer writers at the current command tick.
-	void NoteRecordedWriters(std::span<PreparedBindings* const> stages);
+	void NoteRecordedWriters(std::span<PreparedBindings* const> stages,
+	                         const IndirectArgsLedger::Position* ledger_position = nullptr);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -200,7 +203,16 @@ private:
 		const CallClosure*         closure = nullptr; // the stage's owned closure object
 		std::vector<uint64_t>      owner_serials;     // per written image (0: null descriptor)
 		std::vector<vk::ImageView> views;             // per written image, the committed view
+		std::vector<vk::DescriptorBufferInfo> data_owners;
+		std::vector<vk::DescriptorBufferInfo> data_sources;
+		std::vector<uint32_t> current_words; // reusable currentness scratch, allocated pre-commit
+		std::vector<GuestRange> heap_input_guards;
+		ImageHeap::CallClosureProof image_heap;
 	};
+	[[nodiscard]] bool        PrepareCallData(PreparedBindings& bindings);
+	void                      WritePreparedCallData(const PreparedBindings& bindings,
+	                                                const CallClosureCheck& check,
+	                                                CommandBuffer& command);
 	[[nodiscard]] bool        ValidatePreparedCallClosure(const ShaderStageRuntime& stage,
 	                                                      const PreparedBindings&   bindings,
 	                                                      CallClosureCheck&         check,

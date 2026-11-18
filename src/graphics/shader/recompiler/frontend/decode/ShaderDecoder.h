@@ -278,6 +278,7 @@ enum class Opcode {
 	V_BFI_B32,
 	V_ALIGNBIT_B32,
 	V_ALIGNBYTE_B32,
+	V_PERM_B32,
 	V_MIN3_F32,
 	V_MIN3_I32,
 	V_MIN3_U32,
@@ -296,7 +297,12 @@ enum class Opcode {
 	V_MED3_F16,
 	V_MED3_I16,
 	V_MED3_U16,
+	V_LERP_U8,
+	V_SAD_U8,
+	V_SAD_HI_U8,
+	V_SAD_U16,
 	V_SAD_U32,
+	V_MSAD_U8,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
 	V_ADD_LSHL_U32,
@@ -902,6 +908,9 @@ struct Instruction {
 	// Linker-derived TABLE-leaf GETPC next guest PC. Zero keeps ordinary caller-relative
 	// behavior. Not decoded/serialized; never changes raw words, instruction width or CFG PCs.
 	uint64_t       getpc_guest_next_pc          = 0;
+	// Ephemeral, owned TABLE-link proof for one fixed S_LOAD. Raw code and PCs stay
+	// native; the proof values also occur in the linked-code cache identity.
+	std::vector<uint32_t> call_context_words;
 };
 
 struct Program {

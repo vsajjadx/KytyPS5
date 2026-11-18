@@ -311,6 +311,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_output_1080p->setChecked(info.output_1080p_enabled);
+	m_ui->checkBox_ufc6_540p->setChecked(info.ufc6_540p_enabled);
+	// Retain a visible opt-out if a saved profile outlives a game update.
+	m_ui->checkBox_ufc6_540p->setVisible(
+	    !m_global_settings && (m_info.SupportsUfc6GraphicsProfile() || info.ufc6_540p_enabled));
 	m_ui->checkBox_frame_generation->setChecked(info.frame_generation_enabled);
 	m_ui->comboBox_frame_generation_backend->clear();
 	m_ui->comboBox_frame_generation_backend->addItem(tr("AMD FSR 3.1 (2x)"), QStringLiteral("fsr"));
@@ -468,6 +472,7 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
 	m_global_settings = true;
+	m_ui->checkBox_ufc6_540p->setVisible(false);
 	m_ui->settings_scope->setText(tr("Global defaults for games without custom settings"));
 	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
 	auto* menu = new QMenu(m_ui->settings_button);
@@ -639,6 +644,9 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.output_1080p_enabled      = ui.checkBox_output_1080p->isChecked();
+	if (!global_settings) {
+		info.ufc6_540p_enabled = ui.checkBox_ufc6_540p->isChecked();
+	}
 	info.frame_generation_enabled  = ui.checkBox_frame_generation->isChecked();
 	info.frame_generation_backend  = ui.comboBox_frame_generation_backend->currentData().toString();
 	info.frame_generation_multiplier = ui.comboBox_frame_generation_multiplier->currentData().toInt();

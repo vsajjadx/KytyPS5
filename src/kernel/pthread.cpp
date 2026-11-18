@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/threadIdentityDiagnostics.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
@@ -21,6 +22,8 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -403,6 +406,50 @@ struct PthreadPrivate {
 	uintptr_t guest_host_gs10;
 #endif
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool PthreadIdentityDiagnosticsEnabled() noexcept {
+	static const bool enabled = Common::ThreadIdentityDiagnostics::EnabledFor(
+	    std::getenv("KYTY_CAUSAL_DIAG"));
+	return enabled;
+}
+
+// Called only after the outer opt-in guard and after all three identities belong
+// to this running thread's initialized Pthread object. No names or scheduling state.
+static void EmitPthreadIdentity(const PthreadPrivate* thread,
+                                Common::ThreadIdentityDiagnostics::Phase phase) {
+	namespace Identity = Common::ThreadIdentityDiagnostics;
+	Identity::Emit(true, Identity::ProcessBudget(), [thread, phase] {
+		Identity::Record record {};
+		record.phase              = phase;
+		record.process_id         = GetCurrentProcessId();
+		record.os_thread_id        = thread->host_thread_id;
+		record.internal_unique_id  = thread->unique_id;
+		record.guest_thread_id     = thread->guest.thread_id;
+		record.object_token        = reinterpret_cast<uintptr_t>(thread);
+		record.entry               = reinterpret_cast<uintptr_t>(thread->entry);
+		const auto file_time = [](const FILETIME& value) {
+			return (uint64_t {value.dwHighDateTime} << 32u) | value.dwLowDateTime;
+		};
+		FILETIME created {}, exited {}, kernel {}, user {};
+		if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+			record.process_creation_valid = true;
+			record.process_creation_time  = file_time(created);
+		} else {
+			record.process_creation_error = GetLastError();
+		}
+		if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+			record.thread_creation_valid = true;
+			record.thread_creation_time  = file_time(created);
+		} else {
+			record.thread_creation_error = GetLastError();
+		}
+		return record;
+	}, [](const char* line, size_t length) {
+		(void)std::fwrite(line, 1, length, stderr);
+	});
+}
+#endif
 
 static PthreadAttrPrivate* GetPthreadAttrValue(const PthreadAttr* attr, const char* func_name) {
 	if (attr == nullptr) {
@@ -1022,6 +1069,11 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (PthreadIdentityDiagnosticsEnabled()) {
+		EmitPthreadIdentity(g_pthread_self, Common::ThreadIdentityDiagnostics::Phase::Main);
+	}
+#endif
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -3271,6 +3323,11 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (PthreadIdentityDiagnosticsEnabled()) {
+		EmitPthreadIdentity(thread, Common::ThreadIdentityDiagnostics::Phase::Begin);
+	}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)

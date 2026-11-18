@@ -12,6 +12,10 @@
 namespace Common {
 
 // Words are accessed atomically, so an array whose writers hold a lock can be read without it.
+// Stores release and loads acquire: a reader that sees a word sees what its writer wrote before
+// it (the memory tracker publishes guest bytes, then clears their GPU-dirty bits off the reader's
+// thread). Plain moves on x86-64; ldar/stlr on ARM64.
+static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
 template <size_t N>
 class BitArray final {
 	static_assert(N != 0, "BitArray size must be nonzero");
@@ -229,11 +233,11 @@ private:
 
 	[[nodiscard]] uint64_t Load(size_t word) const {
 		// A load never writes, so it may reference the word through a const member.
-		return std::atomic_ref(const_cast<uint64_t&>(m_data[word])).load(std::memory_order_relaxed);
+		return std::atomic_ref(const_cast<uint64_t&>(m_data[word])).load(std::memory_order_acquire);
 	}
 
 	void Store(size_t word, uint64_t value) {
-		std::atomic_ref(m_data[word]).store(value, std::memory_order_relaxed);
+		std::atomic_ref(m_data[word]).store(value, std::memory_order_release);
 	}
 
 	std::array<uint64_t, WORD_COUNT> m_data {};

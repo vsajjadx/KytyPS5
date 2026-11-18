@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/causalDiagnosticsRuntime.h"
 #include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
@@ -96,7 +97,27 @@ bool GpuSyncDebugEnabled() {
 	return enabled;
 }
 
+bool FaultPeekEnabled() noexcept {
+	static const bool enabled = CausalDiagnostics::Enabled() &&
+	    CausalDiagnostics::EnabledFor(std::getenv("KYTY_FAULT_PEEK"));
+	return enabled;
+}
+
+MasterSemaphore::HostWaitWitness MasterSemaphore::ReadFaultPeekHostWait() const noexcept {
+	if (!FaultPeekEnabled()) return {};
+	return {m_fault_peek_wait_entered.load(std::memory_order_acquire),
+	        m_fault_peek_wait_completed.load(std::memory_order_acquire)};
+}
+
 namespace {
+
+void PublishRequestedHostWait(std::atomic<uint64_t>& destination, uint64_t tick) noexcept {
+	auto previous = destination.load(std::memory_order_relaxed);
+	while (previous < tick &&
+	       !destination.compare_exchange_weak(previous, tick, std::memory_order_release,
+	                                          std::memory_order_relaxed)) {
+	}
+}
 
 void ReportSemaphoreFatal(const char* what, vk::Result result, uint64_t tick, uint64_t known) {
 	LOGF("%s failed: %s (%d), wait_tick=%" PRIu64 " known_gpu_tick=%" PRIu64 "\n", what,
@@ -133,6 +154,14 @@ void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
+		if (CausalDiagnostics::Enabled()) {
+			auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::TimelineObserved,
+			    CausalDiagnostics::Domain(this));
+			record.flags = 1; // Query failed: counter is not a completion observation.
+			record.data[0] = counter; record.data[1] = KnownGpuTick();
+			record.data[2] = static_cast<uint64_t>(static_cast<int64_t>(result));
+			CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record, true);
+		}
 		ReportSemaphoreFatal("vkGetSemaphoreCounterValue", result, 0, KnownGpuTick());
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -142,14 +171,44 @@ void MasterSemaphore::Refresh() {
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
 	}
+	if (CausalDiagnostics::Enabled()) {
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::TimelineObserved,
+		    CausalDiagnostics::Domain(this), 0, counter);
+		record.data[0] = counter; record.data[1] = KnownGpuTick();
+		record.data[2] = static_cast<uint64_t>(static_cast<int64_t>(result));
+		CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record, true);
+	}
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	const bool diagnostic = CausalDiagnostics::Enabled();
+	CausalDiagnostics::Context context{};
+	if (diagnostic) {
+		context = CausalDiagnostics::CurrentContext();
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::TimelineWaitEnter,
+		    CausalDiagnostics::Domain(this), 0, tick);
+		record.related = context.point;
+		record.data[0] = KnownGpuTick(); record.data[1] = CurrentTick();
+		context.cause = CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record).parent;
+	}
+	CausalDiagnostics::ContextScope causal_scope(context, diagnostic);
+	const auto returned = [&](uint64_t route, vk::Result result) {
+		if (!diagnostic) return;
+		auto record = CausalDiagnostics::Make(CausalDiagnostics::Event::TimelineWaitReturn,
+		    CausalDiagnostics::Domain(this), 0, tick);
+		record.related = context.point;
+		record.data[0] = KnownGpuTick();
+		record.data[1] = static_cast<uint64_t>(static_cast<int64_t>(result));
+		record.data[2] = route; // 0 cached, 1 refreshed, 2 existing wait/spin, 3 failure.
+		CausalDiagnostics::RecordEvent(CausalDiagnostics::Family::Native, record);
+	};
 	if (IsFree(tick)) {
+		returned(0, vk::Result::eSuccess);
 		return;
 	}
 	Refresh();
 	if (IsFree(tick)) {
+		returned(1, vk::Result::eSuccess);
 		return;
 	}
 
@@ -182,11 +241,18 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		} while (std::chrono::steady_clock::now() < spin_until);
 	}
 	if (result != vk::Result::eSuccess) {
+		const bool peek = FaultPeekEnabled();
+		if (peek) PublishRequestedHostWait(m_fault_peek_wait_entered, tick);
 		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+		// Publish the requested value, never a later counter from Refresh(). Cached,
+		// query-only, spin-only and failed returns cannot establish this witness.
+		if (peek && result == vk::Result::eSuccess)
+			PublishRequestedHostWait(m_fault_peek_wait_completed, tick);
 	}
 	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	    std::chrono::steady_clock::now() - wait_begin).count()));
 	if (result != vk::Result::eSuccess) {
+		returned(3, result);
 		const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		    std::chrono::steady_clock::now() - wait_begin).count();
 		// A Windows TDR hang is reported after about 2000 ms of no progress; an invalid GPU
@@ -198,6 +264,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
+	returned(2, result);
 }
 
 } // namespace Libs::Graphics

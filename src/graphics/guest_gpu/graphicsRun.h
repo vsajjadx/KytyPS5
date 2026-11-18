@@ -43,8 +43,11 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	[[nodiscard]] static bool IsGpuThreadFor(const RenderContext& renderer) noexcept;
 
 private:
+	friend struct GuestGpuTestAccess;
+
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
@@ -60,6 +63,12 @@ private:
 		Pm4Execution              execution;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		// Full-width opt-in provenance survives blocked retries. This adds 32
+		// bytes per queued submission; disabled recording still keeps this footprint.
+		uint64_t diagnostic_sequence = 0;
+		uint64_t diagnostic_id       = 0;
+		uint64_t diagnostic_point    = 0;
+		uint64_t diagnostic_request  = 0;
 	};
 
 	void              Enqueue(Submission submission);

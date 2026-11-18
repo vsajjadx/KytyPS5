@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <unordered_set>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -179,6 +180,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .profile       = profile,
 		                                                  .resolve_epoch = epoch,
 		                                                  .layout_epoch  = epoch});
+		created->serial = ++m_view_serial;
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
 		UpdateProbes(*created, 0u, bytes);
@@ -633,6 +635,457 @@ void ImageHeap::Drop(Memory& memory) {
 			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
 		}
 	}
+}
+
+bool ImageHeap::ReadCallReference(uint32_t image, const IR::ImageResource& resource,
+                                  std::span<const uint32_t> flattened_srt,
+                                  CallClosureProof::Reference& result,
+                                  std::string& reason) const {
+	if (!resource.heap || resource.resource_class != IR::ImageResourceClass::Sampled ||
+	    !resource.read || resource.written || resource.atomic || resource.atomic64) {
+		reason = "image heap closure requires read-only sampled resources";
+		return false;
+	}
+	const auto offset = resource.indirect_mapping_offset;
+	if (offset > flattened_srt.size() || flattened_srt.size() - offset < 3u) {
+		reason = "image heap closure has no complete slot mapping";
+		return false;
+	}
+	result.image = image;
+	result.mapping_offset = offset;
+	result.slot_count = flattened_srt[offset];
+	result.slots = uint64_t {flattened_srt[offset + 1u]} |
+	               (uint64_t {flattened_srt[offset + 2u]} << 32u);
+	result.profile = IR::ImageHeapResource(resource, 0u);
+	if (result.slot_count == 0u || result.slots == 0u) {
+		reason = "image heap closure has an empty slot mapping";
+		return false;
+	}
+	return true;
+}
+
+bool ImageHeap::ReadCallView(const View& view, CallClosureProof::View& result,
+                             std::string& reason) const {
+	const GuestRange table {view.memory.base, view.memory.size};
+	if (view.serial == 0u || view.memory.draw != m_draw || !table.Valid() ||
+	    view.buffer == nullptr || view.slots.empty() ||
+	    view.slots.size() - 1u > UINT32_MAX ||
+	    view.memory.size / sizeof(uint32_t) != view.slots.size() - 1u ||
+	    view.slots.size() > view.buffer->Size() / sizeof(uint32_t) ||
+	    !view.profile.indirect_resources.empty()) {
+		reason = "image heap closure has an invalid or stale source view";
+		return false;
+	}
+	result.serial = view.serial;
+	result.table = table;
+	result.buffer = view.buffer->Handle();
+	result.slots = view.buffer->BufferDeviceAddress();
+	result.slot_count = static_cast<uint32_t>(view.slots.size() - 1u);
+	result.first = view.first;
+	result.step = view.step;
+	result.count = view.count;
+	result.limit = view.limit;
+	result.element_count = view.elements.size();
+	result.profile = view.profile;
+	return true;
+}
+
+bool ImageHeap::ReadCallElement(uint32_t index, CallClosureProof::Element& result,
+                                std::string& reason) const {
+	if (index >= m_elements.size() || std::ranges::find(m_writes, index) != m_writes.end()) {
+		reason = "image heap closure has a missing or unpublished sampled descriptor";
+		return false;
+	}
+	const auto& element = m_elements[index];
+	if (element.stale || (index != 0u && element.refs == 0u)) {
+		reason = "image heap closure has a stale or unreferenced sampled descriptor";
+		return false;
+	}
+	const auto& binding = element.binding;
+	const bool image = static_cast<bool>(binding.image_id);
+	const bool view = binding.image_view != nullptr;
+	if (image != view || (image ? element.serial == 0u : element.serial != 0u) ||
+	    (index == 0u && (image || element.kind != 0u))) {
+		reason = "image heap closure has an inconsistent null sampled descriptor";
+		return false;
+	}
+	result.index = index;
+	result.kind = element.kind;
+	result.descriptor = element.value;
+	result.image_id = binding.image_id;
+	result.serial = element.serial;
+	result.view = binding.image_view;
+	result.layout = binding.layout;
+	// Both element zero and a resolved, intentional nonzero null binding have no image access.
+	// Its descriptor identity is still retained and its source table is still checked.
+	if (!image) return true;
+	if (!binding.desc.heap || binding.desc.type != TextureCache::BindingType::Texture ||
+	    !binding.desc.info.data.Valid()) {
+		reason = "image heap closure has no bounded sampled texture view";
+		return false;
+	}
+	result.requested_data = binding.desc.info.data;
+	if (binding.desc.info.HasStencil()) {
+		if (!binding.desc.info.stencil.Valid()) {
+			reason = "image heap closure has invalid requested stencil input";
+			return false;
+		}
+		result.requested_stencil = binding.desc.info.stencil;
+	}
+	if (binding.desc.info.HasMetadata()) {
+		if (!binding.desc.info.metadata.range.Valid()) {
+			reason = "image heap closure has invalid requested image metadata";
+			return false;
+		}
+		result.requested_metadata = binding.desc.info.metadata.range;
+	}
+	return true;
+}
+
+bool ImageHeap::ReadCallImage(ImageId id, const Image& image,
+                              CallClosureProof::ImageInput& result, std::string& reason) {
+	// Caller holds TextureCache::m_lock. Even a native-less stencil plane remains a
+	// registered cache input: DeleteImage unlinks it before unregistering the record.
+	if (!image.registered || image.serial == 0u || !image.info.data.Valid()) {
+		reason = "image heap closure has an unavailable or unbounded image input";
+		return false;
+	}
+	result = {};
+	result.image_id = id;
+	result.depth_id = image.depth_id;
+	result.serial = image.serial;
+	result.image = image.backing.image;
+	result.data = image.info.data;
+	if (image.info.HasMetadata()) {
+		if (!image.info.metadata.range.Valid()) {
+			reason = "image heap closure has invalid native image metadata";
+			return false;
+		}
+		result.metadata = image.info.metadata.range;
+	}
+	// This range can exist before any association record is created.
+	if (image.info.HasStencil()) {
+		if (!image.info.stencil.Valid()) {
+			reason = "image heap closure has invalid native stencil input";
+			return false;
+		}
+		result.stencil = image.info.stencil;
+	}
+	if (image.IsTracked()) {
+		if (image.track_addr_end <= image.track_addr ||
+		    !GuestRange {image.track_addr, image.track_addr_end - image.track_addr}.Valid()) {
+			reason = "image heap closure has an invalid tracked image range";
+			return false;
+		}
+		result.tracked = {image.track_addr, image.track_addr_end - image.track_addr};
+	}
+	result.format = image.info.pixel_format;
+	result.guest_format = image.info.guest_format;
+	result.type = image.info.type;
+	result.extent = image.info.extent;
+	result.resources = image.info.resources;
+	result.mapping = image.stencil_subresources;
+	result.pitch = image.info.pitch;
+	result.bytes_per_block = image.info.bytes_per_block;
+	result.samples = image.info.samples;
+	result.tile = image.info.tile_mode;
+	result.metadata_kind = image.info.metadata.kind;
+	result.compression = image.info.metadata.compression;
+	result.clear_word = image.info.metadata.clear_word;
+	result.stencil_compressed = image.info.metadata.stencil_compressed;
+	result.clear_register_valid = image.info.metadata.clear_register_valid;
+	result.dcc_alpha_msb = image.info.metadata.dcc_alpha_msb;
+	result.htile_initial_clear = image.info.htile_initial_clear;
+	return true;
+}
+
+bool ImageHeap::CheckCallAssociation(const CallClosureProof::ImageInput& owner,
+                                     const CallClosureProof::ImageInput& plane,
+                                     std::string& reason) {
+	// AssociateStencil creates one direct S8 plane mapped into a native depth owner.
+	// Do not turn an unexpected graph into an arbitrary recursive dependency walk.
+	const auto& mapping = plane.mapping;
+	if (plane.image_id == owner.image_id || plane.depth_id != owner.image_id ||
+	    DepthAspectTransferFormat(owner.format) == vk::Format::eUndefined ||
+	    plane.format != vk::Format::eS8Uint ||
+	    plane.guest_format != Prospero::BufferFormat::k8UInt ||
+	    plane.bytes_per_block != 1u || plane.samples != 1u ||
+	    plane.type != owner.type || plane.extent != owner.extent || plane.tile != owner.tile ||
+	    mapping.level_count == 0u || mapping.base_level >= owner.resources.levels ||
+	    mapping.level_count > owner.resources.levels - mapping.base_level ||
+	    mapping.layer_count == 0u || mapping.base_layer >= owner.resources.layers ||
+	    mapping.layer_count > owner.resources.layers - mapping.base_layer ||
+	    plane.resources.levels != mapping.level_count ||
+	    plane.resources.layers != mapping.layer_count) {
+		reason = "image heap closure has an inconsistent stencil association mapping";
+		return false;
+	}
+	return true;
+}
+
+bool ImageHeap::CaptureCallOwner(ImageId id, uint64_t serial, CallClosureProof::Owner& result,
+                                 std::vector<CallClosureProof::ImageInput>& associations,
+                                 std::string& reason) const {
+	auto& textures = m_context.GetTextureCache();
+	// Capture the complete family under the existing lock. No guest-memory operation,
+	// GPU work or retained pointer crosses it; faults may otherwise shrink tracked ranges.
+	std::scoped_lock lock {textures.m_lock};
+	const auto* owner = textures.m_slot_images.try_get(id);
+	if (owner == nullptr || serial == 0u || owner->serial != serial) {
+		reason = "image heap closure lost its sampled image owner";
+		return false;
+	}
+	if (owner->depth_id || owner->backing.image == nullptr) {
+		reason = "image heap closure has no native sampled image owner";
+		return false;
+	}
+	if (!ReadCallImage(id, *owner, result.input, reason)) return false;
+	result.association_begin = associations.size();
+	result.association_count = owner->stencil_ids.size();
+	std::unordered_set<uint64_t> seen;
+	seen.reserve(owner->stencil_ids.size());
+	for (const auto child_id: owner->stencil_ids) {
+		const auto* child = textures.m_slot_images.try_get(child_id);
+		if (child == nullptr || !child->stencil_ids.empty()) {
+			reason = "image heap closure has a missing or nested stencil association";
+			return false;
+		}
+		CallClosureProof::ImageInput plane;
+		if (!ReadCallImage(child_id, *child, plane, reason) ||
+		    !CheckCallAssociation(result.input, plane, reason)) return false;
+		if (!seen.insert(plane.serial).second) {
+			reason = "image heap closure has a repeated stencil association";
+			return false;
+		}
+		// Existing color records can be reused as planes. Their native backing is optional;
+		// UploadImage and descriptor resolution use depth_id, not that unused backing.
+		associations.push_back(plane);
+	}
+	return true;
+}
+
+bool ImageHeap::ValidateCallOwner(
+    const CallClosureProof::Owner& saved,
+    std::span<const CallClosureProof::ImageInput> associations, std::string& reason) const {
+	if (saved.association_begin > associations.size() ||
+	    saved.association_count > associations.size() - saved.association_begin) {
+		reason = "image heap closure has an invalid association certificate";
+		return false;
+	}
+	auto& textures = m_context.GetTextureCache();
+	std::scoped_lock lock {textures.m_lock};
+	const auto* owner = textures.m_slot_images.try_get(saved.input.image_id);
+	if (owner == nullptr || owner->serial != saved.input.serial) {
+		reason = "image heap closure lost its sampled image owner";
+		return false;
+	}
+	CallClosureProof::ImageInput current;
+	if (!ReadCallImage(saved.input.image_id, *owner, current, reason)) return false;
+	if (current != saved.input) {
+		reason = "image heap closure native owner changed during commit";
+		return false;
+	}
+	if (owner->stencil_ids.size() != saved.association_count) {
+		reason = "image heap closure association graph changed during commit";
+		return false;
+	}
+	// Exact ordered membership also detects reassociation; no allocation is needed here.
+	for (size_t i = 0; i < saved.association_count; ++i) {
+		const auto& old = associations[saved.association_begin + i];
+		if (owner->stencil_ids[i] != old.image_id) {
+			reason = "image heap closure association graph changed during commit";
+			return false;
+		}
+		const auto* child = textures.m_slot_images.try_get(old.image_id);
+		if (child == nullptr || child->serial != old.serial || !child->stencil_ids.empty()) {
+			reason = "image heap closure stencil association retired or changed during commit";
+			return false;
+		}
+		if (!ReadCallImage(old.image_id, *child, current, reason)) return false;
+		if (current != old) {
+			reason = "image heap closure stencil association inputs changed during commit";
+			return false;
+		}
+	}
+	return true;
+}
+
+
+bool ImageHeap::CaptureCallClosure(std::span<const IR::ImageResource> resources,
+                                   std::span<const uint32_t> flattened_srt,
+                                   std::span<const GuestRange> protected_ranges,
+                                   CallClosureProof& proof, std::string& reason) const {
+	proof = {};
+	reason.clear();
+	uint64_t previous_end = 0;
+	for (const auto& range: protected_ranges) {
+		if (!range.Valid() || range.address < previous_end) {
+			reason = "image heap closure has invalid protected intervals";
+			return false;
+		}
+		previous_end = range.End();
+	}
+	if (m_set == nullptr) {
+		reason = "image heap closure has no native sampled descriptor set";
+		return false;
+	}
+	if (!ReadCallElement(0u, proof.null_element, reason)) return false;
+	std::unordered_map<uint64_t, ImageId> owners;
+	const auto append_inputs = [&](const CallClosureProof::ImageInput& input) {
+		for (const auto range: {input.data, input.metadata, input.stencil, input.tracked}) {
+			if (!range.Empty()) proof.ranges.push_back(range);
+		}
+	};
+	for (uint32_t index = 0; index < resources.size(); ++index) {
+		if (!resources[index].heap) continue;
+		CallClosureProof::Reference reference;
+		if (!ReadCallReference(index, resources[index], flattened_srt, reference, reason)) return false;
+		const auto selected = std::ranges::find_if(m_active, [&](const View* view) {
+			return view != nullptr && view->buffer != nullptr &&
+			       view->buffer->BufferDeviceAddress() == reference.slots &&
+			       view->slots.size() == uint64_t {reference.slot_count} + 1u;
+		});
+		if (selected == m_active.end() || (*selected)->profile != reference.profile) {
+			reason = "image heap closure mapping has no matching active source view";
+			return false;
+		}
+		const auto& view = **selected;
+		reference.view_serial = view.serial;
+		proof.references.push_back(reference);
+		if (std::ranges::any_of(proof.views, [&](const auto& old) { return old.serial == view.serial; })) {
+			continue; // Root and numeric kinds can reference the same source mapping.
+		}
+		CallClosureProof::View captured;
+		if (!ReadCallView(view, captured, reason)) return false;
+		captured.element_begin = proof.elements.size();
+		proof.ranges.push_back(captured.table);
+		for (const auto& [value, element_index]: view.elements) {
+			CallClosureProof::Element element;
+			if (!ReadCallElement(element_index, element, reason)) return false;
+			if (element.descriptor != value) {
+				reason = "image heap closure source element identity changed";
+				return false;
+			}
+			proof.elements.push_back(element);
+			if (!element.image_id) continue; // Stable native null: no guest image input.
+			proof.ranges.push_back(element.requested_data);
+			if (!element.requested_metadata.Empty()) proof.ranges.push_back(element.requested_metadata);
+			if (!element.requested_stencil.Empty()) proof.ranges.push_back(element.requested_stencil);
+			const auto [found, inserted] = owners.try_emplace(element.serial, element.image_id);
+			if (!inserted) {
+				if (found->second != element.image_id) {
+					reason = "image heap closure has inconsistent native owner identities";
+					return false;
+				}
+				continue;
+			}
+			CallClosureProof::Owner owner;
+			if (!CaptureCallOwner(element.image_id, element.serial, owner, proof.associations, reason)) {
+				return false;
+			}
+			proof.owners.push_back(owner);
+			append_inputs(owner.input);
+			for (size_t i = owner.association_begin; i < proof.associations.size(); ++i) {
+				append_inputs(proof.associations[i]);
+			}
+		}
+		proof.views.push_back(std::move(captured));
+	}
+	if (proof.references.empty() || proof.views.empty()) {
+		reason = "image heap closure has no bound sampled source mapping";
+		return false;
+	}
+	// Only stage-bound views and their referenced elements are inspected. Deduplicate native
+	// owners/ranges, and never scan table words or unrelated resident descriptor slots.
+	std::ranges::sort(proof.ranges);
+	proof.ranges.erase(std::unique(proof.ranges.begin(), proof.ranges.end()), proof.ranges.end());
+	for (const auto& range: proof.ranges) {
+		const auto overlap = std::lower_bound(
+		    protected_ranges.begin(), protected_ranges.end(), range.address,
+		    [](const GuestRange& candidate, uint64_t address) { return candidate.End() <= address; });
+		if (overlap != protected_ranges.end() && overlap->address < range.End()) {
+			reason = "image heap derived table/image input overlaps protected call inputs";
+			return false;
+		}
+	}
+	// Publication is last: a failed capture cannot be reused as a post-commit certificate.
+	proof.set = m_set;
+	proof.draw = m_draw;
+	return true;
+}
+
+bool ImageHeap::ValidateCallClosure(std::span<const IR::ImageResource> resources,
+                                    std::span<const uint32_t> flattened_srt,
+                                    const CallClosureProof& proof, std::string& reason) const {
+	reason.clear();
+	if (proof.draw == 0u || proof.draw != m_draw || proof.set != m_set ||
+	    proof.references.empty() || proof.views.empty() ||
+	    static_cast<size_t>(std::ranges::count_if(resources, &IR::ImageResource::heap)) != proof.references.size()) {
+		reason = "image heap closure identity changed during commit";
+		return false;
+	}
+	CallClosureProof::Element null_element;
+	if (!ReadCallElement(0u, null_element, reason)) return false;
+	if (null_element != proof.null_element) {
+		reason = "image heap closure null descriptor changed during commit";
+		return false;
+	}
+	for (const auto& saved: proof.references) {
+		CallClosureProof::Reference current;
+		if (saved.image >= resources.size() ||
+		    !ReadCallReference(saved.image, resources[saved.image], flattened_srt, current, reason)) {
+			if (reason.empty()) reason = "image heap closure resource disappeared during commit";
+			return false;
+		}
+		current.view_serial = saved.view_serial;
+		if (current != saved) {
+			reason = "image heap closure slot mapping changed during commit";
+			return false;
+		}
+	}
+	for (const auto& saved: proof.views) {
+		// Never dereference a retained View*: a wrapped stream can submit and retire it.
+		const View* view = nullptr;
+		for (const auto& memory: m_memories) {
+			if (memory->base != saved.table.address) continue;
+			const auto found = std::ranges::find_if(
+			    memory->views, [&](const auto& candidate) { return candidate->serial == saved.serial; });
+			if (found != memory->views.end()) view = found->get();
+			break;
+		}
+		if (view == nullptr) {
+			reason = "image heap closure source view retired during commit";
+			return false;
+		}
+		CallClosureProof::View current;
+		if (!ReadCallView(*view, current, reason)) return false;
+		current.element_begin = saved.element_begin;
+		if (current != saved || saved.element_begin > proof.elements.size() ||
+		    saved.element_count > proof.elements.size() - saved.element_begin) {
+			reason = "image heap closure source view changed during commit";
+			return false;
+		}
+		for (size_t i = saved.element_begin; i < saved.element_begin + saved.element_count; ++i) {
+			const auto& old = proof.elements[i];
+			const auto found = view->elements.find(old.descriptor);
+			CallClosureProof::Element element;
+			if (found == view->elements.end() || found->second != old.index) {
+				reason = "image heap closure reachable elements changed during commit";
+				return false;
+			}
+			if (!ReadCallElement(old.index, element, reason)) return false;
+			if (element != old) {
+				reason = "image heap closure sampled descriptor changed during commit";
+				return false;
+			}
+		}
+	}
+	// Re-resolve each native owner and its exact direct stencil family once. Child records
+	// need not have a VkImage, but every dependency and reciprocal mapping must stay live.
+	for (const auto& saved: proof.owners) {
+		if (!ValidateCallOwner(saved, proof.associations, reason)) return false;
+	}
+	return true;
 }
 
 } // namespace Libs::Graphics

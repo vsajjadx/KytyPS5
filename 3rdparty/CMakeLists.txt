@@ -33,6 +33,7 @@ FetchContent_Declare(openxr
 	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
 	GIT_SHALLOW FALSE)
 FetchContent_MakeAvailable(openxr)
+target_include_directories(openxr_loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include")
 # The loader uses exceptions internally.
 if(NOT KYTY_CLANG_CL)
 	target_compile_options(openxr_loader PRIVATE -fexceptions)

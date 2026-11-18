@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
 		auto* categories = Control<QListWidget>(dialog, "settings_categories");
 		auto* search     = Control<QLineEdit>(dialog, "settings_search");
 		Check(VisibleCategories(categories) == 10, "global categories");
+		Check(Control<QCheckBox>(dialog, "checkBox_ufc6_540p")->isHidden(),
+		      "game-specific graphics profile exposed globally");
 		search->setText(QStringLiteral("frame generation"));
 		const auto* current_category = categories->currentItem();
 		const auto current_name = current_category ? current_category->text() : QStringLiteral("<none>");
@@ -146,6 +148,35 @@ int main(int argc, char** argv) {
 		Control<QCheckBox>(dialog, "checkBox_frame_generation")->setChecked(false);
 		Control<QPushButton>(dialog, "cancel_button")->click();
 		Check(config.GameSettings() == original, "cancel discards changes across categories");
+	}
+	{
+		Configuration supported;
+		supported.title_id = QStringLiteral("PPSA23566");
+		supported.gameVersion = QStringLiteral("01.004.000");
+		ConfigurationEditDialog dialog(supported);
+		dialog.show();
+		app.processEvents();
+		auto* profile = Control<QCheckBox>(dialog, "checkBox_ufc6_540p");
+		Check(!profile->isHidden() && !profile->isChecked(), "supported graphics profile is not optional/default off");
+		profile->setChecked(true);
+		Control<QPushButton>(dialog, "ok_button")->click();
+		Check(supported.ufc6_540p_enabled && dialog.result() == QDialog::Accepted,
+		      "per-game graphics profile not saved");
+		ConfigurationEditDialog cancel(supported);
+		Control<QCheckBox>(cancel, "checkBox_ufc6_540p")->setChecked(false);
+		Control<QPushButton>(cancel, "cancel_button")->click();
+		Check(supported.ufc6_540p_enabled, "cancel changed the graphics profile");
+		supported.gameVersion = QStringLiteral("01.005.000");
+		ConfigurationEditDialog stale(supported);
+		auto* stale_profile = Control<QCheckBox>(stale, "checkBox_ufc6_540p");
+		Check(!stale_profile->isHidden() && stale_profile->isChecked(),
+		      "updated game lost the ability to disable its old graphics profile");
+		stale_profile->setChecked(false);
+		Control<QPushButton>(stale, "ok_button")->click();
+		Check(!supported.ufc6_540p_enabled, "old-version graphics profile could not be disabled");
+		ConfigurationEditDialog unsupported(supported);
+		Check(Control<QCheckBox>(unsupported, "checkBox_ufc6_540p")->isHidden(),
+		      "unsupported version offered the graphics profile");
 	}
 	std::puts(
 	    "PASS: settings navigation, search, global/per-game scope, save, validation and cancel");

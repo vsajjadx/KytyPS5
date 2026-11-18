@@ -258,7 +258,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .ray_query              = graphics.ray_query_enabled};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -309,9 +310,9 @@ void PipelineCache::NoteCallFailure(uint64_t hash, const std::string& reason) {
 
 bool PipelineCache::HasAddressWrites(const ShaderRecompiler::IR::Program& program) {
 	using namespace ShaderRecompiler::IR;
-	// This runs AFTER resource tracking. A certified FlatLocal store can only select
-	// private scratch/LDS in StoreLocalFlat; it cannot address snapshotted guest code.
-	// Unknown indices and every other address kind retain the conservative rejection.
+	// This runs AFTER resource tracking. Tracked Scratch stores use bounded Function
+	// storage, and certified FlatLocal stores can only select scratch/LDS. Neither
+	// can address snapshotted guest code. Other address kinds remain conservative.
 	static const bool diagnose = [] {
 		const char* text = std::getenv("KYTY_CALL_TABLE_DIAG");
 		return text != nullptr && text[0] == '1' && text[1] == '\0';
@@ -329,9 +330,18 @@ bool PipelineCache::HasAddressWrites(const ShaderRecompiler::IR::Program& progra
 			const auto flags = inst.Flags<MemoryFlags>();
 			const bool valid = flags.index < program.memory_info.size();
 			const auto* memory = valid ? &program.memory_info[flags.index] : nullptr;
-			const bool local = inst.GetOpcode() == ValueOpcode::StoreAddressU32 && memory != nullptr &&
-			                   memory->kind == ResourceKind::FlatLocal && memory->data_bits == 32u &&
-			                   memory->data_dwords == 1u && program.scratch_dwords != 0u;
+			const auto* scratch_handle = memory != nullptr && memory->kind == ResourceKind::Scratch &&
+			                                 inst.NumArgs() != 0u
+			                             ? inst.Arg(0).Resolve().TryInstruction()
+			                             : nullptr;
+			const bool scratch = program.resource_tracking_complete && program.scratch_dwords != 0u &&
+			                     scratch_handle != nullptr &&
+			                     scratch_handle->GetOpcode() == ValueOpcode::GetScratchResource &&
+			                     scratch_handle->NumArgs() == 0u;
+			const bool local = scratch ||
+			                   (inst.GetOpcode() == ValueOpcode::StoreAddressU32 && memory != nullptr &&
+			                    memory->kind == ResourceKind::FlatLocal && memory->data_bits == 32u &&
+			                    memory->data_dwords == 1u && program.scratch_dwords != 0u);
 			unbounded |= !local;
 			local_writes += local ? 1u : 0u;
 			if (report && writes < 32u) {
@@ -417,8 +427,14 @@ std::string PipelineCache::CallCodeConflict(const Program& program, const Shader
 			if (!buffers[index].written) continue;
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[index]);
 			const auto base       = descriptor.Base48();
-			const auto bytes      = descriptor.NumRecords() == UINT32_MAX ? UINT64_MAX - base
+			auto bytes            = descriptor.NumRecords() == UINT32_MAX ? UINT64_MAX - base
 			                                                              : descriptor.GetSize();
+			// Match FindBuffers' actual raw zero-stride view: OOB_SELECT=2 permits the
+			// whole instruction payload even when NumRecords advertises fewer bytes.
+			if (bytes != 0 && descriptor.NumRecords() != UINT32_MAX && descriptor.Stride() == 0 &&
+			    descriptor.OutOfBounds() == 2 && !buffers[index].scalar) {
+				bytes = std::max(bytes, uint64_t {buffers[index].max_byte_extent});
+			}
 			if (bytes != 0 && base < address + size && address < base + bytes) {
 				return fmt::format("callee code 0x{:x}+{} is writable through buffer {} of this dispatch",
 				                   address, size, index);
@@ -842,6 +858,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	const auto bind = [&](const ShaderModule& module) -> const ShaderModule* {
 		if (const auto* source = entry->second.call_source.get();
 		    source != nullptr && (!source->call_code_ranges.empty() || !source->call_table_ranges.empty())) {
+			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				// Context-data projection is admitted only where canonical snapshot copying
+				// and late native-owner/write validation precede the actual consumer.
+				if (!source->call_data.empty()) {
+					NoteCallFailure(params.hash, "captured context data requires compute dispatch enforcement");
+					input_info.stage = {};
+					return nullptr;
+				}
+			}
 			// Table callee code is a dispatch-time snapshot: it must be uniquely backed and not
 			// writable through this dispatch's buffer bindings. (Flat/global/image stores cannot
 			// be bounded here; see the report.) Otherwise this dispatch fails explicitly.
@@ -858,6 +883,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			closure->mapping_generation    = Libs::LibKernel::Memory::MappingGeneration();
 			closure->protection_generation = Libs::LibKernel::Memory::ProtectionGeneration();
 			closure->table_ranges          = source->call_table_ranges;
+			// Rebuilt for every bind, including module reuse after only a companion pointer
+			// changes. Linked code identity does not identify the current data snapshot.
+			closure->data.reserve(source->call_data.size());
+			for (const auto& data: source->call_data) {
+				closure->data.push_back({data.address, data.words});
+			}
 			const auto& linked = *source->linked;
 			for (const auto& function: linked.functions) {
 				if (source->calls[function.site].kind != ShaderRecompiler::ShaderSource::Call::Kind::Table) continue;

@@ -986,8 +986,17 @@ private:
 			for (; slot < m_program.srt_reads.size(); ++slot) {
 				const auto* other = m_program.srt_reads[slot].value.Resolve().TryInstruction();
 				if (other->GetOpcode() != read->GetOpcode() ||
-				    m_program.memory_info[other->Flags<MemoryFlags>().index] != memory) continue;
+				    other->NumArgs() != read->NumArgs()) continue;
+				auto other_memory = m_program.memory_info[other->Flags<MemoryFlags>().index];
+				// MakeSource already used the native V# bank to resolve the four descriptor
+				// words at this read. Once validated, that bank is provenance, not another
+				// read operand. Keep stored metadata and all bounds/component semantics intact.
+				if (memory.kind == ResourceKind::ScalarBuffer)
+					other_memory.resource = memory.resource;
+				if (other_memory != memory) continue;
 				const auto* other_handle = other->Arg(0).Resolve().TryInstruction();
+				if (other_handle == nullptr || other_handle->GetOpcode() != handle->GetOpcode() ||
+				    other_handle->NumArgs() != resolved->source.dword_count) continue;
 				bool same = true;
 				for (uint32_t word = 0; word < resolved->source.dword_count; ++word)
 					same &= EquivalentValue(m_program, resolved->source.dwords[word], other_handle->Arg(word));
@@ -4299,7 +4308,7 @@ private:
 				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     fmt::format("buffer descriptor is not a valid runtime value; GPU-selected access "
-					                 "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load "
+					                 "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X/XY/XYZ/XYZW load (32-bit or packed 16-bit) "
 					                 "(op={} memory_kind={} bits={} dwords={} formatted={} typed={})",
 					                 static_cast<uint32_t>(op), static_cast<uint32_t>(memory.kind),
 					                 memory.data_bits, memory.data_dwords, memory.formatted ? 1 : 0,

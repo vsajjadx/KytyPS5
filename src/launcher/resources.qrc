@@ -14,4 +14,8 @@
  <qresource prefix="/styles">
   <file alias="launcher.qss">styles/launcher.qss</file>
  </qresource>
+ <qresource prefix="/profiles">
+  <file alias="ufc6-540p.json">profiles/ufc6-540p.json</file>
+  <file alias="NOTICE.txt">profiles/NOTICE.txt</file>
+ </qresource>
 </RCC>

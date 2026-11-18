@@ -285,7 +285,12 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x357u, Opcode::V_MED3_F16},
     {0x358u, Opcode::V_MED3_I16},
     {0x359u, Opcode::V_MED3_U16},
+    {0x14du, Opcode::V_LERP_U8},
+    {0x15au, Opcode::V_SAD_U8},
+    {0x15bu, Opcode::V_SAD_HI_U8},
+    {0x15cu, Opcode::V_SAD_U16},
     {0x15du, Opcode::V_SAD_U32},
+    {0x171u, Opcode::V_MSAD_U8},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
     {0x12fu, Opcode::V_CVT_PKRTZ_F16_F32},
@@ -313,6 +318,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
     {0x340u, Opcode::V_MAD_U16},
+    {0x344u, Opcode::V_PERM_B32},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
@@ -1409,7 +1415,9 @@ bool SupportsNativeVop3Clamp(Opcode opcode) {
 	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16 ||
 	       opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MAX3_I16 ||
 	       opcode == Opcode::V_MAX3_U16 || opcode == Opcode::V_MED3_U16 ||
-	       opcode == Opcode::V_MUL_HI_I32_I24 || opcode == Opcode::V_MUL_HI_U32_U24;
+	       opcode == Opcode::V_MUL_HI_I32_I24 || opcode == Opcode::V_MUL_HI_U32_U24 ||
+	       opcode == Opcode::V_SAD_U8 || opcode == Opcode::V_SAD_HI_U8 ||
+	       opcode == Opcode::V_SAD_U16 || opcode == Opcode::V_SAD_U32 || opcode == Opcode::V_MSAD_U8;
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
@@ -1443,6 +1451,12 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		case Opcode::V_MUL_HI_I32_I24:
 		case Opcode::V_MUL_HI_U32_U24:
 			// The high product fits in 32 bits, so clamp has no effect.
+			return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
+		case Opcode::V_SAD_U8:
+		case Opcode::V_SAD_HI_U8:
+		case Opcode::V_SAD_U16:
+		case Opcode::V_SAD_U32:
+		case Opcode::V_MSAD_U8:
 			return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
 		case Opcode::V_CVT_F32_UBYTE0:

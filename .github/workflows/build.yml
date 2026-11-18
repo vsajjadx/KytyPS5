@@ -114,9 +114,10 @@ jobs:
         run: |
           cmake --build _Build/windows --target launcher ^
             audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
-            shader_recompiler_compute_tests ^
-            resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests ^
+            shader_recompiler_compute_tests shader_cfg_tests ^
+            resource_tracking_tests scalar_provenance_tests playgo_tests ^
+            launcher_graphics_profile_tests launcher_settings_dialog_tests launcher_frame_generation_tests ^
+            resource_materialization_tests causal_diagnostics_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests ^
             memory_tracker_tests page_manager_tests image_page_table_tests bit_array_tests build_flags_tests ^
             event_queue_lifetime_tests sync_on_address_tests save_data_memory_tests trophy_system_tests ^
             audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests ces_tests save_data_dialog_tests psml_tests --parallel > build.log 2>&1
@@ -139,10 +140,20 @@ jobs:
           }
 
       - name: Test
-        continue-on-error: true # fork: a failing unit test must not block the exe artifact
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_read_provenance_cpu|scalar_provenance|resource_materialization|legacy_value_opcode_wire|causal_diagnostics|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml|playgo|launcher_graphics_profile|launcher_settings_dialog|launcher_frame_generation|shader_cfg|table_selected_context_cfg)$"
+
+      - name: Upload Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-diagnostics
+          path: |
+            build.log
+            _Build/windows/Testing/Temporary/LastTest.log
+            _Build/windows/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
 
       - name: Install
         shell: cmd
@@ -227,14 +238,14 @@ jobs:
             --target launcher audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests causal_diagnostics_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_read_provenance_cpu|scalar_provenance|resource_materialization|legacy_value_opcode_wire|causal_diagnostics|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -413,14 +424,14 @@ jobs:
             --target launcher page_manager_tests memory_tracker_tests \
               audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests causal_diagnostics_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_read_provenance_cpu|scalar_provenance|resource_materialization|legacy_value_opcode_wire|causal_diagnostics|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

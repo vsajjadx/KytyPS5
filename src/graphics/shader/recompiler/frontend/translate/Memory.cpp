@@ -355,6 +355,15 @@ IR::Value Translator::NarrowSubdword(IR::U32 value, uint32_t bits) {
 }
 
 void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
+	if (!inst.call_context_words.empty()) {
+		// The linker proved equality over every reachable record for this callee.
+		// Dispatch is conditional on the renderer enforcing its immutable DATA
+		// closure, including the actual GPU copies. Never replace the context pair.
+		EXIT_IF(!raw || inst.call_context_words.size() != inst.data_dwords);
+		for (uint32_t component = 0; component < inst.data_dwords; ++component)
+			WriteOperand(ScalarDestinationOperand(inst.dst, component), IR::Value(inst.call_context_words[component]));
+		return;
+	}
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto resource =
 	    raw ? GetScalarAddressResource(RawScalarLoadBase(inst.src0)) : GetBufferResource(memory);

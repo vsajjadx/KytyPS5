@@ -117,6 +117,7 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   output_1080p_enabled        = false;
+	bool                   ufc6_540p_enabled           = false;
 	bool                   frame_generation_enabled    = false;
 	QString                frame_generation_backend    = QStringLiteral("fsr");
 	int                    frame_generation_multiplier = 2;
@@ -183,6 +184,7 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
 		output_1080p_enabled        = other.output_1080p_enabled;
+		ufc6_540p_enabled           = other.ufc6_540p_enabled;
 		frame_generation_enabled    = other.frame_generation_enabled;
 		frame_generation_backend    = other.frame_generation_backend;
 		frame_generation_multiplier = other.frame_generation_multiplier;
@@ -251,6 +253,7 @@ public:
 	void ReadSettings(QSettings* s);
 
 	[[nodiscard]] QVariantMap GameSettings() const;
+	[[nodiscard]] bool SupportsUfc6GraphicsProfile() const;
 	// Call on a temporary configuration: validation can fail after loading values.
 	bool SetGameSettings(const QJsonObject& settings, QString& error);
 

@@ -287,12 +287,53 @@ void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	}
 }
 
-void Translator::V_SAD_U32(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU32(inst.src0);
-	const auto rhs    = ReadU32(inst.src1);
-	const auto lo     = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
-	const auto hi     = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {lhs, rhs}));
-	const auto result = ir.IAdd(ir.ISub(hi, lo), ReadU32(inst.src2));
+void Translator::V_LERP_U8(const Decoder::Instruction& inst) {
+	const auto lhs      = ReadU32(inst.src0);
+	const auto rhs      = ReadU32(inst.src1);
+	const auto rounding = ReadU32(inst.src2);
+	auto       result   = IR::U32(IR::Value(0u));
+	for (uint32_t offset = 0; offset < 32u; offset += 8u) {
+		const auto byte = [&](IR::U32 value, uint32_t bits) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                       {value, IR::Value(offset), IR::Value(bits)}));
+		};
+		const auto sum = ir.IAdd(ir.IAdd(byte(lhs, 8), byte(rhs, 8)), byte(rounding, 1));
+		const auto average = ir.ShiftRightLogical(sum, IR::U32(IR::Value(1u)));
+		result = ir.BitwiseOr(result, ir.ShiftLeftLogical(average, IR::U32(IR::Value(offset))));
+	}
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::SubwordSad(const Decoder::Instruction& inst, uint32_t bits, uint32_t shift,
+                            bool masked) {
+	const auto lhs = ReadU32(inst.src0);
+	const auto rhs = ReadU32(inst.src1);
+	auto       sum = IR::U32(IR::Value(0u));
+	for (uint32_t offset = 0; offset < 32u; offset += bits) {
+		const auto extract = [&](IR::U32 value) {
+			return bits == 32 ? value : IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                         {value, IR::Value(offset), IR::Value(bits)}));
+		};
+		const auto left  = extract(lhs);
+		const auto right = extract(rhs);
+		const auto low   = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {left, right}));
+		const auto high  = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {left, right}));
+		auto difference  = ir.ISub(high, low);
+		if (masked) {
+			difference = ir.Select(ir.INotEqual(right, IR::U32(IR::Value(0u))), difference,
+			                       IR::U32(IR::Value(0u)));
+		}
+		sum = ir.IAdd(sum, difference);
+	}
+	if (shift != 0) {
+		sum = ir.ShiftLeftLogical(sum, IR::U32(IR::Value(shift)));
+	}
+	const auto addend = ReadU32(inst.src2);
+	auto       result = ir.IAdd(sum, addend);
+	if (inst.dst.clamp) {
+		const auto carry = IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {result, sum}));
+		result = ir.Select(carry, IR::U32(IR::Value(0xffffffffu)), result);
+	}
 	WriteOperand(DestinationOperand(inst), result);
 }
 
@@ -488,6 +529,37 @@ void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset)
 	const auto hi_part =
 	    ir.Select(ir.INotEqual(shift, IR::U32(IR::Value(0u))), hi_part_raw, IR::U32(IR::Value(0u)));
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(lo_part, hi_part));
+}
+
+void Translator::V_PERM_B32(const Decoder::Instruction& inst) {
+	const auto high      = ReadU32(inst.src0);
+	const auto low       = ReadU32(inst.src1);
+	const auto selectors = ReadU32(inst.src2);
+	const auto imm       = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+	const auto extract   = [&](IR::ValueOpcode op, IR::U32 value, IR::U32 offset, uint32_t count) {
+		return IR::U32(ir.Emit(op, {value, offset, imm(count)}));
+	};
+	// {high, low} holds bytes 7..0. Selectors 0-7 copy a byte, 8-11 replicate the top bit of
+	// byte 1, 3, 5 or 7, 12 writes 0x00 and larger selectors write 0xff.
+	const auto byte_at = [&](uint32_t i) {
+		const auto sel  = extract(IR::ValueOpcode::BitFieldUExtract, selectors, imm(i * 8u), 8u);
+		const auto byte = extract(IR::ValueOpcode::BitFieldUExtract,
+		                          ir.Select(ir.ULessThan(sel, imm(4u)), low, high),
+		                          ir.ShiftLeftLogical(ir.BitwiseAnd(sel, imm(3u)), imm(3u)), 8u);
+		const auto sign = extract(
+		    IR::ValueOpcode::BitFieldSExtract, ir.Select(ir.ULessThan(sel, imm(10u)), low, high),
+		    ir.IAdd(ir.ShiftLeftLogical(ir.BitwiseAnd(sel, imm(1u)), imm(4u)), imm(15u)), 1u);
+		const auto fill = ir.Select(ir.IEqual(sel, imm(12u)), imm(0u), imm(0xffu));
+		const auto rest = ir.Select(ir.ULessThan(sel, imm(12u)), sign, fill);
+		return ir.Select(ir.ULessThan(sel, imm(8u)), byte, rest);
+	};
+	// The inserts of bytes 1-3 overwrite bits 8-31, so byte 0 needs none.
+	auto result = byte_at(0);
+	for (uint32_t i = 1; i < 4; i++) {
+		result = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitFieldInsert, {result, byte_at(i), imm(i * 8u), imm(8u)}));
+	}
+	WriteOperand(DestinationOperand(inst), result);
 }
 
 void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {

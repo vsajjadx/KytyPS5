@@ -18,10 +18,10 @@ class CommandScheduler;
 class RenderContext;
 struct GraphicContext;
 
-// Mirrors guest BVHs (header version 1) into host acceleration structures. The guest builds and
-// refits them on the GPU, so a GPU job reads them there; the host reads back only what sizes the
-// builds. A guest TLAS instance names a (BLAS, subtree root) pair, mirrored as one BLAS over the
-// subtree's prim-record range.
+// Mirrors guest BVHs (header formats 1, 3 and 10) into host acceleration structures. The guest
+// builds and refits them on the GPU, so a GPU job reads them there; the host reads back only what
+// sizes the builds. A guest TLAS instance names a (BLAS, subtree root) pair, mirrored as one BLAS
+// over the subtree's prim-record range.
 class RayTracing {
 public:
 	explicit RayTracing(RenderContext& context);
@@ -29,11 +29,12 @@ public:
 	KYTY_CLASS_NO_COPY(RayTracing);
 
 	// Records the mirror of the guest TLAS header at `tlas`. Returns the device address of its
-	// context {u32 valid, u32 guest instance count, u32, u64 TLAS address at +16}, valid once every
-	// visible instance has a mirror of its pair as the guest holds it at the dispatch. New or
-	// changed BVHs get mirrors a few calls later. Instance i has custom index i and SBT offset
-	// equal to the first prim record of its range, so a hit's record is that plus the primitive.
-	// The context and the mirrors serve the commands recorded before the next call.
+	// context {u32 valid, u32 guest instance count, u32, u64 TLAS address at +16, u64 guest
+	// instance array at +24}, valid once every visible instance has a mirror of its pair as the
+	// guest holds it at the dispatch. New or changed BVHs get mirrors a few calls later. Instance i
+	// has custom index i and SBT offset equal to the first prim record of its range, so a hit's
+	// record is that plus the primitive. The context and the mirrors serve the commands recorded
+	// before the next call. The guest page table must be synchronized first (PrepareBda).
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
 private:

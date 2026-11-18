@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -138,6 +139,29 @@ const char* MatchCallTable(const IR::Program& query, ShaderSource::Call& site) {
 	return nullptr;
 }
 
+// Prove companion values with the same typed IR relations used by the target.
+// The caller query only follows plain moves from the already translated wide SMEM
+// producer, so probing unrelated SGPRs cannot introduce unsupported instructions.
+bool MatchCallContext(const IR::Program& query, const ShaderSource::Call& site,
+                      const std::array<IR::Value, 2>& values) {
+	using namespace IR;
+	const auto* target = site.target[0].TryInstruction();
+	if (target == nullptr || target->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+	    site.table_stride < 16u || site.table_word_offset > UINT32_MAX - 12u) return false;
+	for (uint32_t half = 0; half < 2u; ++half) {
+		const auto* value = values[half].Resolve().TryInstruction();
+		if (value == nullptr || value->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+		    value->NumArgs() != 2u || value->Arg(0).Resolve() != target->Arg(0).Resolve() ||
+		    value->Arg(1).Resolve() != target->Arg(1).Resolve()) return false;
+		const auto index = value->Flags<MemoryFlags>().index;
+		if (index >= query.memory_info.size()) return false;
+		const auto& memory = query.memory_info[index];
+		if (memory.kind != ResourceKind::ScalarBuffer || memory.data_dwords != 1u ||
+		    memory.offset != site.table_word_offset + 8u + half * 4u) return false;
+	}
+	return true;
+}
+
 // Geometry of one table site, already validated by the caller: entry offsets are
 // first + n * stride (n < slots, all < reach <= 2^32), the pointer is at word_offset in each.
 struct CallTableGeometry {
@@ -180,6 +204,83 @@ struct CallTableAttempts {
 	}
 };
 
+// Optional descriptor-data proof; unsupported proofs preserve the original loads.
+constexpr uint64_t MaxCallContextBytes = uint64_t {8} << 20u;
+constexpr size_t MaxCallContexts = 4096u;
+constexpr size_t MaxCallContextRanges = 16384u;
+// Optional reaching-definition analysis must remain bounded independently of linking.
+constexpr size_t MaxContextFlowInstructions = 8192u;
+constexpr size_t MaxContextFlowBlocks = 512u;
+constexpr uint32_t ContextLoadMarker = 0xbf800003u;
+
+void AppendCaptured(std::vector<ShaderSource::CapturedData>& ranges, uint64_t address,
+                    std::span<const uint32_t> words) {
+	if (words.empty()) return;
+	if (!ranges.empty() && ranges.back().address + ranges.back().words.size() * 4u == address) {
+		ranges.back().words.insert(ranges.back().words.end(), words.begin(), words.end());
+	} else {
+		ranges.push_back({address, {words.begin(), words.end()}});
+	}
+}
+
+struct CallTableContext {
+	bool usable = true;
+	size_t unique_contexts = 0;
+	uint64_t bytes = 0;
+	std::vector<ShaderSource::CapturedData> records;
+	std::map<uint64_t, std::set<uint64_t>> contexts;
+	struct Pending { uint64_t address; std::array<uint32_t, 4> entry; uint32_t available; };
+	std::vector<Pending> pending;
+	void Defer(uint64_t address, const std::array<uint32_t, 4>& entry, uint32_t available) {
+		if (!usable) return;
+		// A third in-range DWORD is real companion data even for a null target.
+		// Read it before capture instead of publishing its zero-initialized slot.
+		if (available <= 2u) { Observe(address, entry, available); return; }
+		if (pending.size() >= MaxCallContextRanges) { usable = false; return; }
+		pending.push_back({address, entry, available});
+	}
+	void Observe(uint64_t address, const std::array<uint32_t, 4>& entry, uint32_t available) {
+		if (!usable) return;
+		const auto target = ((uint64_t {entry[1]} << 32u) | entry[0]) & ~uint64_t {3};
+		if (available > 4u || (target != 0u && available != 4u) ||
+		    bytes > MaxCallContextBytes - available * 4u || records.size() >= MaxCallContextRanges) {
+			usable = false; return;
+		}
+		AppendCaptured(records, address, std::span(entry).first(available));
+		bytes += available * 4u;
+		if (target == 0u) return;
+		const auto context = (uint64_t {entry[3]} << 32u) | entry[2];
+		if (context == 0u || (context & 3u) != 0u || (context >> 48u) != 0u) {
+			usable = false; return;
+		}
+		if (contexts[target].insert(context).second && ++unique_contexts > MaxCallContexts) usable = false;
+	}
+};
+
+bool NormalizeCaptured(std::vector<ShaderSource::CapturedData>& ranges) {
+	std::ranges::sort(ranges, {}, &ShaderSource::CapturedData::address);
+	std::vector<ShaderSource::CapturedData> merged;
+	uint64_t bytes = 0;
+	for (auto& range: ranges) {
+		const auto size = uint64_t {range.words.size()} * 4u;
+		if (range.words.empty() || (range.address & 3u) != 0u || range.address > UINT64_MAX - size) return false;
+		if (!merged.empty() && range.address <= merged.back().address + merged.back().words.size() * 4u) {
+			auto& previous = merged.back();
+			const auto offset = (range.address - previous.address) / 4u;
+			const auto overlap = std::min<uint64_t>(range.words.size(), previous.words.size() - offset);
+			if (!std::equal(range.words.begin(), range.words.begin() + overlap, previous.words.begin() + offset)) return false;
+			previous.words.insert(previous.words.end(), range.words.begin() + overlap, range.words.end());
+			bytes += (range.words.size() - overlap) * 4u;
+		} else {
+			bytes += size;
+			merged.push_back(std::move(range));
+		}
+		if (bytes > MaxCallContextBytes || merged.size() > MaxCallContextRanges) return false;
+	}
+	ranges = std::move(merged);
+	return true;
+}
+
 struct CallTableScan {
 	uint64_t null_entries = 0, span_bytes = 0, chunks = 0, fallback_dwords = 0, ranges = 0;
 };
@@ -199,7 +300,8 @@ std::string ScanLargeCallTable(const CallTableGeometry& table, std::vector<uint6
                                CallTableScan& scan, uint64_t& scan_budget, uint64_t& range_budget,
                                uint64_t& fallback_budget, CallTableAttempts& attempts,
                                const CallTableReader& read_transport,
-                               std::vector<std::pair<uint64_t, uint64_t>>& reads) {
+                               std::vector<std::pair<uint64_t, uint64_t>>& reads,
+                               CallTableContext* context = nullptr) {
 	static thread_local std::vector<uint32_t> chunk(CallTableChunkBytes / sizeof(uint32_t));
 	// Every pointer DWORD offset is a multiple of 4 (base, addend, stride and word offset are), so
 	// "at + 4 <= size" is exactly "at < limit".
@@ -249,7 +351,7 @@ std::string ScanLargeCallTable(const CallTableGeometry& table, std::vector<uint6
 		++scan.chunks;
 		for (uint64_t index = 0; index < count; ++index) {
 			const uint64_t relative = index * table.stride;
-			std::array<uint32_t, 2> entry {};
+			std::array<uint32_t, 4> entry {};
 			for (uint32_t half = 0; half < 2u; ++half) {
 				const uint64_t at = begin + relative + half * sizeof(uint32_t);
 				if (at >= limit) continue; // Out of range reads zero.
@@ -267,6 +369,17 @@ std::string ScanLargeCallTable(const CallTableGeometry& table, std::vector<uint6
 				}
 				if (!depend(table.base + at))
 					return fmt::format("exceeded its {} pre-checked dependency ranges", scan.ranges);
+			}
+			// Companion bytes in an existing transport gap cost no extra read.
+			// Missing words wait until every mandatory read has completed.
+			if (context != nullptr && context->usable) {
+				const auto available = static_cast<uint32_t>(std::min<uint64_t>(16u, limit - begin - relative) / 4u);
+				if (batched && relative + available * 4u <= words.size_bytes()) {
+					for (uint32_t half = 2u; half < available; ++half) entry[half] = words[relative / 4u + half];
+					context->Observe(table.base + begin + relative, entry, available);
+				} else {
+					context->Defer(table.base + begin + relative, entry, available);
+				}
 			}
 			const auto target = ((uint64_t {entry[1]} << 32u) | entry[0]) & ~uint64_t {3};
 			if (target == 0u) {
@@ -314,6 +427,8 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	query.blocks.push_back(&block);
 	struct Producer { bool ready = false; std::map<uint32_t, Value> values; };
 	std::map<uint32_t, Producer> producers;
+	using ContextQuery = std::pair<uint32_t, std::array<Value, 2>>;
+	std::map<uint32_t, std::vector<ContextQuery>> context_queries;
 	std::function<Value(uint32_t, uint32_t)> Register;
 	std::function<Value(uint32_t, Value)> Resolve = [&](uint32_t before, Value value) -> Value {
 		value = value.Resolve();
@@ -400,6 +515,57 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			}
 			site.kind = ShaderSource::Call::Kind::Table;
 		}
+		if (site.kind == ShaderSource::Call::Kind::Table) {
+			const auto* target = values[0].Resolve().TryInstruction();
+			const auto flags = target->Flags<MemoryFlags>();
+			const auto found = std::ranges::find(source.decoded.instructions, flags.pc, &Decoder::Instruction::pc);
+			if (found != source.decoded.instructions.end() && found->dst.kind == Decoder::OperandKind::Sgpr &&
+			    found->family == Decoder::Family::SMEM && flags.index < query.memory_info.size()) {
+				const auto offset = query.memory_info[flags.index].offset;
+				const auto component = (offset - found->offset) / 4u;
+				const auto producer_index = static_cast<uint32_t>(found - source.decoded.instructions.begin());
+				if (offset >= found->offset && (offset - found->offset) % 4u == 0u &&
+				    component + 3u < found->data_dwords) {
+					const auto originates = [&](const auto& self, uint32_t before, uint32_t reg,
+					                             uint32_t word, uint32_t depth) -> bool {
+						if (depth == 32u) return false;
+						// The mandatory definition API fatally rejects crossing a call
+						// that writes this register. Optional probing must never enter it.
+						for (const auto& other: source.calls) {
+							const auto& destination = source.decoded.instructions[other.instruction].dst;
+							if (destination.kind == Decoder::OperandKind::Sgpr && reg >= destination.reg &&
+							    reg - destination.reg < 2u) return false;
+						}
+						std::vector<uint32_t> crossed;
+						const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, reg,
+						                                                   source.wave_size, crossed);
+						// Optional provenance must not impose new preservation requirements
+						// on an earlier call through Register().
+						if (!definition || *definition == UINT32_MAX || !crossed.empty()) return false;
+						if (*definition == producer_index) return reg == found->dst.reg + component + word;
+						const auto& move = source.decoded.instructions[*definition];
+						if (move.src0.kind != Decoder::OperandKind::Sgpr || move.dst.kind != Decoder::OperandKind::Sgpr ||
+						    reg < move.dst.reg) return false;
+						const auto half = reg - move.dst.reg;
+						if (!((move.opcode == Decoder::Opcode::S_MOV_B32 && half == 0u) ||
+						      (move.opcode == Decoder::Opcode::S_MOV_B64 && half < 2u))) return false;
+						return self(self, *definition, move.src0.reg + half, word, depth + 1u);
+					};
+					for (uint32_t reg = 0; reg < 105u; ++reg) {
+						if (reg <= call.dst.reg + 1u && call.dst.reg <= reg + 1u) continue;
+						if (!originates(originates, site.instruction, reg, 2u, 0u) ||
+						    !originates(originates, site.instruction, reg + 1u, 3u, 0u)) continue;
+						std::array<Value, 2> companion;
+						for (uint32_t half = 0; half < 2u; ++half) {
+							auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
+							root.SetArg(0, Register(site.instruction, reg + half));
+							companion[half] = Value(&root);
+						}
+						context_queries[site.instruction].emplace_back(reg, companion);
+					}
+				}
+			}
+		}
 		for (uint32_t i = 0; i < 2u; ++i) {
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, values[i]);
@@ -418,6 +584,10 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			if (const auto* reason = MatchCallTable(query, site)) {
 				unsupported(source.decoded.instructions[site.instruction].pc, reason);
 				return;
+			}
+			for (auto& [reg, values]: context_queries[site.instruction]) {
+				for (auto& value: values) value = value.Instruction()->Arg(0).Resolve();
+				if (MatchCallContext(query, site, values)) site.context_registers.set(reg);
 			}
 			targets.insert(targets.end(), site.table_descriptor.begin(), site.table_descriptor.end());
 		} else {
@@ -525,6 +695,194 @@ LeafRead ReadLeaf(uint64_t address, uint32_t call_pc, bool soft,
 	return result;
 }
 
+// Each accepted load reads an incoming companion pair, either preserved by the
+// entire true leaf or before any clobber in a non-reentered entry prefix.
+std::vector<ShaderSource::Linked::ContextRead> FindContextReads(
+    size_t site_index, uint32_t slot, const ShaderSource::Call& site,
+    const LeafRead& leaf, uint32_t wave_size) {
+	std::vector<ShaderSource::Linked::ContextRead> result;
+	if (site.context_registers.none()) return result;
+	uint32_t first_branch_target = UINT32_MAX;
+	for (const auto& inst: leaf.body)
+		if (Decoder::IsDirectBranch(inst.opcode)) first_branch_target = std::min(first_branch_target, inst.branch_target);
+	auto stable = site.context_registers;
+	for (const auto& inst: leaf.body) {
+		if (inst.opcode == Decoder::Opcode::S_SETREG_B32 ||
+		    inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+		    inst.opcode == Decoder::Opcode::UNKNOWN || inst.opcode == Decoder::Opcode::UNSUPPORTED) return {};
+		for (uint32_t reg = 0; reg < 105u; ++reg)
+			if (stable[reg] && (CFG::MayWriteScalarRegister(inst, reg, wave_size) ||
+			                    CFG::MayWriteScalarRegister(inst, reg + 1u, wave_size))) stable.reset(reg);
+	}
+	Decoder::Program flow;
+	CFG::Graph flow_graph;
+	bool flow_attempted = false, flow_usable = false;
+	const auto reaches_entry = [&](uint32_t before, uint32_t reg) {
+		if (!flow_attempted) {
+			flow_attempted = true;
+			if (leaf.body.size() > MaxContextFlowInstructions) return false;
+			size_t branches = 0;
+			for (const auto& inst: leaf.body) {
+				if (!Decoder::IsDirectBranch(inst.opcode)) continue;
+				// Each branch adds at most its target and fallthrough as leaders.
+				if (++branches > (MaxContextFlowBlocks - 1u) / 2u) return false;
+				const auto target = std::ranges::lower_bound(leaf.body, inst.branch_target,
+				                                             {}, &Decoder::Instruction::pc);
+				if (target == leaf.body.end() || target->pc != inst.branch_target) return false;
+			}
+			flow.instructions = leaf.body;
+			// A true leaf's return is an exit for this analysis. Original instruction
+			// PCs, raw slices and executable linked instructions are never changed.
+			flow.instructions.back().opcode = Decoder::Opcode::S_ENDPGM;
+			flow_graph = CFG::BuildGraph(flow);
+			const auto* entry = flow_graph.FindBlock(flow_graph.entry_block);
+			// FindScalarDefinition treats entry as a boundary. A backedge into it
+			// must therefore disable this optional extension, not hide a clobber.
+			flow_usable = !flow_graph.unsupported && entry != nullptr && entry->predecessors.empty();
+		}
+		if (!flow_usable || !std::ranges::any_of(flow_graph.blocks, [&](const auto& block) {
+		        return block.inst_begin <= before && before < block.inst_end;
+		    })) return false; // BuildGraph prunes unreachable instruction ranges.
+		for (uint32_t half = 0; half < 2u; ++half) {
+			std::vector<uint32_t> crossed;
+			const auto definition = CFG::FindScalarDefinition(flow, flow_graph, before, reg + half,
+			                                                  wave_size, crossed);
+			if (!definition || *definition != UINT32_MAX || !crossed.empty()) return false;
+		}
+		return true;
+	};
+	auto live = site.context_registers;
+	bool prefix = true;
+	for (uint32_t index = 0; index < leaf.body.size(); ++index) {
+		const auto& inst = leaf.body[index];
+		const bool branch = Decoder::IsDirectBranch(inst.opcode) || inst.opcode == Decoder::Opcode::S_SETPC_B64;
+		if (branch) prefix = false;
+		const bool scalar_load = inst.opcode == Decoder::Opcode::S_LOAD_DWORD ||
+		    inst.opcode == Decoder::Opcode::S_LOAD_DWORDX2 || inst.opcode == Decoder::Opcode::S_LOAD_DWORDX4 ||
+		    inst.opcode == Decoder::Opcode::S_LOAD_DWORDX8 || inst.opcode == Decoder::Opcode::S_LOAD_DWORDX16;
+		if (scalar_load && inst.src0.kind == Decoder::OperandKind::Sgpr && inst.src0.reg < 105u &&
+		    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg + inst.data_dwords <= 106u &&
+		    inst.data_dwords != 0u && inst.data_dwords <= 16u) {
+			bool incoming = stable[inst.src0.reg];
+			if (!incoming && prefix && live[inst.src0.reg]) {
+				incoming = first_branch_target > inst.pc;
+			}
+			if (!incoming && site.context_registers[inst.src0.reg]) incoming = reaches_entry(index, inst.src0.reg);
+			uint64_t dynamic = 0;
+			bool fixed = inst.src1.kind == Decoder::OperandKind::Null;
+			if (inst.src1.kind == Decoder::OperandKind::IntegerInlineConstant ||
+			    inst.src1.kind == Decoder::OperandKind::LiteralConstant) {
+				dynamic = inst.src1.value; fixed = true;
+			}
+			const int64_t offset = static_cast<int64_t>(dynamic) + static_cast<int32_t>(inst.offset);
+			if (incoming && fixed && offset >= 0 && (dynamic & 3u) == 0u &&
+			    (inst.offset & 3u) == 0u && (offset & 3) == 0 &&
+			    static_cast<uint64_t>(offset) <= UINT32_MAX - uint64_t {inst.data_dwords} * 4u) {
+				result.push_back({site_index, slot, inst.pc, static_cast<uint32_t>(offset), inst.data_dwords});
+			}
+		}
+		for (uint32_t reg = 0; reg < 105u; ++reg)
+			if (live[reg] && (CFG::MayWriteScalarRegister(inst, reg, wave_size) ||
+			                  CFG::MayWriteScalarRegister(inst, reg + 1u, wave_size))) live.reset(reg);
+	}
+	return result;
+}
+
+struct ContextProof {
+	std::vector<ShaderSource::Linked::ContextLoad> loads;
+	std::vector<ShaderSource::CapturedData> data;
+};
+using ContextPayloadCache = std::map<std::pair<uint64_t, uint32_t>, std::optional<std::vector<uint32_t>>>;
+
+ContextProof ProveContextLoads(std::span<const ShaderSource::Linked::ContextRead> candidates,
+                              std::vector<CallTableContext>& tables,
+                              const std::vector<std::vector<uint64_t>>& targets,
+                              CallTableAttempts& attempts, ContextPayloadCache& cache,
+                              const CallTableReader& reader) {
+	ContextProof proof;
+	if (candidates.size() > MaxCallContextRanges) return proof;
+	// Optional companion probes run after all mandatory pointer/code reads.
+	std::set<size_t> requested_tables;
+	for (const auto& candidate: candidates) if (candidate.site < tables.size()) requested_tables.insert(candidate.site);
+	for (const auto site: requested_tables) {
+		auto& table = tables[site];
+		if (!table.usable) continue;
+		for (auto& pending: table.pending) {
+			const uint64_t bytes = uint64_t {pending.available - 2u} * 4u;
+			if (pending.address > UINT64_MAX - 16u || attempts.bytes > MaxCallTableAttemptBytes - bytes ||
+			    !attempts.Charge(bytes) || !reader(pending.address + 8u,
+			        std::span(pending.entry).subspan(2u, pending.available - 2u))) { table.usable = false; break; }
+			table.Observe(pending.address, pending.entry, pending.available);
+			if (!table.usable) break;
+		}
+		table.pending.clear();
+	}
+	std::set<size_t> used_tables;
+	std::set<std::pair<uint64_t, uint32_t>> used_payloads;
+	for (const auto& load: candidates) {
+		if (load.site >= tables.size() || load.site >= targets.size() ||
+		    load.slot >= targets[load.site].size() || !tables[load.site].usable) continue;
+		const auto found = tables[load.site].contexts.find(targets[load.site][load.slot]);
+		if (found == tables[load.site].contexts.end() || found->second.empty()) continue;
+		bool invariant = true;
+		std::vector<uint32_t> expected;
+		std::vector<std::pair<uint64_t, uint32_t>> payloads;
+		for (const uint64_t context: found->second) {
+			const auto bytes = uint64_t {load.dwords} * 4u;
+			constexpr uint64_t address_limit = uint64_t {1} << 48u;
+			if (load.dwords == 0u || load.dwords > 16u || context >= address_limit ||
+			    load.offset > address_limit - context || bytes > address_limit - context - load.offset) {
+				invariant = false; break;
+			}
+			const std::pair<uint64_t, uint32_t> key {context + load.offset, load.dwords};
+			auto [entry, inserted] = cache.try_emplace(key);
+			if (inserted) {
+				if (cache.size() > MaxCallContextRanges || attempts.bytes > MaxCallTableAttemptBytes - bytes ||
+				    !attempts.Charge(bytes)) { invariant = false; break; }
+				std::vector<uint32_t> words(load.dwords);
+				if (reader(key.first, words)) entry->second = std::move(words);
+			}
+			if (!entry->second) { invariant = false; break; }
+			if (expected.empty()) expected = *entry->second;
+			else if (expected != *entry->second) { invariant = false; break; }
+			payloads.push_back(key);
+		}
+		if (!invariant || expected.empty()) continue;
+		proof.loads.push_back({load.site, load.slot, load.local_pc, expected});
+		used_tables.insert(load.site);
+		for (const auto& key: payloads) {
+			if (used_payloads.insert(key).second) proof.data.push_back({key.first, *cache.at(key)});
+		}
+	}
+	for (const auto site: used_tables)
+		proof.data.insert(proof.data.end(), tables[site].records.begin(), tables[site].records.end());
+	if (!NormalizeCaptured(proof.data)) return {};
+	return proof;
+}
+
+void PublishContextData(ShaderSource& source, ContextProof proof) {
+	source.call_data = std::move(proof.data);
+	source.call_code_ranges.clear();
+	const auto& linked = *source.linked;
+	for (const auto& function: linked.functions) {
+		if (source.calls[function.site].kind != ShaderSource::Call::Kind::Table) continue;
+		const std::pair<uint64_t, uint64_t> range {linked.site_targets[function.site][function.slot],
+		                                           uint64_t {function.size} * sizeof(uint32_t)};
+		if (std::ranges::find(source.call_code_ranges, range) == source.call_code_ranges.end())
+			source.call_code_ranges.push_back(range);
+	}
+	uint64_t bytes = 0;
+	for (const auto& range: source.call_data) {
+		const std::pair<uint64_t, uint64_t> span {range.address, uint64_t {range.words.size()} * 4u};
+		source.call_code_ranges.push_back(span);
+		source.reads.push_back(span);
+		bytes += span.second;
+	}
+	if (!source.call_data.empty()) source.call_diagnostic += fmt::format(
+	    "; context_loads={} context_snapshot_bytes={} context_snapshot_ranges={}",
+	    linked.context_loads.size(), bytes, source.call_data.size());
+}
+
 } // namespace
 
 const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime,
@@ -533,6 +891,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	failure.clear();
 	auto& reads = source.reads;
 	reads.clear();
+	source.call_data.clear();
 	std::vector<uint32_t> flat;
 	const bool walked = IR::WalkSrt(source.call_targets, runtime, flat, &reads);
 	const std::function<bool(uint64_t, std::span<uint32_t>)> read_code =
@@ -548,6 +907,10 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	};
 	// The closed callee set of every site for THIS dispatch, in first-appearance order.
 	std::vector<std::vector<uint64_t>> plan(source.calls.size());
+	std::vector<CallTableContext> context_tables(source.calls.size());
+	for (auto& context: context_tables) context.usable = false;
+	uint64_t context_capture_budget = MaxCallContextBytes;
+	ContextPayloadCache payload_cache;
 	source.call_diagnostic.clear();
 	source.call_table_ranges.clear();
 	// Aggregate large-table work bounds for this refresh (see MaxCallTableScanBytes).
@@ -599,6 +962,17 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 		const uint64_t first  = table.first;
 		const uint64_t slots  = table.slots;
 		if (slots == 0u) return fail(call.pc, fmt::format("call table at 0x{:x} has no entries", base));
+		CallTableContext* context = nullptr;
+		const uint64_t first_word = first + site.table_word_offset;
+		const uint64_t limit = size & ~uint64_t {3};
+		const uint64_t rows = first_word < limit ? std::min(slots, (limit - first_word - 1u) / site.table_stride + 1u) : 0u;
+		const uint64_t end_word = rows != 0u ? std::min(first_word + (rows - 1u) * site.table_stride + 16u, limit) : first_word;
+		const uint64_t record_bytes = rows != 0u ? (rows - 1u) * 16u + std::min<uint64_t>(16u, limit - first_word - (rows - 1u) * site.table_stride) : 0u;
+		if (site.context_registers.any() && record_bytes <= context_capture_budget &&
+		    end_word >= first_word) {
+			context = &context_tables[i]; context->usable = true;
+			context_capture_budget -= record_bytes;
+		}
 		source.call_table_ranges.emplace_back(base, std::min<uint64_t>(size, reach + site.table_word_offset + 8u));
 		auto& targets = plan[i];
 		uint64_t null_entries = 0;
@@ -607,7 +981,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 			const auto reason = ScanLargeCallTable(
 			    {.base = base, .size = size, .first = first, .slots = slots, .stride = site.table_stride,
 			     .word_offset = site.table_word_offset},
-			    targets, scan, scan_budget, range_budget, fallback_budget, attempts, read_transport, reads);
+			    targets, scan, scan_budget, range_budget, fallback_budget, attempts, read_transport, reads, context);
 			if (!reason.empty())
 				return fail(call.pc, fmt::format(
 				    "call table at 0x{:x} {} "
@@ -631,7 +1005,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 		scan_budget -= std::min(scan_budget, slots * 8u);
 		range_budget -= std::min(range_budget, slots * 2u);
 		for (uint64_t offset = first; offset < reach; offset += site.table_stride) {
-			std::array<uint32_t, 2> entry {};
+			std::array<uint32_t, 4> entry {};
 			for (uint32_t half = 0; half < 2u; ++half) {
 				const uint64_t at = offset + site.table_word_offset + half * sizeof(uint32_t);
 				if (at + sizeof(uint32_t) > size) continue; // Out of range reads zero.
@@ -639,6 +1013,10 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 					return fail(call.pc, fmt::format("call table at 0x{:x} {}", base, attempts.Refusal(sizeof(uint32_t))));
 				if (base > UINT64_MAX - at || !read_code(base + at, std::span(entry).subspan(half, 1)))
 					return fail(call.pc, fmt::format("call table entry at 0x{:x} is unreadable", base + at));
+			}
+			if (context != nullptr) {
+				const uint64_t at = offset + site.table_word_offset;
+				context->Defer(base + at, entry, at < limit ? static_cast<uint32_t>(std::min<uint64_t>(16u, limit - at) / 4u) : 0u);
 			}
 			const auto target = ((uint64_t {entry[1]} << 32u) | entry[0]) & ~uint64_t {3};
 			if (target == 0u) {
@@ -661,6 +1039,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	}
 	if (large_refresh) source.call_diagnostic += fmt::format("; table_attempt_bytes={}", attempts.bytes);
 	const auto query_reads = reads.size();
+	bool verified_link_code = false;
 	if (source.linked) {
 		auto& linked = *source.linked;
 		// Uniform sites may relocate identical code; table sites compile their callee addresses
@@ -695,8 +1074,16 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 			            std::ranges::equal(expected, linked.observed_function);
 		}
 		if (unchanged) {
-			for (size_t i = 0; i < plan.size(); ++i) linked.site_targets[i] = plan[i];
-			return &linked.decoded;
+			verified_link_code = true;
+			auto proof = ProveContextLoads(linked.context_reads, context_tables, plan,
+			                              attempts, payload_cache, read_transport);
+			if (proof.loads == linked.context_loads) {
+				for (size_t i = 0; i < plan.size(); ++i) linked.site_targets[i] = plan[i];
+				// Data-only changes refresh the per-dispatch closure even when its
+				// compiled constants and original function code can be reused.
+				PublishContextData(source, std::move(proof));
+				return &linked.decoded;
+			}
 		}
 		reads.resize(query_reads);
 	}
@@ -729,13 +1116,35 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	const auto load = [&](size_t site_index, uint64_t address) -> const LeafRead& {
 		const auto& site = source.calls[site_index];
 		auto [entry, inserted] = functions.try_emplace(address);
-		if (inserted) {
+		if (inserted && verified_link_code) {
+			// A data-only relink already read and compared every mandatory code
+			// range. Decode its owned raw slice without spending guest reads again.
+			const auto& old = *source.linked;
+			const auto found = std::ranges::find_if(old.functions, [&](const auto& function) {
+				return plan[function.site][function.slot] == address;
+			});
+			EXIT_IF(found == old.functions.end());
+			const auto raw = std::span(old.code).subspan(found->offset, found->size);
+			const auto read_owned = [&](uint64_t at, std::span<uint32_t> words) {
+				if (at < address || ((at - address) & 3u) != 0u) return false;
+				const auto offset = (at - address) / sizeof(uint32_t);
+				if (offset > raw.size() || words.size() > raw.size() - offset) return false;
+				std::copy_n(raw.begin() + offset, words.size(), words.begin());
+				return true;
+			};
+			// Leaf slices terminate at S_SETPC_B64, not the S_ENDPGM contract
+			// of DecodeProgram. Reuse the leaf decoder and its bounds/policy.
+			entry->second = ReadLeaf(address, source.decoded.instructions[site.instruction].pc,
+			                         site.kind == ShaderSource::Call::Kind::Table, read_owned,
+			                         large_refresh ? &decode_budget : nullptr);
+		} else if (inserted) {
 			entry->second = ReadLeaf(address, source.decoded.instructions[site.instruction].pc,
 			                         site.kind == ShaderSource::Call::Kind::Table, read_code,
 			                         large_refresh ? &decode_budget : nullptr);
 		}
 		return entry->second;
 	};
+	bool context_candidate_overflow = false;
 	// Appends one copy of a leaf whose S_SETPC_B64 returns after the call.
 	const auto append = [&](size_t site_index, uint32_t slot, const LeafRead& leaf) -> std::string {
 		const auto& site  = source.calls[site_index];
@@ -784,6 +1193,15 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 			}
 			inst.pc += function_pc;
 			linked.decoded.instructions.push_back(std::move(inst));
+		}
+		if (!context_candidate_overflow && site.kind == ShaderSource::Call::Kind::Table) {
+			auto candidates = FindContextReads(site_index, slot, site, leaf, source.wave_size);
+			if (candidates.size() > MaxCallContextRanges - linked.context_reads.size()) {
+				context_candidate_overflow = true;
+				linked.context_reads.clear();
+			} else {
+				linked.context_reads.insert(linked.context_reads.end(), candidates.begin(), candidates.end());
+			}
 		}
 		linked.functions.push_back({function_offset, function_size / 4u, site_index, slot, function_pc});
 		function_pc += function_size;
@@ -919,14 +1337,34 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 		}
 		if (!repeated) reads.emplace_back(address, function.size * sizeof(uint32_t));
 	}
-	source.call_code_ranges.clear();
-	for (size_t j = 0; j < linked.functions.size(); ++j) {
-		const auto& function = linked.functions[j];
-		if (source.calls[function.site].kind != ShaderSource::Call::Kind::Table) continue;
-		const std::pair<uint64_t, uint64_t> range {plan[function.site][function.slot],
-		                                           uint64_t {function.size} * sizeof(uint32_t)};
-		if (std::ranges::find(source.call_code_ranges, range) == source.call_code_ranges.end())
-			source.call_code_ranges.push_back(range);
+	// All required leaf reads, validation and native linked-code charges precede
+	// optional probes. Lack of proof budget never refuses an otherwise valid call.
+	auto context_proof = ProveContextLoads(linked.context_reads, context_tables, plan,
+	                                      attempts, payload_cache, read_transport);
+	uint64_t projection_bytes = 12u;
+	for (const auto& projection: context_proof.loads) projection_bytes += 16u + projection.words.size() * 4u;
+	if (large_refresh && !context_proof.loads.empty() && projection_bytes > linked_budget) context_proof = {};
+	linked.context_loads = std::move(context_proof.loads);
+	std::map<std::pair<size_t, uint32_t>, uint32_t> function_pcs;
+	for (const auto& function: linked.functions) function_pcs.emplace(std::pair {function.site, function.slot}, function.synthetic_pc);
+	std::map<uint32_t, const std::vector<uint32_t>*> projections;
+	for (const auto& projection: linked.context_loads)
+		projections.emplace(function_pcs.at({projection.site, projection.slot}) + projection.local_pc, &projection.words);
+	for (auto& inst: linked.decoded.instructions)
+		if (const auto found = projections.find(inst.pc); found != projections.end()) inst.call_context_words = *found->second;
+	// Cache identity includes every semantic projection, outside untouched raw
+	// Function slices. These data words are never decoded as guest instructions.
+	if (!linked.context_loads.empty()) {
+		uint64_t footer_words = 3u;
+		for (const auto& projection: linked.context_loads) footer_words += 4u + projection.words.size();
+		if (!charge_linked(source.decoded.instructions[source.calls.front().instruction].pc,
+		                   footer_words * sizeof(uint32_t))) return nullptr;
+		linked.code.insert(linked.code.end(), {ContextLoadMarker, 1u, static_cast<uint32_t>(linked.context_loads.size())});
+		for (const auto& projection: linked.context_loads) {
+			linked.code.insert(linked.code.end(), {static_cast<uint32_t>(projection.site), projection.slot,
+			    projection.local_pc, static_cast<uint32_t>(projection.words.size())});
+			linked.code.insert(linked.code.end(), projection.words.begin(), projection.words.end());
+		}
 	}
 	linked.decoded.code = linked.code;
 	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
@@ -934,6 +1372,7 @@ const Decoder::Program* TryRefreshShaderSource(ShaderSource& source, const IR::S
 	linked.site_targets = std::move(plan);
 
 	source.linked = std::move(linked);
+	PublishContextData(source, std::move(context_proof));
 	++source.revision;
 	return &source.linked->decoded;
 }

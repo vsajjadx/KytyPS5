@@ -32,6 +32,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
 	KYTY_CFG_SET(output_1080p_enabled);
+	KYTY_CFG_SET(ufc6_540p_enabled);
 	KYTY_CFG_SET(frame_generation_enabled);
 	KYTY_CFG_SET(frame_generation_backend);
 	KYTY_CFG_SET(frame_generation_multiplier);
@@ -107,6 +108,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(fullscreen_enabled);
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(output_1080p_enabled);
+	ufc6_540p_enabled = s.value("ufc6_540p_enabled", false).toBool();
 	KYTY_CFG_GET(frame_generation_enabled);
 	frame_generation_backend = s.value("frame_generation_backend", QStringLiteral("fsr")).toString();
 	if (!Config::IsFrameGenerationBackendValid(frame_generation_backend.toStdString())) {
@@ -184,6 +186,12 @@ void Configuration::WriteSettings(QSettings* s) const {
 	s->setValue("game_path", game_path);
 	s->setValue("custom_settings", QVariant::fromValue(custom_settings).toString());
 	s->setValue("host_input_mapping", host_input_mapping);
+}
+
+bool Configuration::SupportsUfc6GraphicsProfile() const {
+	return title_id.trimmed().compare(QStringLiteral("PPSA23566"), Qt::CaseInsensitive) == 0 &&
+	       gameVersion == QStringLiteral("01.004.000") &&
+	       elf.compare(QStringLiteral("eboot.bin"), Qt::CaseInsensitive) == 0;
 }
 
 void Configuration::ReadSettings(QSettings* s) {

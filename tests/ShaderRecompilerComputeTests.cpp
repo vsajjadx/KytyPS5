@@ -16530,6 +16530,65 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckUfc6PresentationPadding() {
+    constexpr const char* name = "Ufc6PresentationPadding";
+    TestCase test;
+    test.name = name;
+    test.has_user_data = true;
+    test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    test.user_data[2] = 7u; // Allocated 8 x 1, irrespective of logical width below.
+    ShaderSamplerResource descriptor{};
+    descriptor.fields[2] = (1u << 20u) | (1u << 22u);
+    std::copy_n(descriptor.fields, 4, test.user_data.begin() + 8);
+    test.user_data[50] = sizeof(u32);
+    test.user_data[51] = 3u << 28u;
+    test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                    ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(7.25f / 8.0f));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.5f));
+    test.code.push_back(EncodeMimg0(0x27, 1)); // Explicit LOD zero.
+    test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    AppendStoreVgpr(&test.code, 0, 0);
+    AppendEnd(&test.code);
+    auto compiled = CompileCase(test, SubgroupSize());
+    auto& program = compiled.program;
+    Require(name, "fixture binding", program.info.buffers.size() == 1u &&
+                program.info.buffers[0].descriptor_index == 0u,
+            "expected only the output before adding the extent descriptor");
+    using BufferResource = ShaderRecompiler::IR::BufferResource;
+    program.info.buffers.push_back(BufferResource{.read = true, .scalar = true, .live = true});
+    program.shader_hash = 0x388e7c4cceacf4fdull;
+    auto profile = *test.profile;
+    profile.ufc6_post_process = true;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(
+        program, {.compute = &test.compute_info}, 0u, profile);
+    ValidateSpirv(name, compiled.spirv);
+    Require(name, "extent binding", program.info.buffers[1].descriptor_index == 1u,
+            "fixture did not bind the extent buffer at slot 1");
+    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
+    // Both descriptors alias the same test storage; descriptor 1 starts one dword in.
+    compiled.packed_user_data[program.bindings.memory_offset_dword] |= 4u << 8;
+    constexpr auto good = std::bit_cast<u32>(0.25f);
+    constexpr auto marker = std::bit_cast<u32>(1.0f);
+    auto image = CreateImage2D(name, 8, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled,
+        {good, good, good, good, good, good, marker, marker}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    const auto sampler = RuntimeRenderer().GetSamplerCache().GetSampler(descriptor, false);
+    for (const auto [width, expected] : {std::pair{6.0f, good}, std::pair{8.0f, marker}}) {
+      const std::vector<u32> initial{0u, std::bit_cast<u32>(width), 0x3f800000u};
+      auto output = CreateStorageBuffer(name, initial, initial.size());
+      Dispatch(test, compiled, output, nullptr, &image, nullptr, nullptr, sampler);
+      const auto actual = ReadBuffer(name, output, 1);
+      Require(name, "native filtered sample", actual.front() == expected,
+              "logical width " + std::to_string(width) +
+              ": expected " + std::to_string(expected) + ", got " + std::to_string(actual.front()));
+      DestroyBuffer(&output);
+    }
+    DestroyImage(&image);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -59548,6 +59607,7 @@ int main(int argc, char **argv) {
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
   vulkan.CheckSamplerFilterMode();
+  vulkan.CheckUfc6PresentationPadding();
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();

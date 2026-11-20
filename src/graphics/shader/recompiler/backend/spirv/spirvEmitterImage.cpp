@@ -43,6 +43,78 @@ uint32_t Ufc6WhiteRecoveryCoord(EmitterState& state, const IR::ImageResource& im
     return result;
 }
 
+// UFC 6's final scaling compute pass names the logical source extent in
+// its own scalar constants (SRV buffer descriptor 1, dwords 0 and 1).
+// Vulkan reports the allocated view extent, which can include stale right padding.
+uint32_t Ufc6PresentationCoord(EmitterState& state, const IR::ImageResource& image,
+                               uint32_t ordinal, uint32_t coord, spv::Op opcode,
+                               uint32_t operand_count, bool normalized) {
+	if (!state.profile.ufc6_post_process || state.program.stage != ShaderType::Compute ||
+	    state.program.shader_hash != 0x388e7c4cceacf4fdull || ordinal != 0u ||
+	    image.descriptor_index != 0u || image.heap || image.cube || image.mip_count != 1u ||
+	    image.resource_class != IR::ImageResourceClass::Sampled ||
+	    image.dimension != Decoder::ImageDimension::Dim2D ||
+	    image.numeric_class != Prospero::TextureNumericClass::Float || !normalized ||
+	    opcode != spv::OpImageSampleExplicitLod || operand_count != 2u) return coord;
+
+	const auto& buffers = state.program.info.buffers;
+	const auto constants = std::find_if(buffers.begin(), buffers.end(), [](const auto& b) {
+		return b.descriptor_index == 1u && b.live && b.read && !b.written && !b.atomic;
+	});
+	if (constants == buffers.end() || state.storage_buffers[2].variable == 0u) return coord;
+
+	const IR::MemoryInfo mem {.kind = IR::ResourceKind::ScalarBuffer,
+	                          .resource = static_cast<uint32_t>(constants - buffers.begin())};
+	const auto access = PrepareMemoryResourceAccess(state, mem);
+	const auto u32 = TypeU32(state);
+	const auto f32 = TypeF32(state);
+	const auto base = Binary(state, spv::OpShiftRightLogical, u32, access.byte_offset,
+	                         ConstantU32(state, 2));
+	const auto dim_index_y = EmitAddU32(state, base, ConstantU32(state, 1));
+	const auto width_and_height_present = EmitMemoryElementInBounds(state, access, dim_index_y);
+	const auto logical = EmitValueOrDefaultIfCondition(
+	    state, width_and_height_present, TypeU32Vector(state, 2),
+	    state.builder.Constant(spv::OpConstantNull, TypeU32Vector(state, 2)), [&]() {
+		    const auto x = state.builder.AllocateId();
+		    const auto y = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpLoad, u32, x, EmitMemoryElementPointer(state, access, base));
+		    state.builder.AddFunction(spv::OpLoad, u32, y, EmitMemoryElementPointer(state, access, dim_index_y));
+		    const auto vec = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), vec, x, y);
+		    return vec;
+	    });
+
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2), size,
+	                          LoadImageDescriptor(state, ordinal), ConstantU32(state, 0));
+	const auto aspect = [&](uint32_t value, uint32_t axis, bool bits) {
+		const auto item = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, item, value, axis);
+		return Unary(state, bits ? spv::OpBitcast : spv::OpConvertUToF, f32, item);
+	};
+	const auto logical_w = aspect(logical, 0, true);
+	const auto logical_h = aspect(logical, 1, true);
+	const auto physical_w = aspect(size, 0, false);
+	const auto physical_h = aspect(size, 1, false);
+	const auto supported = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	    Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), logical_w,
+	           ConstantF32Value(state, 1.0f)),
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	        Binary(state, spv::OpFOrdLessThan, TypeBool(state), logical_w, physical_w),
+	        Binary(state, spv::OpFOrdEqual, TypeBool(state), logical_h, physical_h)));
+	const auto limit = Binary(state, spv::OpFDiv, f32,
+	    Binary(state, spv::OpFSub, f32, logical_w, ConstantF32Value(state, 0.5f)), physical_w);
+	const auto u = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, f32, u, coord, 0u);
+	const auto clamp = Binary(state, spv::OpLogicalAnd, TypeBool(state), supported,
+	    Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), u, limit));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2), result,
+	                          Select(state, f32, clamp, limit, u), coord, 0u);
+	return result;
+}
+
 uint32_t Ufc6DofGatherCoord(EmitterState& state, const IR::ImageResource& image,
                             uint32_t ordinal, uint32_t coord) {
 	namespace Gather = KytyUfc6DofGatherBounds;
@@ -1204,8 +1276,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized);
 			const auto bloom_coord = Ufc6WhiteRecoveryCoord(state, candidate, resource, coord_raw,
 			    opcode, sample_operand_count, !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized));
-			const auto coord = Ufc6DofMergeCoord(state, candidate, resource, bloom_coord,
-			                                          simple_normalized_sample);
+			const auto dof_coord = Ufc6DofMergeCoord(state, candidate, resource, bloom_coord,
+			                                              simple_normalized_sample);
+			const auto coord = Ufc6PresentationCoord(state, candidate, resource, dof_coord, opcode,
+			    sample_operand_count, !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized));
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();

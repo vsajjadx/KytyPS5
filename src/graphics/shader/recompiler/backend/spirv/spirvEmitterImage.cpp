@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
@@ -7,6 +8,36 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+uint32_t Ufc6BloomLogicalCoord(EmitterState& state, const IR::ImageResource& image,
+                               uint32_t ordinal, uint32_t coord, bool simple_normalized_sample) {
+	namespace Bloom = KytyUfc6BloomLogicalView;
+	if (state.program.stage != ShaderType::Pixel || state.program.shader_hash != Bloom::Shader ||
+	    !state.profile.ufc6_post_process || !simple_normalized_sample ||
+	    ordinal != Bloom::Slot || image.descriptor_index != Bloom::Slot ||
+	    image.source != Bloom::ResourceSource || image.heap || image.cube ||
+	    image.resource_class != IR::ImageResourceClass::Sampled ||
+	    image.dimension != Decoder::ImageDimension::Dim2D ||
+	    image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
+	const auto end = state.program.bindings.memory_offset_dword;
+	const auto scale = Unary(state, spv::OpBitcast, TypeF32(state),
+	                         EmitShaderDataDwordLoad(state, end - 2u));
+	const auto limit_bits = EmitShaderDataDwordLoad(state, end - 1u);
+	const auto limit = Unary(state, spv::OpBitcast, TypeF32(state), limit_bits);
+	const auto u = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), u, coord, 0u);
+	const auto scaled = Binary(state, spv::OpFMul, TypeF32(state), u, scale);
+	const auto beyond = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), scaled, limit);
+	const auto limited = Select(state, TypeF32(state), beyond, limit, scaled);
+	const auto enabled = Binary(state, spv::OpINotEqual, TypeBool(state), limit_bits,
+	                            ConstantU32(state, 0x7f800000u));
+	// Preserve the original coordinate bits when this exact draw/view does not qualify.
+	const auto repaired = Select(state, TypeF32(state), enabled, limited, u);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2), result,
+	                          repaired, coord, 0u);
+	return result;
+}
 
 uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {
 	uint32_t index = 0;
@@ -1115,10 +1146,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands[0] |= spv::ImageOperandsMinLodMask;
 				sample_operands[sample_operand_count++] = min_lod;
 			}
-			const auto coord =
+			const auto coord_raw =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube, RowCenter(state, candidate.dimension));
+			const bool simple_normalized_sample =
+			    opcode == spv::OpImageSampleImplicitLod && sample_operand_count == 0u &&
+			    !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized);
+			const auto coord = Ufc6BloomLogicalCoord(state, candidate, resource, coord_raw,
+			                                         simple_normalized_sample);
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();

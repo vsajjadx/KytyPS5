@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -266,6 +267,11 @@ void DefineDescriptors(EmitterState& state) {
 	if (info.ray_query) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
+	}
+	if (state.program.stage == ShaderType::Pixel &&
+	    state.program.shader_hash == KytyUfc6BloomLogicalView::Shader &&
+	    state.profile.ufc6_post_process) {
+		bindings.memory_offset_dword += 2u; // scale, normalized upper limit
 	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());

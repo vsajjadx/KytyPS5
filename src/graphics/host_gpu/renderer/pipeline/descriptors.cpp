@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/readbackAttribution.h"
 #include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
@@ -1030,6 +1031,48 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	ReadbackAttribution::Scope attribution_scope(program.shader_hash, ReadbackAttribution::Phase::Bindings);
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
+
+	namespace Bloom = KytyUfc6BloomLogicalView;
+	if (program.stage == ShaderType::Pixel && program.shader_hash == Bloom::Shader &&
+	    layout.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.ray_query_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.memory_offset_dword == program.info.user_data_registers.size() + 2u) {
+		const auto end = layout.memory_offset_dword;
+		EXIT_IF(end > prepared.shader_data.size());
+		auto& scale = prepared.shader_data[end - 2u];
+		auto& limit = prepared.shader_data[end - 1u];
+		scale = std::bit_cast<uint32_t>(1.0f);
+		limit = 0x7f800000u; // identity even for nonfinite original UVs
+		if (prepared.images.size() > Bloom::Slot && program.info.images.size() > Bloom::Slot) {
+			const auto& resource = program.info.images[Bloom::Slot];
+			const auto& binding = prepared.images[Bloom::Slot];
+			const auto& req = binding.desc.info;
+			const auto& view = binding.desc.view_info;
+			if (resource.descriptor_index == Bloom::Slot && resource.source == Bloom::ResourceSource &&
+			    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+			    !resource.heap && binding.image_id && binding.image_view &&
+			    binding.desc.type == TextureCache::BindingType::Texture &&
+			    req.data.Valid() && req.extent.depth == 1u &&
+			    req.pixel_format == vk::Format::eB10G11R11UfloatPack32 && req.samples == 1u &&
+			    req.resources.levels == 1u && req.resources.layers == 1u &&
+			    view.format == vk::Format::eB10G11R11UfloatPack32 &&
+			    view.type == vk::ImageViewType::e2D && view.base_level == 0u && view.level_count == 1u &&
+			    view.base_layer == 0u && view.layer_count == 1u) {
+				const auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+				const auto& native = image.backing;
+				const bool exact_owner = image.registered && !image.binding.needs_rebind &&
+				    native.image && image.info.data == req.data && image.info.tile_mode == req.tile_mode &&
+				    native.image_type == vk::ImageType::e2D && native.extent.depth == 1u &&
+				    native.format == vk::Format::eB10G11R11UfloatPack32 && native.mip_levels == 1u &&
+				    native.layers == 1u && native.samples == 1u;
+				if (exact_owner && Bloom::HasPaddedWidth(req.extent.width, req.extent.height,
+				                                          native.extent.width, native.extent.height)) {
+					scale = std::bit_cast<uint32_t>(Bloom::Scale(req.extent.width, native.extent.width));
+					limit = std::bit_cast<uint32_t>(Bloom::MaxU(req.extent.width, native.extent.width));
+				}
+			}
+		}
+	}
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,

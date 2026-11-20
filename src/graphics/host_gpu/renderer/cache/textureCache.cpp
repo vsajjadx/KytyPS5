@@ -1457,6 +1457,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	Image::ActivityChanged();
+	const auto& meta = desc.info.metadata;
+	// Guest mapping ownership is queried outside the image-cache lock.
+	const bool zero_filled = meta.kind == ImageMetadataKind::Htile &&
+	                         m_buffer_cache.ConsumeHtileZeroFill(meta.range.address, meta.range.size);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1479,7 +1483,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted && image.info.htile_initial_clear) {
+		if (zero_filled || (inserted && image.info.htile_initial_clear)) {
 			metadata->second.clear_mask.set();
 		}
 		metadata->second.owner = id;
@@ -1509,6 +1513,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
+	m_buffer_cache.ForgetHtileZeroFill(image.info.data.address, image.info.data.size);
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}

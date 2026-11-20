@@ -315,6 +315,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
+	ForgetHtileZeroFill(address, size);
 	auto* bytes = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
@@ -602,6 +603,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	ForgetHtileZeroFill(vaddr, size);
 	if (auto* ledger = IndirectArgsLedger::Active()) ledger->DirtyUnknown(vaddr, size);
 	if (ShaderRecompiler::IR::HostActivityProofEnabled()) ++m_activity_epoch;
 	m_memory_tracker.InvalidateRegion(vaddr, size,
@@ -1122,6 +1124,19 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	// All PS5 HTile footprints are 32 KiB aligned. Track only recorded GPU fills,
+	// whose pages are protected until readback, within this command buffer.
+	if (value == 0 && ((vaddr | size) & 0x7fffu) == 0) {
+		const auto tick = m_scheduler.CurrentTick();
+		const auto mapping = LibKernel::Memory::MappingGeneration();
+		std::lock_guard lock(m_guest_ranges_mutex);
+		if (m_htile_fill_tick.load(std::memory_order_relaxed) != tick || m_htile_fill_mapping != mapping) {
+			m_htile_zero_fills = {};
+			m_htile_fill_mapping = mapping;
+		}
+		m_htile_zero_fills.Add(vaddr, size);
+		m_htile_fill_tick.store(tick, std::memory_order_release);
+	}
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -1380,7 +1395,32 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 	return true;
 }
 
+bool BufferCache::ConsumeHtileZeroFill(uint64_t address, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	if (size == 0 || m_htile_fill_tick.load(std::memory_order_acquire) != tick) return false;
+	uint64_t mapping;
+	{
+		std::lock_guard lock(m_guest_ranges_mutex);
+		if (!m_htile_zero_fills.Contains(address, size)) return false;
+		m_htile_zero_fills.Subtract(address, size);
+		mapping = m_htile_fill_mapping;
+		if (m_htile_zero_fills.Empty()) m_htile_fill_tick.store(0, std::memory_order_release);
+	}
+	// Do not hold the range lock while querying guest memory or calling into another cache.
+	return HasOnlyGpuDirtyBytes(address, size) &&
+	       LibKernel::Memory::IsBackingUniquelyMapped(address, size) &&
+	       mapping == LibKernel::Memory::MappingGeneration();
+}
+
+void BufferCache::ForgetHtileZeroFill(uint64_t address, uint64_t size) {
+	if (size == 0 || m_htile_fill_tick.load(std::memory_order_acquire) != m_scheduler.CurrentTick()) return;
+	std::lock_guard lock(m_guest_ranges_mutex);
+	m_htile_zero_fills.Subtract(address, size);
+	if (m_htile_zero_fills.Empty()) m_htile_fill_tick.store(0, std::memory_order_release);
+}
+
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	ForgetHtileZeroFill(vaddr, size);
 	for (auto& checked: m_checked_color_metadata) {
 		checked.Subtract(vaddr, size);
 	}
@@ -1570,7 +1610,7 @@ void BufferCache::PrepareBdaRange(uint64_t vaddr, uint64_t size) {
 	// Keep explicit residency enrollment aligned to the page-table entries.
 	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	std::lock_guard lock(m_bda_sync_mutex);
+	std::lock_guard lock(m_guest_ranges_mutex);
 	if (!m_bda_prepared.Contains(begin, end - begin)) {
 		m_bda_prepared.Add(begin, end - begin);
 		m_bda_sync.Add(begin, end - begin);
@@ -1584,13 +1624,13 @@ void BufferCache::ProcessFaultBuffer() {
 void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	std::lock_guard lock(m_bda_sync_mutex);
+	std::lock_guard lock(m_guest_ranges_mutex);
 	m_bda_sync.Add(begin, end - begin);
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	const auto queued = [this] {
-		std::lock_guard lock(m_bda_sync_mutex);
+		std::lock_guard lock(m_guest_ranges_mutex);
 		return std::exchange(m_bda_sync, {});
 	}();
 	std::vector<vk::BufferCopy> copies;

@@ -29,6 +29,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/systemContent.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -1045,6 +1046,28 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// UFC 6 starts its fighter depth prepass with this depth-only draw. The guest may
+// initialize compressed HTile before the D32S8 host attachment exists. Loading
+// the previous depth/stencil contents then rejects whole tiles of both fighters.
+static bool IsUfc6FighterPrepass(const DrawCallInfo& draw, const DrawRenderState& state,
+                                const RenderDepthInfo& target, const RenderState& rendering) {
+	if (rendering.num_color_attachments != 0 || state.ps_active || !draw.indexed ||
+	    draw.index_count != 1350 || draw.instance_count != 1 || state.indirect_draw ||
+	    state.vertex_info[0].stage.module->info.shader_hash != 0xe73e2d7b63570811ull) return false;
+	const auto& surface = target.desc.info;
+	const auto& attachment = rendering.depth_stencil_attachment;
+	if (!attachment.has_depth || !attachment.has_stencil || !target.depth_test_enable ||
+	    !target.depth_write_enable || target.depth_compare_op != vk::CompareOp::eGreaterOrEqual ||
+	    !target.stencil_test_enable || target.stencil_front.writeMask != 0xfe ||
+	    target.depth_clear_value != 0.0f || target.stencil_clear_value != 0 ||
+	    target.desc.view_info.format != vk::Format::eD32SfloatS8Uint ||
+	    surface.metadata.kind != ImageMetadataKind::Htile || !surface.metadata.stencil_compressed ||
+	    surface.samples != 1 || rendering.num_layers != 1 || rendering.width < 1000 ||
+	    rendering.height < 600) return false;
+	std::string title_id;
+	return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && title_id == "PPSA23566";
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
@@ -1221,7 +1244,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
-	buffer.BeginRendering(rendering);
+	buffer.BeginRendering(rendering, IsUfc6FighterPrepass(draw, state, m_targets.depth, rendering));
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);

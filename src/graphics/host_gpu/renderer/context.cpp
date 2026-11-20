@@ -41,6 +41,10 @@ void CommandBuffer::End() const {
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
+	BeginRendering(state, false);
+}
+
+void CommandBuffer::BeginRendering(const RenderState& state, bool clear_depth_stencil_on_begin) const {
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
@@ -80,7 +84,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.imageView   = depth_stencil.image_view;
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
-	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	    (depth_stencil.depth_clear || clear_depth_stencil_on_begin) ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
 	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
@@ -88,7 +92,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.imageView   = depth_stencil.image_view;
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
-	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	    (depth_stencil.stencil_clear || clear_depth_stencil_on_begin) ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
 	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 

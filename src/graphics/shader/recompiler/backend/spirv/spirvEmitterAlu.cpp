@@ -200,7 +200,30 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }
 
-uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+uint32_t EmitPackFloat2x16Rtz(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto arg0 = ctx.Arg(inst, 0);
+	auto arg1 = ctx.Arg(inst, 1);
+	if (state.profile.ufc6_post_process && state.program.stage == ShaderType::Pixel &&
+	    state.program.shader_hash == 0xed4b36c85001b428ULL) {
+		// The final RGB values are MAD(delta, amount, scene). An empty blur neighborhood
+		// can produce an invalid delta, which then spreads through the bloom mip chain.
+		const auto nonfinite = [&](uint32_t value) {
+			const auto type = TypeBool(state);
+			return Binary(state, spv::OpLogicalOr, type, Unary(state, spv::OpIsNan, type, value),
+			              Unary(state, spv::OpIsInf, type, value));
+		};
+		const auto channel = [&](size_t index, uint32_t blended) {
+			const auto* mad = inst.Arg(index).Resolve().TryInstruction();
+			if (mad == nullptr || mad->GetOpcode() != IR::ValueOpcode::FPMad32) return blended;
+			const auto scene = ctx.Arg(*mad, 2);
+			const auto fallback = Select(state, TypeF32(state), nonfinite(scene),
+			                             ConstantF32(state, 0), scene);
+			return Select(state, TypeF32(state), nonfinite(blended), fallback, blended);
+		};
+		arg0 = channel(0, arg0);
+		arg1 = channel(1, arg1);
+	}
 	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
 	    state, EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg0)),
 	    EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg1)),

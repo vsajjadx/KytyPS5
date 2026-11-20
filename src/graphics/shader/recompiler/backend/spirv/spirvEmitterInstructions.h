@@ -46,7 +46,7 @@ inline constexpr auto EmitPackSnorm2x16 =
     EmitGlsl<GLSLstd450PackSnorm2x16, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitPackUnorm2x16 =
     EmitGlsl<GLSLstd450PackUnorm2x16, IR::Type::U32, uint32_t>;
-uint32_t              EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t              EmitPackFloat2x16Rtz(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitFPAbs32 = EmitFAbsValue;
 inline constexpr auto EmitFPNeg32 = EmitFNegateValue;
 uint32_t              EmitFPSaturate32(EmitterState& state, uint32_t arg0);

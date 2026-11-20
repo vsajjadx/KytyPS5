@@ -24,6 +24,8 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// UFC 6 depth-of-field and bloom shader workarounds.
+	bool ufc6_post_process = false;
 };
 
 inline constexpr Profile DefaultProfile {};

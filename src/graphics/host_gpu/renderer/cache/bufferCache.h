@@ -147,6 +147,10 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// A native zero fill can precede the first bind of its HTile allocation.
+	[[nodiscard]] bool ConsumeHtileZeroFill(uint64_t address, uint64_t size);
+	void ForgetHtileZeroFill(uint64_t address, uint64_t size);
+
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -264,13 +268,18 @@ private:
 	PageTable                                         m_page_table;
 	std::atomic<uint64_t>                              m_activity_epoch {1};
 	RangeSet                                          m_gpu_modified_ranges;
+	// Guest faults can invalidate fills concurrently. The mutex protects the ranges and
+	// mapping generation; the atomic tick skips locking when no current fill exists.
+	RangeSet                                          m_htile_zero_fills;
+	std::atomic<uint64_t>                             m_htile_fill_tick {0};
+	uint64_t                                          m_htile_fill_mapping = 0;
 	std::vector<std::pair<uint64_t, uint32_t>>        m_read_checks;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
-	std::mutex                                        m_bda_sync_mutex;
+	std::mutex                                        m_guest_ranges_mutex;
 	RangeSet                                          m_bda_sync;
-	// Explicit residency already enrolled, guarded by m_bda_sync_mutex.
+	// Explicit residency already enrolled, guarded by m_guest_ranges_mutex.
 	RangeSet                                          m_bda_prepared;
 	// Cache at most 64 MiB of upload chunks. Additional in-flight chunks remain owned by
 	// their scopes/deferred callbacks and are released after their consumer completes.

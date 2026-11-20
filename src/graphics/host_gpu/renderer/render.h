@@ -101,6 +101,7 @@ public:
 	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
 	void BeginRendering(const RenderState& state) const;
+	void BeginRendering(const RenderState& state, bool clear_depth_stencil_on_begin) const;
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }

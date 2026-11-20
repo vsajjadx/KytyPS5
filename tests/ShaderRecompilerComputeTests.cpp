@@ -262,7 +262,7 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
-  static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }
+  static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_guest_ranges_mutex; }
 
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
@@ -9079,6 +9079,50 @@ public:
                   "selected stencil clear changed depth, another mip, or another layer");
         }
       }
+      // The fighter prepass clears a new native scope, even within the same guest frame.
+      // Repeating the matching draw in an already-open scope must retain intervening writes.
+      auto prepass_view = stencil_clear_desc.view_info;
+      prepass_view.type = vk::ImageViewType::e2D;
+      prepass_view.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      prepass_view.level_count = prepass_view.layer_count = 1;
+      RenderState prepass{};
+      prepass.width = 13;
+      prepass.height = 11;
+      auto& prepass_attachment = prepass.depth_stencil_attachment;
+      prepass_attachment.image_view = stencil_clear_image.FindView(prepass_view);
+      prepass_attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+      prepass_attachment.has_depth = prepass_attachment.has_stencil = true;
+      for (unsigned pass = 0; pass < 2; ++pass) {
+        stencil_clear_image.Transit(prepass_attachment.image_layout,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command.Handle());
+        command.BeginRendering(prepass, true);
+        if (pass == 0) {
+          vk::ClearAttachment mark{};
+          mark.aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+          mark.clearValue.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x73};
+          const vk::ClearRect whole{{{0, 0}, {13, 11}}, 0, 1};
+          command.Handle().clearAttachments(1, &mark, 1, &whole);
+          command.BeginRendering(prepass, true);
+        }
+        command.EndRendering();
+        stencil_clear_image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+            vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+        std::array<vk::BufferImageCopy, 2> samples{};
+        samples[0].imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+        samples[1].imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 1};
+        samples[0].imageExtent = samples[1].imageExtent = vk::Extent3D{1, 1, 1};
+        samples[1].bufferOffset = 4;
+        command.Handle().copyImageToBuffer(stencil_clear_image.backing.image,
+            vk::ImageLayout::eTransferSrcOptimal, stencil_readback.buffer, 2, samples.data());
+        HostReadBarrier(stencil_readback.buffer, 8, vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        const auto sample = ReadBuffer(name, stencil_readback, 2);
+        Require(name, "depth and stencil once per native prepass",
+                sample[0] == (pass == 0 ? std::bit_cast<uint32_t>(0.625f) : 0u) &&
+                (sample[1] & 0xffu) == (pass == 0 ? 0x73u : 0u),
+                "reused scope lost writes or a new scope retained previous fighters");
+      }
       DestroyBuffer(&stencil_readback);
 
       constexpr uint64_t partial_image_offset = 0xa000;
@@ -9469,6 +9513,62 @@ public:
         desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
         return desc;
       };
+      // Late HTile binding after a native zero fill must survive depth image recreation.
+      constexpr uint64_t late_meta = 0x2b80000;
+      constexpr uint64_t late_size = 0x8000;
+      auto late_depth = MakeMetadataDepth(0x12700, late_meta);
+      late_depth.info.htile_initial_clear = false;
+      late_depth.info.metadata.range.size = late_size;
+      auto& late_buffers = context.GetBufferCache();
+      (void)late_buffers.ObtainBuffer(base + late_meta, late_size, true);
+      late_buffers.FillBuffer(base + late_meta, late_size, 0, false);
+      auto late_id = texture_cache.FindImage(late_depth);
+      (void)texture_cache.FindDepthTarget(late_id, late_depth);
+      Require(name, "zero fill before first HTile acquisition",
+              texture_cache.IsMetaCleared(base + late_meta, 0),
+              "first attachment lost its recorded metadata clear");
+      (void)texture_cache.TouchMeta(base + late_meta, 0, false);
+      (void)texture_cache.FindDepthTarget(late_id, late_depth);
+      Require(name, "consume late HTile clear once",
+              !texture_cache.IsMetaCleared(base + late_meta, 0),
+              "second bind reapplied a consumed clear");
+      for (unsigned i = 0; i < 3; ++i) {
+        const auto offset = late_meta + (i + 1) * late_size;
+        const auto address = base + offset;
+        auto target = MakeMetadataDepth(0x12720 + i * 4, offset);
+        target.info.htile_initial_clear = false;
+        target.info.metadata.range.size = late_size;
+        (void)late_buffers.ObtainBuffer(address, late_size, true);
+        late_buffers.FillBuffer(address, i == 0 ? late_size / 2 : late_size,
+                                i == 1 ? 0xffffffffu : 0u, false);
+        if (i == 2) (void)late_buffers.ObtainBuffer(address + 32, 4, true);
+        auto id = texture_cache.FindImage(target);
+        (void)texture_cache.FindDepthTarget(id, target);
+        Require(name, "reject partial, nonzero or superseded HTile fills",
+                !texture_cache.IsMetaCleared(address, 0),
+                "unproven metadata range cleared the attachment");
+      }
+      // Fault notifications run on guest threads while the GPU consumes independent fills.
+      const auto concurrent_meta = base + late_meta + 4 * late_size;
+      const auto stable_meta = concurrent_meta + late_size;
+      (void)late_buffers.ObtainBuffer(concurrent_meta, 2 * late_size, true);
+      late_buffers.FillBuffer(concurrent_meta, 2 * late_size, 0, false);
+      std::atomic<bool> begin_invalidations{false};
+      auto invalidate_words = [&](uint64_t offset) {
+        begin_invalidations.wait(false);
+        for (unsigned i = 0; i < 512; ++i)
+          late_buffers.ForgetHtileZeroFill(concurrent_meta + offset + 16 * i, 4);
+      };
+      std::jthread first_writer(invalidate_words, 0);
+      std::jthread second_writer(invalidate_words, 8);
+      begin_invalidations.store(true);
+      begin_invalidations.notify_all();
+      const bool independent_fill = late_buffers.ConsumeHtileZeroFill(stable_meta, late_size);
+      first_writer.join();
+      second_writer.join();
+      Require(name, "concurrent HTile invalidations",
+              independent_fill && !late_buffers.ConsumeHtileZeroFill(concurrent_meta, late_size),
+              "overlapping guest writes were ignored or consumed an independent fill");
       auto metadata_depth_a = MakeMetadataDepth(metadata_data_a, metadata_a);
       auto metadata_depth_b = MakeMetadataDepth(metadata_data_b, metadata_b);
       metadata_depth_a.info.htile_initial_clear = false;

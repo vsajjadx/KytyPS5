@@ -1,6 +1,16 @@
 #define SPV_ENABLE_UTILITY_CODE
 
+#include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
+
+namespace {
+namespace Bloom = KytyUfc6BloomLogicalView;
+static_assert(Bloom::HasPaddedWidth(12, 7, 14, 7));
+static_assert(Bloom::Scale(12, 14) == 12.0f / 14.0f);
+static_assert(Bloom::MaxU(12, 14) * 14.0f - 0.5f == 11.0f);
+static_assert(!Bloom::HasPaddedWidth(12, 7, 12, 7));
+static_assert(!Bloom::HasPaddedWidth(12, 7, 14, 8));
+} // namespace
 
 namespace {
 using KytyUfc6DofGatherBounds::Disabled;

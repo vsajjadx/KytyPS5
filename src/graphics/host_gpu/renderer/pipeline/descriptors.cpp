@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/ir/ufc6WhiteRecovery.h"
+#include "graphics/shader/recompiler/ir/ufc6DofMergeBounds.h"
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -884,6 +886,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.uploads = {};
 	prepared.call_data_sources.clear();
 	prepared.runtime = &runtime;
+	prepared.ufc6_dof_merge_viewport_width = 0;
+	prepared.ufc6_postprocess_viewport_height = 0;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
@@ -1034,43 +1038,111 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 
-	namespace Bloom = KytyUfc6BloomLogicalView;
-	if (program.stage == ShaderType::Pixel && program.shader_hash == Bloom::Shader &&
-	    layout.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
-	    layout.ray_query_dword == ShaderRecompiler::IR::PushData::NoStart &&
-	    layout.memory_offset_dword == program.info.user_data_registers.size() + 2u) {
+	namespace W = KytyUfc6WhiteRecovery;
+	const auto hash = program.shader_hash;
+	const auto words = W::Dwords(hash);
+	const auto layout_base = program.info.user_data_registers.size() +
+	    (layout.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart ? 0u : 3u) +
+	    (layout.ray_query_dword == ShaderRecompiler::IR::PushData::NoStart ? 0u : 2u);
+	if (words && layout.memory_offset_dword == layout_base + words) {
 		const auto end = layout.memory_offset_dword;
 		EXIT_IF(end > prepared.shader_data.size());
-		auto& scale = prepared.shader_data[end - 2u];
-		auto& limit = prepared.shader_data[end - 1u];
-		scale = std::bit_cast<uint32_t>(1.0f);
-		limit = 0x7f800000u; // identity even for nonfinite original UVs
-		if (prepared.images.size() > Bloom::Slot && program.info.images.size() > Bloom::Slot) {
-			const auto& resource = program.info.images[Bloom::Slot];
-			const auto& binding = prepared.images[Bloom::Slot];
+		for (uint32_t i = 0; i < words; i += 2) {
+			prepared.shader_data[end - words + i] = 0x3f800000u;
+			prepared.shader_data[end - words + i + 1u] = W::Disabled;
+		}
+		for (uint32_t i = 0; i < prepared.images.size() && i < program.info.images.size(); ++i) {
+			const auto mode = W::ForSlot(hash, i);
+			if (mode == W::Mode::None) continue;
+			const auto& res = program.info.images[i];
+			const auto& binding = prepared.images[i];
 			const auto& req = binding.desc.info;
 			const auto& view = binding.desc.view_info;
-			if (resource.descriptor_index == Bloom::Slot && resource.source == Bloom::ResourceSource &&
+			const auto format = mode == W::Mode::Dof ? vk::Format::eR16G16B16A16Sfloat
+			                                        : vk::Format::eB10G11R11UfloatPack32;
+			if (res.descriptor_index != i || res.heap || !binding.image_id || !binding.image_view ||
+			    !req.data.Valid() || view.format != format || view.type != vk::ImageViewType::e2D ||
+			    view.base_level != 0u || view.base_layer != 0u || view.layer_count != 1u) continue;
+			const auto& img = m_context.GetTextureCache().GetImage(binding.image_id);
+			const auto& native = img.backing;
+			if (!img.registered || img.binding.needs_rebind || !native.image ||
+			    native.extent.depth != 1u || native.samples != 1u || native.layers != 1u) continue;
+			uint32_t w = prepared.ufc6_dof_merge_viewport_width;
+			uint32_t h = prepared.ufc6_postprocess_viewport_height;
+			uint32_t pw = native.extent.width;
+			uint32_t ph = native.extent.height;
+			if (mode == W::Mode::FirstMip) {
+				w = req.extent.width;
+				h = req.extent.height;
+			} else if (mode == W::Mode::UpsampleHalf || mode == W::Mode::Compose) {
+				w /= 2u;
+				h /= 2u;
+			} else if (mode == W::Mode::UpsampleMip) {
+				for (uint32_t m = 0; m + 1u < view.level_count && ph > h && ph > 1u; ++m) {
+					pw = std::max(1u, pw >> 1u);
+					ph = std::max(1u, ph >> 1u);
+				}
+			}
+			if (mode == W::Mode::UpsampleHalf && (h != ph || !w)) {
+				// Retain the former guest-view metadata fallback for this shader.
+				w = req.extent.width;
+				h = req.extent.height;
+			}
+			if (h != ph || h == 0) continue;
+			const auto bounds = W::ForWidths(mode, w, pw);
+			const auto dword = end - words + 2u * W::Index(hash, i);
+			prepared.shader_data[dword] = bounds.scale;
+			prepared.shader_data[dword + 1u] = bounds.limit;
+			static const bool diagnose = std::getenv("KYTY_UFC6_WHITE_DIAG") != nullptr;
+			if (diagnose) {
+				std::printf("UFC6_WHITE slot=%u valid=%ux%u actual=%ux%u limits=0x%08x/0x%08x\n",
+				            i,w,h,pw,ph,bounds.scale,bounds.limit);
+			}
+		}
+	}
+
+	namespace Merge = KytyUfc6DofMergeBounds;
+	if (program.stage == ShaderType::Pixel && program.shader_hash == Merge::Shader &&
+	    layout.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.ray_query_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.memory_offset_dword == program.info.user_data_registers.size() + 1u) {
+		const auto end = layout.memory_offset_dword;
+		EXIT_IF(end > prepared.shader_data.size());
+		auto& limit = prepared.shader_data[end - 1u];
+		limit = Merge::Disabled;
+		if (prepared.images.size() > Merge::Slot && program.info.images.size() > Merge::Slot) {
+			const auto& resource = program.info.images[Merge::Slot];
+			const auto& color = prepared.images[Merge::Slot];
+			const auto& depth = prepared.images[Merge::DepthSlot];
+			const auto& req = color.desc.info;
+			const auto& view = color.desc.view_info;
+			const auto& dv = depth.desc.view_info;
+			if (resource.descriptor_index == Merge::Slot && !resource.heap &&
 			    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
-			    !resource.heap && binding.image_id && binding.image_view &&
-			    binding.desc.type == TextureCache::BindingType::Texture &&
-			    req.data.Valid() && req.extent.depth == 1u &&
-			    req.pixel_format == vk::Format::eB10G11R11UfloatPack32 && req.samples == 1u &&
-			    req.resources.levels == 1u && req.resources.layers == 1u &&
+			    color.image_id && color.image_view && depth.image_id && depth.image_view &&
+			    color.desc.type == TextureCache::BindingType::Texture && req.data.Valid() &&
 			    view.format == vk::Format::eB10G11R11UfloatPack32 &&
 			    view.type == vk::ImageViewType::e2D && view.base_level == 0u && view.level_count == 1u &&
-			    view.base_layer == 0u && view.layer_count == 1u) {
-				const auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+			    view.base_layer == 0u && view.layer_count == 1u &&
+			    dv.format == vk::Format::eR16Sfloat && dv.type == vk::ImageViewType::e2D &&
+			    dv.base_level == 0u && dv.level_count == 1u && dv.base_layer == 0u && dv.layer_count == 1u) {
+				const auto& image = m_context.GetTextureCache().GetImage(color.image_id);
 				const auto& native = image.backing;
-				const bool exact_owner = image.registered && !image.binding.needs_rebind &&
-				    native.image && image.info.data == req.data && image.info.tile_mode == req.tile_mode &&
-				    native.image_type == vk::ImageType::e2D && native.extent.depth == 1u &&
-				    native.format == vk::Format::eB10G11R11UfloatPack32 && native.mip_levels == 1u &&
-				    native.layers == 1u && native.samples == 1u;
-				if (exact_owner && Bloom::HasPaddedWidth(req.extent.width, req.extent.height,
-				                                          native.extent.width, native.extent.height)) {
-					scale = std::bit_cast<uint32_t>(Bloom::Scale(req.extent.width, native.extent.width));
-					limit = std::bit_cast<uint32_t>(Bloom::MaxU(req.extent.width, native.extent.width));
+				const auto& de = depth.desc.info.extent;
+				if (image.registered && !image.binding.needs_rebind && native.image &&
+				    (native.format == vk::Format::eB10G11R11UfloatPack32 ||
+				     native.format == vk::Format::eA2B10G10R10UnormPack32) &&
+				    native.extent.depth == 1u && native.samples == 1u && native.mip_levels == 1u &&
+				    native.layers == 1u && req.extent.height == native.extent.height &&
+				    de.height == native.extent.height && de.depth == 1u) {
+					limit = Merge::LimitDword(prepared.ufc6_dof_merge_viewport_width, de.width,
+					                          req.extent.width, native.extent.width);
+					static const bool diagnose = std::getenv("KYTY_UFC6_MERGE_DIAG") != nullptr;
+					if (diagnose) {
+						std::printf("UFC6_MERGE viewport=%u depth=%u requested=%u backing=%u limit=0x%08x\n",
+						            prepared.ufc6_dof_merge_viewport_width, de.width,
+						            req.extent.width, native.extent.width, limit);
+					}
 				}
 			}
 		}

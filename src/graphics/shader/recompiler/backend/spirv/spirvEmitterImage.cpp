@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/ir/ufc6WhiteRecovery.h"
+#include "graphics/shader/recompiler/ir/ufc6DofMergeBounds.h"
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -10,34 +12,35 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-uint32_t Ufc6BloomLogicalCoord(EmitterState& state, const IR::ImageResource& image,
-                               uint32_t ordinal, uint32_t coord, bool simple_normalized_sample) {
-	namespace Bloom = KytyUfc6BloomLogicalView;
-	if (state.program.stage != ShaderType::Pixel || state.program.shader_hash != Bloom::Shader ||
-	    !state.profile.ufc6_post_process || !simple_normalized_sample ||
-	    ordinal != Bloom::Slot || image.descriptor_index != Bloom::Slot ||
-	    image.source != Bloom::ResourceSource || image.heap || image.cube ||
-	    image.resource_class != IR::ImageResourceClass::Sampled ||
-	    image.dimension != Decoder::ImageDimension::Dim2D ||
-	    image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
-	const auto end = state.program.bindings.memory_offset_dword;
-	const auto scale = Unary(state, spv::OpBitcast, TypeF32(state),
-	                         EmitShaderDataDwordLoad(state, end - 2u));
-	const auto limit_bits = EmitShaderDataDwordLoad(state, end - 1u);
-	const auto limit = Unary(state, spv::OpBitcast, TypeF32(state), limit_bits);
-	const auto u = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), u, coord, 0u);
-	const auto scaled = Binary(state, spv::OpFMul, TypeF32(state), u, scale);
-	const auto beyond = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), scaled, limit);
-	const auto limited = Select(state, TypeF32(state), beyond, limit, scaled);
-	const auto enabled = Binary(state, spv::OpINotEqual, TypeBool(state), limit_bits,
-	                            ConstantU32(state, 0x7f800000u));
-	// Preserve the original coordinate bits when this exact draw/view does not qualify.
-	const auto repaired = Select(state, TypeF32(state), enabled, limited, u);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2), result,
-	                          repaired, coord, 0u);
-	return result;
+uint32_t Ufc6WhiteRecoveryCoord(EmitterState& state, const IR::ImageResource& image,
+                                  uint32_t ordinal, uint32_t coord, spv::Op opcode,
+                                  uint32_t operand_count, bool normalized) {
+    namespace W = KytyUfc6WhiteRecovery;
+    const auto hash = state.program.shader_hash;
+    const auto mode = W::ForSlot(hash, ordinal);
+    if (!state.profile.ufc6_post_process || mode == W::Mode::None || !normalized ||
+        image.descriptor_index != ordinal || image.heap || image.cube ||
+        image.resource_class != IR::ImageResourceClass::Sampled ||
+        image.dimension != Decoder::ImageDimension::Dim2D ||
+        image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
+    const bool explicit_lod = mode == W::Mode::FirstMip || mode == W::Mode::Compose;
+    if (explicit_lod ? (opcode != spv::OpImageSampleExplicitLod || operand_count != 2u)
+                     : (opcode != spv::OpImageSampleImplicitLod || operand_count != 0u)) return coord;
+    const auto field = state.program.bindings.memory_offset_dword - W::Dwords(hash) + 2u * W::Index(hash, ordinal);
+    const auto scale = Unary(state, spv::OpBitcast, TypeF32(state), EmitShaderDataDwordLoad(state, field));
+    const auto limit_bits = EmitShaderDataDwordLoad(state, field + 1u);
+    const auto limit = Unary(state, spv::OpBitcast, TypeF32(state), limit_bits);
+    const auto u = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), u, coord, 0u);
+    const auto scaled = mode == W::Mode::Dof ? u : Binary(state, spv::OpFMul, TypeF32(state), u, scale);
+    const auto beyond = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), scaled, limit);
+    const auto bounded = Select(state, TypeF32(state), beyond, limit, scaled);
+    const auto enabled = Binary(state, spv::OpINotEqual, TypeBool(state), limit_bits,
+                                ConstantU32(state, W::Disabled));
+    const auto result = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2), result,
+                              Select(state, TypeF32(state), enabled, bounded, u), coord, 0u);
+    return result;
 }
 
 uint32_t Ufc6DofGatherCoord(EmitterState& state, const IR::ImageResource& image,
@@ -46,6 +49,27 @@ uint32_t Ufc6DofGatherCoord(EmitterState& state, const IR::ImageResource& image,
 	if (state.program.stage != ShaderType::Pixel || !state.profile.ufc6_post_process ||
 	    state.program.shader_hash != Gather::Shader || ordinal != Gather::Slot ||
 	    image.descriptor_index != Gather::Slot || image.heap || image.cube ||
+	    image.resource_class != IR::ImageResourceClass::Sampled || image.mip_count != 1u ||
+	    image.dimension != Decoder::ImageDimension::Dim2D ||
+	    image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
+	const auto limit_bits = EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword - 1u);
+	const auto limit = Unary(state, spv::OpBitcast, TypeF32(state), limit_bits);
+	const auto u = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), u, coord, 0u);
+	const auto beyond = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), u, limit);
+	const auto clamped = Select(state, TypeF32(state), beyond, limit, u);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2),
+	                          result, clamped, coord, 0u);
+	return result;
+}
+
+uint32_t Ufc6DofMergeCoord(EmitterState& state, const IR::ImageResource& image,
+                           uint32_t ordinal, uint32_t coord, bool simple_normalized_sample) {
+	namespace Merge = KytyUfc6DofMergeBounds;
+	if (state.program.stage != ShaderType::Pixel || !state.profile.ufc6_post_process ||
+	    state.program.shader_hash != Merge::Shader || !simple_normalized_sample ||
+	    ordinal != Merge::Slot || image.descriptor_index != Merge::Slot || image.heap || image.cube ||
 	    image.resource_class != IR::ImageResourceClass::Sampled || image.mip_count != 1u ||
 	    image.dimension != Decoder::ImageDimension::Dim2D ||
 	    image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
@@ -1178,8 +1202,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const bool simple_normalized_sample =
 			    opcode == spv::OpImageSampleImplicitLod && sample_operand_count == 0u &&
 			    !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized);
-			const auto coord = Ufc6BloomLogicalCoord(state, candidate, resource, coord_raw,
-			                                         simple_normalized_sample);
+			const auto bloom_coord = Ufc6WhiteRecoveryCoord(state, candidate, resource, coord_raw,
+			    opcode, sample_operand_count, !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized));
+			const auto coord = Ufc6DofMergeCoord(state, candidate, resource, bloom_coord,
+			                                          simple_normalized_sample);
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();

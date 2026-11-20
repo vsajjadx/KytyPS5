@@ -1,6 +1,8 @@
+#include "graphics/shader/recompiler/ir/ufc6WhiteRecovery.h"
 #define SPV_ENABLE_UTILITY_CODE
 
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
+#include "graphics/shader/recompiler/ir/ufc6DofMergeBounds.h"
 #include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 
 namespace {
@@ -10,6 +12,19 @@ static_assert(Bloom::Scale(12, 14) == 12.0f / 14.0f);
 static_assert(Bloom::MaxU(12, 14) * 14.0f - 0.5f == 11.0f);
 static_assert(!Bloom::HasPaddedWidth(12, 7, 12, 7));
 static_assert(!Bloom::HasPaddedWidth(12, 7, 14, 8));
+namespace White = KytyUfc6WhiteRecovery;
+static_assert(White::ForWidths(White::Mode::Dof, 820, 828).scale == 0x3f800000u);
+static_assert(std::bit_cast<float>(White::ForWidths(White::Mode::Dof,820,828).limit) * 828 < 819.5f);
+static_assert(White::ForWidths(White::Mode::FirstMip, 1640, 1656).limit != White::Disabled);
+static_assert(White::ForWidths(White::Mode::Compose, 820, 820).limit == White::Disabled);
+namespace Merge = KytyUfc6DofMergeBounds;
+static_assert(std::bit_cast<float>(Merge::LimitDword(1640, 1640, 1656, 1656)) ==
+              1639.5f / 1656.0f);
+static_assert(std::bit_cast<float>(Merge::LimitDword(1600, 1600, 1600, 1608)) ==
+              1599.5f / 1608.0f);
+static_assert(Merge::LimitDword(1600, 1600, 1600, 1600) == Merge::Disabled);
+static_assert(Merge::LimitDword(1600, 1608, 1608, 1608) == Merge::Disabled);
+static_assert(Merge::LimitDword(1600, 1600, 1604, 1608) == Merge::Disabled);
 } // namespace
 
 namespace {

@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/ir/ufc6WhiteRecovery.h"
+#include "graphics/shader/recompiler/ir/ufc6DofMergeBounds.h"
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
 #include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -269,14 +271,13 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
 	}
-	if (state.program.stage == ShaderType::Pixel &&
-	    state.program.shader_hash == KytyUfc6BloomLogicalView::Shader &&
-	    state.profile.ufc6_post_process) {
-		bindings.memory_offset_dword += 2u; // scale, normalized upper limit
+	if (state.profile.ufc6_post_process) {
+		bindings.memory_offset_dword += KytyUfc6WhiteRecovery::Dwords(state.program.shader_hash);
 	}
 	if (state.program.stage == ShaderType::Pixel && state.profile.ufc6_post_process &&
-	    state.program.shader_hash == KytyUfc6DofGatherBounds::Shader) {
-		++bindings.memory_offset_dword; // normalized gather upper limit
+	    (state.program.shader_hash == KytyUfc6DofGatherBounds::Shader ||
+	     state.program.shader_hash == KytyUfc6DofMergeBounds::Shader)) {
+		++bindings.memory_offset_dword; // normalized upper limit
 	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());

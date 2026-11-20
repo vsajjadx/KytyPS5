@@ -273,7 +273,7 @@ std::filesystem::path ShaderStorePath() {
 		return {};
 	}
 	// The UFC 6 DOF gather module has a different shader-data layout.
-	const auto suffix = title_id == "PPSA23566" ? ".dof-gather-v1.shaders" : ".shaders";
+	const auto suffix = title_id == "PPSA23566" ? ".white-recovery-v3.shaders" : ".shaders";
 	return std::filesystem::path("_PipelineCache") / (title_id + suffix);
 }
 

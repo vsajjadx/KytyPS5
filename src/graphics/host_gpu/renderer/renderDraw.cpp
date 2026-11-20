@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/ir/ufc6WhiteRecovery.h"
+#include "graphics/shader/recompiler/ir/ufc6DofMergeBounds.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1133,6 +1135,20 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (state.ps_active) {
 		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
+		const auto shader = state.ps_input_info.stage.module->info.shader_hash;
+		if (shader == KytyUfc6DofMergeBounds::Shader || KytyUfc6WhiteRecovery::Dwords(shader)) {
+			const auto& viewport = buffer.GetRegisters().GetScreenViewport().viewports[0];
+			const auto width = 2.0f * viewport.xscale;
+			const auto height = 2.0f * (viewport.yscale < 0 ? -viewport.yscale : viewport.yscale);
+			if (viewport.xoffset == viewport.xscale && width >= 1.0f && width <= 65536.0f &&
+			    static_cast<float>(static_cast<uint32_t>(width)) == width) {
+				bindings.pixel.ufc6_dof_merge_viewport_width = static_cast<uint32_t>(width);
+				if (height >= 1.0f && height <= 65536.0f &&
+				    static_cast<float>(static_cast<uint32_t>(height)) == height) {
+					bindings.pixel.ufc6_postprocess_viewport_height = static_cast<uint32_t>(height);
+				}
+			}
+		}
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};

@@ -35,6 +35,8 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	uint32_t ufc6_dof_merge_viewport_width = 0;
+	uint32_t ufc6_postprocess_viewport_height = 0;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

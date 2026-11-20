@@ -1,5 +1,16 @@
 #define SPV_ENABLE_UTILITY_CODE
 
+#include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
+
+namespace {
+using KytyUfc6DofGatherBounds::Disabled;
+using KytyUfc6DofGatherBounds::LimitDword;
+static_assert(std::bit_cast<float>(LimitDword(1600, 1608)) * 1608.0f > 1598.5f);
+static_assert(std::bit_cast<float>(LimitDword(1600, 1608)) * 1608.0f < 1599.5f);
+static_assert(LimitDword(1608, 1608) == Disabled);
+static_assert(LimitDword(0, 1608) == Disabled && LimitDword(1, 1608) == Disabled);
+} // namespace
+
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
+#include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/readbackAttribution.h"
 #include "graphics/host_gpu/renderer/cache/indirectArgsLedgerRuntime.h"
@@ -35,6 +36,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -1069,6 +1071,51 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				                                          native.extent.width, native.extent.height)) {
 					scale = std::bit_cast<uint32_t>(Bloom::Scale(req.extent.width, native.extent.width));
 					limit = std::bit_cast<uint32_t>(Bloom::MaxU(req.extent.width, native.extent.width));
+				}
+			}
+		}
+	}
+
+	namespace Gather = KytyUfc6DofGatherBounds;
+	if (program.stage == ShaderType::Pixel && program.shader_hash == Gather::Shader &&
+	    layout.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.ray_query_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	    layout.memory_offset_dword == program.info.user_data_registers.size() + 1u) {
+		const auto end = layout.memory_offset_dword;
+		EXIT_IF(end > prepared.shader_data.size());
+		auto& limit = prepared.shader_data[end - 1u];
+		limit = Gather::Disabled;
+		if (prepared.images.size() > Gather::Slot && program.info.images.size() > Gather::Slot) {
+			const auto& resource = program.info.images[Gather::Slot];
+			const auto& binding = prepared.images[Gather::Slot];
+			const auto& req = binding.desc.info;
+			const auto& view = binding.desc.view_info;
+			if (resource.descriptor_index == Gather::Slot && !resource.heap &&
+			    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+			    binding.image_id && binding.image_view &&
+			    binding.desc.type == TextureCache::BindingType::Texture &&
+			    req.data.Valid() && req.extent.depth == 1u &&
+			    view.format == vk::Format::eB10G11R11UfloatPack32 &&
+			    view.type == vk::ImageViewType::e2D &&
+			    view.base_level == 0u && view.level_count == 1u &&
+			    view.base_layer == 0u && view.layer_count == 1u) {
+				const auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+				const auto& native = image.backing;
+				// The descriptor retains the active guest width even when the image cache
+				// reuses a wider color allocation after a dynamic-resolution change.
+				if (image.registered && !image.binding.needs_rebind && native.image &&
+				    (native.format == vk::Format::eA2B10G10R10UnormPack32 ||
+				     native.format == vk::Format::eB10G11R11UfloatPack32) &&
+				    native.extent.depth == 1u && native.samples == 1u &&
+				    native.mip_levels == 1u && native.layers == 1u &&
+				    req.extent.height == native.extent.height) {
+					limit = Gather::LimitDword(req.extent.width, native.extent.width);
+					static const bool diagnose = std::getenv("KYTY_UFC6_GATHER_DIAG") != nullptr;
+					if (diagnose) {
+						std::printf("UFC6_GATHER logical=%ux%u backing=%ux%u limit=0x%08x\\n",
+						            req.extent.width, req.extent.height,
+						            native.extent.width, native.extent.height, limit);
+					}
 				}
 			}
 		}

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/ufc6BloomLogicalView.h"
+#include "graphics/shader/recompiler/ir/ufc6DofGatherBounds.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
@@ -36,6 +37,27 @@ uint32_t Ufc6BloomLogicalCoord(EmitterState& state, const IR::ImageResource& ima
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2), result,
 	                          repaired, coord, 0u);
+	return result;
+}
+
+uint32_t Ufc6DofGatherCoord(EmitterState& state, const IR::ImageResource& image,
+                            uint32_t ordinal, uint32_t coord) {
+	namespace Gather = KytyUfc6DofGatherBounds;
+	if (state.program.stage != ShaderType::Pixel || !state.profile.ufc6_post_process ||
+	    state.program.shader_hash != Gather::Shader || ordinal != Gather::Slot ||
+	    image.descriptor_index != Gather::Slot || image.heap || image.cube ||
+	    image.resource_class != IR::ImageResourceClass::Sampled || image.mip_count != 1u ||
+	    image.dimension != Decoder::ImageDimension::Dim2D ||
+	    image.numeric_class != Prospero::TextureNumericClass::Float) return coord;
+	const auto limit_bits = EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword - 1u);
+	const auto limit = Unary(state, spv::OpBitcast, TypeF32(state), limit_bits);
+	const auto u = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), u, coord, 0u);
+	const auto beyond = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), u, limit);
+	const auto clamped = Select(state, TypeF32(state), beyond, limit, u);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, 2),
+	                          result, clamped, coord, 0u);
 	return result;
 }
 
@@ -1041,6 +1063,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				} else if (layout.offset != NoImageComponent) {
 					offset = PackedOffset(ctx, offset_value, dimension, operand_mask);
 				}
+				const auto gather_coord = !dref && operand_mask == 0u &&
+				                          !HasFlag(mem, Decoder::ImageSampleFlagUnnormalized)
+				    ? Ufc6DofGatherCoord(state, candidate, resource, coord) : coord;
 				const auto EmitMip = [&](uint32_t mip) {
 					const auto sampled = MakeSampledImage(state, resource, sampler.id, mip, array_index,
 					                                      sampler.dynamic);
@@ -1048,7 +1073,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					const std::array operands {operand_mask, offset};
 					state.builder.AddFunction(
 					    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
-					    sample, sampled, coord, component_or_dref,
+					    sample, sampled, gather_coord, component_or_dref,
 					    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 					return sample;
 				};
